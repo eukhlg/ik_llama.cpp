@@ -5,24 +5,69 @@ from math import log2, ceil
 
 from numpy.typing import DTypeLike
 
-from .constants import GGML_QUANT_SIZES, GGMLQuantizationType, QK_K
+from .constants import GGML_QUANT_SIZES, GGML_ROW_META_SIZES, GGMLQuantizationType, QK_K
 from .lazy import LazyNumpyTensor
 
 import numpy as np
 
 
-def quant_shape_to_byte_shape(shape: Sequence[int], quant_type: GGMLQuantizationType) -> tuple[int, ...]:
+_KT_TAIL_BYTES = {
+    GGMLQuantizationType.IQ1_KT: lambda nt: 8 * ((nt + 7) // 8) + 4 * nt + min(4 * nt, 16),
+    GGMLQuantizationType.IQ2_KT: lambda nt: 4 * ((nt + 7) // 8) + 8 * nt,
+    GGMLQuantizationType.IQ3_KT: lambda nt: (nt + 1) // 2 + 12 * nt,
+    GGMLQuantizationType.IQ4_KT: lambda nt: 16 * nt,
+}
+
+
+def _iq3_ks_r16_row_bytes(n: int) -> int:
+    # 16 f32 row scales + n/32 blocks of 204 B, padded so that a band is a
+    # whole number of bytes per row (mirrors ggml_row_size).
+    if n % 32 != 0:
+        raise ValueError(f"Quantized tensor row size ({n}) is not a multiple of IQ3_KS_R16 block size (32)")
+    band = 64 + n // 32 * 204
+    return (band + 15) // 16
+
+
+def quant_row_bytes(n: int, quant_type: GGMLQuantizationType) -> int:
     block_size, type_size = GGML_QUANT_SIZES[quant_type]
-    if shape[-1] % block_size != 0:
-        raise ValueError(f"Quantized tensor row size ({shape[-1]}) is not a multiple of {quant_type.name} block size ({block_size})")
-    return (*shape[:-1], shape[-1] // block_size * type_size)
+    row_meta_size = GGML_ROW_META_SIZES.get(quant_type, 0)
+    if quant_type == GGMLQuantizationType.IQ3_KS_R16:
+        return _iq3_ks_r16_row_bytes(n)
+    if quant_type in _KT_TAIL_BYTES:
+        if n % 32 != 0:
+            raise ValueError(f"Quantized tensor row size ({n}) is not a multiple of {quant_type.name} block size (32)")
+        row = row_meta_size + n // block_size * type_size + _KT_TAIL_BYTES[quant_type]((n % block_size) // 32)
+        return (row + 3) // 4 * 4
+    if n % block_size != 0:
+        raise ValueError(f"Quantized tensor row size ({n}) is not a multiple of {quant_type.name} block size ({block_size})")
+    return row_meta_size + n // block_size * type_size
+
+
+def quant_shape_to_byte_shape(shape: Sequence[int], quant_type: GGMLQuantizationType) -> tuple[int, ...]:
+    return (*shape[:-1], quant_row_bytes(shape[-1], quant_type))
 
 
 def quant_shape_from_byte_shape(shape: Sequence[int], quant_type: GGMLQuantizationType) -> tuple[int, ...]:
     block_size, type_size = GGML_QUANT_SIZES[quant_type]
-    if shape[-1] % type_size != 0:
-        raise ValueError(f"Quantized tensor bytes per row ({shape[-1]}) is not a multiple of {quant_type.name} type size ({type_size})")
-    return (*shape[:-1], shape[-1] // type_size * block_size)
+    row_meta_size = GGML_ROW_META_SIZES.get(quant_type, 0)
+    if quant_type == GGMLQuantizationType.IQ3_KS_R16:
+        b = shape[-1]
+        band = 16 * b
+        if band >= 64 and (band - 64) % 204 == 0:
+            n = (band - 64) // 204 * 32
+            if _iq3_ks_r16_row_bytes(n) == b:
+                return (*shape[:-1], n)
+        raise ValueError(f"Quantized tensor bytes per row ({b}) is not a valid {quant_type.name} row size")
+    if quant_type in _KT_TAIL_BYTES:
+        if shape[-1] >= row_meta_size:
+            n = (shape[-1] - row_meta_size) // type_size * block_size
+            for tail in range(0, block_size, 32):
+                if quant_row_bytes(n + tail, quant_type) == shape[-1]:
+                    return (*shape[:-1], n + tail)
+        raise ValueError(f"Quantized tensor bytes per row ({shape[-1]}) is not a valid {quant_type.name} row size")
+    if shape[-1] < row_meta_size or (shape[-1] - row_meta_size) % type_size != 0:
+        raise ValueError(f"Quantized tensor bytes per row ({shape[-1]}) minus the {quant_type.name} row metadata ({row_meta_size}) is not a multiple of its type size ({type_size})")
+    return (*shape[:-1], (shape[-1] - row_meta_size) // type_size * block_size)
 
 
 # This is faster than np.vectorize and np.apply_along_axis because it works on more than one row at a time

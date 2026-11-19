@@ -80,6 +80,21 @@ struct llama_control_vector_load_info;
 int32_t cpu_get_num_physical_cores();
 int32_t cpu_get_num_math();
 
+// P-cores, one thread per physical core (no E-cores, no SMT siblings)
+std::vector<int32_t> cpu_get_math_cpus();
+
+// E-cores, one per physical core (Intel hybrid)
+std::vector<int32_t> cpu_get_efficiency_cpus();
+
+// explicit affinity, else auto-detected math CPUs
+std::vector<int32_t> cpu_affinity_resolve(const std::vector<int32_t> & cpus, bool auto_detect);
+
+// explicit affinity, else auto-detected E-cores
+std::vector<int32_t> cpu_affinity_resolve_draft(const std::vector<int32_t> & cpus, bool auto_detect);
+
+bool cpu_affinity_parse_mask (const std::string & value, std::vector<int32_t> & cpus);
+bool cpu_affinity_parse_range(const std::string & value, std::vector<int32_t> & cpus);
+
 enum llama_example {
     LLAMA_EXAMPLE_COMMON,
     LLAMA_EXAMPLE_SPECULATIVE,
@@ -150,6 +165,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT,         // draft model
     COMMON_SPECULATIVE_TYPE_DFLASH,        // DFlash draft model
+    COMMON_SPECULATIVE_TYPE_DSPARK,
     COMMON_SPECULATIVE_TYPE_MTP,           // MTP model
     COMMON_SPECULATIVE_TYPE_EAGLE3,        // eagle draft model
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding
@@ -164,6 +180,8 @@ enum common_speculative_type {
 std::string common_speculative_type_name_str();
 enum common_speculative_type common_speculative_type_from_name(const std::string & name);
 std::string common_speculative_type_to_str(enum common_speculative_type type);
+bool common_speculative_type_is_dflash_family(enum common_speculative_type type);
+bool common_speculative_type_uses_target_features(enum common_speculative_type type);
 bool common_speculative_type_is_self_spec(enum common_speculative_type type);
 
 struct common_speculative_stage_params {
@@ -172,7 +190,7 @@ struct common_speculative_stage_params {
     int32_t n_max = -1;
     int32_t n_min = -1;
     float   p_min = -1.0f;
-    int32_t dflash_cross_ctx = -1;
+    int32_t mtp_heads = -1;
 
     uint16_t ngram_size_n = 0;
     uint16_t ngram_size_m = 0;
@@ -185,7 +203,7 @@ struct common_speculative_stage_params {
     bool has_n_max_override() const { return n_max >= 0; }
     bool has_n_min_override() const { return n_min >= 0; }
     bool has_p_min_override() const { return p_min >= 0.0f; }
-    bool has_dflash_cross_ctx_override() const { return dflash_cross_ctx >= 0; }
+    bool has_mtp_heads_override() const { return mtp_heads >= 0; }
     bool has_ngram_size_n_override() const { return ngram_size_n > 0; }
     bool has_ngram_size_m_override() const { return ngram_size_m > 0; }
     bool has_ngram_min_hits_override() const { return ngram_min_hits > 0; }
@@ -207,8 +225,8 @@ struct common_ngram_mod;
 struct common_params_speculative {
     common_speculative_type type = COMMON_SPECULATIVE_TYPE_NONE; // type of speculative decoding
 
-    // Recurrent-model checkpoint strategy for speculative decoding.
-    int recurrent_ckpt_mode = LLAMA_SPEC_CKPT_AUTO;
+    // Generic speculative checkpoint mode, recurrent spelling is a compatibility alias.
+    int spec_ckpt_mode = LLAMA_SPEC_CKPT_AUTO;
 
     std::string devices;
     std::string params;
@@ -218,7 +236,11 @@ struct common_params_speculative {
     int32_t n_max = 16; // number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of tokens to draft during speculative decoding
     std::vector<common_speculative_stage_params> stages; // explicit stage chain for single-spec or self-spec + model fallback
-    int32_t dflash_cross_ctx = 512; // target-feature context window for DFlash
+    int32_t mtp_heads = 1; // MTP heads to use; 1 is the default, while >1 and 0 (all model heads) are experimental
+
+    // Samplers for DFlash2
+    float    draft_temperature = 0.0f;
+    uint32_t draft_seed = LLAMA_DEFAULT_SEED;
 
     float   p_split = 0.1f; // speculative decoding split probability
     float   p_min = 0.75f; // minimum speculative decoding probability (greedy)
@@ -246,6 +268,14 @@ struct common_params_speculative {
 
     llama_context_params cparams_dft; // these are the parameters for the draft llama_context
 
+    // storage for the pointers in cparams_dft
+    std::string cuda_params;
+    std::vector<std::pair<int,int>> offload_policy;
+
+    // draft affinity from --draft-params; empty = inherit the target
+    std::vector<int32_t> cpu_affinity;
+    bool cpu_affinity_configured = false; // a draft affinity was requested
+
     int32_t n_ctx = 0;  // draft context size
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
@@ -257,14 +287,16 @@ struct common_params_speculative {
     bool autotune = false; // automatically optimize speculative params for max tokens/sec
 
     bool has_dft() const {
-        return !model.empty() || !params.empty();
-        //return !mparams_dft.path.empty() || !mparams_dft.hf_repo.empty();
+        // external draft model present only when -md is set
+        return !model.empty();
     }
 
     std::vector<common_speculative_stage_params> get_resolved_stages() const;
     common_params_speculative with_stage_overrides(const common_speculative_stage_params & stage) const;
     bool has_stage_chain() const;
     bool has_stage_type(common_speculative_type stage_type) const;
+    bool has_dflash_family_stage() const;
+    bool uses_target_features() const;
     void remove_stage_type(common_speculative_type stage_type);
     bool has_composite_stage_chain() const;
     bool needs_dft_model() const;
@@ -283,6 +315,9 @@ struct gpt_params {
 
     int32_t n_threads             = cpu_get_num_math();
     int32_t n_threads_batch       =      -1; // number of threads to use for batch processing (-1 = use n_threads)
+    std::vector<int32_t> cpu_affinity;       // logical CPU ids to pin worker threads to (empty = no explicit pinning)
+    bool    cpu_affinity_auto     = false;   // pin to hybrid P-cores when cpu_affinity is empty (--cpu-affinity)
+    bool    cpu_affinity_configured = false; // a CPU affinity option was given
     int32_t n_predict             =      -1; // new tokens to predict
     int32_t n_ctx                 =       0; // context size
     int32_t n_batch               =    2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
@@ -296,6 +331,9 @@ struct gpt_params {
     int32_t main_gpu              =       0; // the GPU that is used for scratch and small tensors
     int32_t max_gpu               =       0; // max number of GPUs to use at a time for split mode "graph"
     int32_t ncmoe                 =       0; // number of layers in which MoE tensors are left in VRAM
+    size_t moe_cache_size         =       0; // total GPU cache budget in bytes for CPU-resident MoE experts
+    enum llama_moe_cache_policy moe_cache_policy = LLAMA_MOE_CACHE_POLICY_LRU;
+    double moe_cache_cpu_share   =     0.0; // fixed fraction of unique cache misses assigned to CPU
     int32_t fit_margin            =       0; // safety margin for auto-fit in MiB
     bool    fit                   =   false; // automatically fit model (for now just using MoE tensor overrides)
     int32_t worst_graph_tokens    =       0; // number of tokens to use when reserving the worst graph
@@ -314,6 +352,9 @@ struct gpt_params {
     float   ban_phrases_bias      = -999.0f; // logit bias applied to ban phrases
     int32_t max_extra_alloc_MiB   =     256; // additional VRAM per GPU the scheduler may allocate for more efficient compute graph evaluation
     int32_t nrep                  =       1; // number of repetitions used in sweep bench
+    int32_t sweep_stride          =       1;
+    bool    sweep_memory          =   false;
+    bool    sweep_bench           =   false;
 
     ggml_backend_sched_eval_callback cb_eval = nullptr;
     void * cb_eval_user_data                 = nullptr;
@@ -362,7 +403,7 @@ struct gpt_params {
         ,uint32_t       // upper codepoint
         ,std::string    // unicode script name
         ,float          // bias
-    >>> allow_ruless;
+    >>> allow_rules;
     std::vector<std::string> allow_pieces;  // each token to allowlist
     std::vector<std::string> allow_kws;     // keywords
     size_t allow_kw_delay;  // minimum n_decoded before first keyword is active
@@ -409,9 +450,11 @@ struct gpt_params {
     bool multiline_input   = false; // reverse the usage of `\`
     bool simple_io         = false; // improves compatibility with subprocesses and limited consoles
     bool cont_batching     = true;  // insert new sequences for decoding on-the-fly
+    llama_nvfp4_precision nvfp4_precision = LLAMA_NVFP4_PRECISION_AUTO;
+    llama_fp8_precision fp8_precision = LLAMA_FP8_PRECISION_AUTO;
     bool flash_attn        = true;  // flash attention
     int  mla_attn          = 3;     // MLA 0: standard, 1: MLA with K and V^T cache, 2: MLA with just K cache, 3: the best of both worlds
-    int  attn_max_batch    = 0;     // Max batch size to use when computing attention (only applicable if flash_attn = false)
+    int  attn_max_batch    = 256;   // Max batch size to use when computing attention (only applicable if flash_attn = false)
     bool fused_moe_up_gate = true;  // fused up*unary(gate) op for MoE models
     bool fused_up_gate     = true;  // fused up*unary(gate) op
     bool fused_mmad        = true;  // fused mul+multi_add op
@@ -419,6 +462,11 @@ struct gpt_params {
     bool rope_cache        = false; // if to use RoPE cache (for supported models)
     bool graph_reuse       = true;  // if to reuse compute graphs
     bool dsa               = false; // enable GLM DSA sparse attention (off by default; opt-in via --dsa)
+    bool fused_idx_topk    = true;  // enable the fused indexer topk op (on by default; -no-fidx or --no-fused-indexer-topk turns it off)
+    bool swa_compress      = false;
+    bool feod              = false; // If true, force offload of experts left in RAM to the default layer device
+    int  dsv41_replay_keep = 256;   // DeepSeek-V4.1 prefill: run the decoder layers on the last N prompt tokens only (0 = off; requires --swa-compress)
+    bool dsv4_legacy_state = false; // if true, write DeepSeek-V4 state in the legacy full-slice layout (no MAGIC), byte-identical to main
     int  dsa_top_k         = -1;    // DSA top-k override (<0 => use the model's configured indexer_top_k)
     int  min_experts       = -1;
     float thresh_experts   = 0;
@@ -443,6 +491,10 @@ struct gpt_params {
     bool merge_qkv         = false; // if true, merge separate Q, K, V tensors into a single, contiguous tensor
     bool merge_up_gate_exps= false; // if true, merge ffn_up_exps and ffn_gate_exps into a single, contiguous tensor
     bool defer_experts     = false; // if true, defer expert mmap residency to speed up model loading (Linux only)
+    bool defer_ple         = false; // if true, keep the per-layer token embedding on the file (Linux and Windows only)
+    std::string ngram_file = "";    // separate GGUF with the n-gram tables (per-layer token embedding, Engram)
+    bool prefetch_experts  = false; // if true, stream mmap'd MoE expert weights into the page cache (Linux only)
+    int  prefetch_experts_threads = 0; // number of expert prefetch workers (<=0 = auto)
     bool k_cache_hadamard  = false; // if true, use Hadamard transform for the K-cache (only makes sense with quantized cache)
     bool v_cache_hadamard  = false; // if true, use Hadamard transform for the V-cache (only makes sense with quantized cache, which requires FA)
     bool split_mode_graph_scheduling = false; // if true, force split mode graph scheduling
@@ -481,9 +533,9 @@ struct gpt_params {
 
     // embedding
     bool embedding         = false; // get only sentence embedding
-    int32_t embd_normalize = 2;     // normalisation for embendings (-1=none, 0=max absolute int16, 1=taxicab, 2=euclidean, >2=p-norm)
-    std::string embd_out   = "";    // empty = default, "array" = [[],[]...], "json" = openai style, "json+" = same "json" + cosine similarity matrix
-    std::string embd_sep   = "\n";  // separator of embendings
+    int32_t embd_normalize = 2;     // normalization for embeddings (-1=none, 0=max absolute int16, 1=taxicab, 2=euclidean, >2=p-norm)
+    std::string embd_out   = "";    // empty = default, "array" = [[],[]...], "json" = OpenAI style, "json+" = same "json" + cosine similarity matrix
+    std::string embd_sep   = "\n";  // separator of embeddings
 
     // server params
     int32_t port           = 8080;         // server listens on this network port
@@ -527,6 +579,7 @@ struct gpt_params {
     bool endpoint_slots   = true;
     bool endpoint_props   = false; // only control POST requests, not GET
     bool endpoint_metrics = false;
+    bool endpoint_memory  = false;
 
     bool log_json = false;
 
@@ -538,6 +591,8 @@ struct gpt_params {
 
     bool do_checkpoint = false;               // do checkpoint for recurrent models only
     int32_t ctx_checkpoints_n = 32;           // max number of context checkpoints per slot
+    std::string ctx_checkpoint_spill_dir = ""; // disk dir for checkpoint spill (empty = disabled, behavior unchanged)
+    int32_t ctx_checkpoint_ram_live = 2;      // max checkpoints with resident data when spill is on
     int32_t ctx_checkpoints_interval = 512;   // minimum number of tokens between each context checkpoints
     int32_t ctx_checkpoints_tolerance = 5;    // the number of tokens before the full prompt to create the checkpoint
     common_checkpoint_eviction ctx_checkpoint_eviction = COMMON_CHECKPOINT_EVICTION_VARIANCE;
@@ -602,6 +657,7 @@ void gpt_params_handle_model_default(gpt_params & params);
 bool gpt_params_parse_ex   (int argc, char ** argv, gpt_params & params);
 bool gpt_params_parse      (int argc, char ** argv, gpt_params & params);
 bool gpt_params_find_arg   (int argc, char ** argv, const std::string & arg, gpt_params & params, int & i, bool & invalid_param);
+void gpt_params_terminate_lists(gpt_params & params);
 void gpt_params_print_usage(int argc, char ** argv, const gpt_params & params);
 
 std::string gpt_params_get_system_info(const gpt_params & params);
@@ -677,6 +733,8 @@ std::vector<std::string> string_extract(const std::string& str, const char c, st
 
 bool string_is_found(const std::string& window, const std::string& str, size_t& pos);
 
+void string_assign_append(std::string& dst, const std::string_view& sv, const std::string& str, const int32_t pos);
+
 //
 // Filesystem utils
 //
@@ -699,9 +757,11 @@ struct llama_init_result {
 };
 
 struct llama_init_result    llama_init_from_gpt_params(gpt_params & params);
+void fp8_auto_warning(const llama_model * model, llama_fp8_precision precision);
 
 struct llama_model_params   common_model_params_to_llama  (const gpt_params & params);
 struct llama_context_params common_context_params_to_llama(const gpt_params & params);
+void common_check_v_cache_types(const llama_context_params & cparams);
 
 struct llama_model * llama_load_model_from_url(const char * model_url, const char * path_model, const char * hf_token, const struct llama_model_params & params);
 struct llama_model * llama_load_model_from_hf(const char * repo, const char * file, const char * path_model, const char * hf_token, const struct llama_model_params & params);
@@ -833,6 +893,19 @@ llama_control_vector_data llama_control_vector_load(const std::vector<llama_cont
 static const char * const LLM_KV_SPLIT_NO            = "split.no";
 static const char * const LLM_KV_SPLIT_COUNT         = "split.count";
 static const char * const LLM_KV_SPLIT_TENSORS_COUNT = "split.tensors.count";
+
+//
+// Memory utils
+//
+
+double common_rss_hwm_mib();
+
+struct common_vram_tracker {
+    std::vector<size_t> baseline;
+
+    void start();
+    double sample() const;
+};
 
 //
 // YAML utils

@@ -886,8 +886,46 @@ const func_builtins & value_bool_t::get_builtins() const {
     return builtins;
 }
 
-[[noreturn]] static value array_unique_not_implemented(const func_args &) {
-    throw not_implemented_exception("Array unique builtin not implemented");
+// Jinja's unique(value, case_sensitive=false, attribute=none): items in order of first appearance
+static value array_unique(const func_args & args) {
+    args.ensure_count(1, 3);
+    if (!is_val<value_array>(args.get_pos(0))) {
+        throw raised_exception("unique: first argument must be an array");
+    }
+    value val       = args.get_pos(0);
+    value val_case  = args.get_kwarg_or_pos("case_sensitive", 1);
+    value attribute = args.get_kwarg_or_pos("attribute",      2);
+    const bool case_sensitive = val_case->as_bool(); // undefined == false, as in Jinja
+    const bool attr_is_int = is_val<value_int>(attribute);
+    std::vector<value> out;
+    std::vector<value> keys;
+    for (const auto & item : val->as_array()) {
+        value key = item;
+        if (!attribute->is_undefined()) {
+            if (attr_is_int && is_val<value_array>(item)) {
+                key = item->at(attribute->as_int());
+            } else if (!attr_is_int && is_val<value_object>(item)) {
+                key = item->at(attribute);
+            } else {
+                throw raised_exception("unique: unsupported attribute lookup on " + item->type());
+            }
+        }
+        if (!case_sensitive && is_val<value_string>(key)) {
+            key = mk_val<value_string>(key->as_string().lowercase());
+        }
+        bool seen = false;
+        for (const auto & k : keys) {
+            if (value_compare(k, key, value_compare_op::eq)) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            keys.push_back(key);
+            out.push_back(item);
+        }
+    }
+    return is_val<value_tuple>(val) ? mk_val<value_tuple>(std::move(out)) : mk_val<value_array>(std::move(out));
 }
 
 const func_builtins & value_array_t::get_builtins() const {
@@ -1049,6 +1087,50 @@ const func_builtins & value_array_t::get_builtins() const {
             value_array_t * arr_editable = const_cast<value_array_t *>(arr);
             return arr_editable->pop_at(index);
         }},
+        {"min", [](const func_args & args) -> value {
+            args.ensure_count(1, 4);
+            args.ensure_vals<value_array>();
+            value val_case    = args.get_kwarg_or_pos("case_sensitive", 1);
+            value attribute   = args.get_kwarg_or_pos("attribute",      2);
+            if (!attribute->is_undefined()) {
+                throw not_implemented_exception("min: attribute not implemented");
+            }
+            // FIXME: min is currently always case sensitive
+            (void) val_case;
+            const auto & arr = args.get_pos(0)->as_array();
+            if (arr.empty()) {
+                return mk_val<value_undefined>();
+            }
+            value result = arr[0];
+            for (size_t i = 1; i < arr.size(); ++i) {
+                if (value_compare(arr[i], result, value_compare_op::lt)) {
+                    result = arr[i];
+                }
+            }
+            return result;
+        }},
+        {"max", [](const func_args & args) -> value {
+            args.ensure_count(1, 4);
+            args.ensure_vals<value_array>();
+            value val_case    = args.get_kwarg_or_pos("case_sensitive", 1);
+            value attribute   = args.get_kwarg_or_pos("attribute",      2);
+            if (!attribute->is_undefined()) {
+                throw not_implemented_exception("max: attribute not implemented");
+            }
+            // FIXME: max is currently always case sensitive
+            (void) val_case;
+            const auto & arr = args.get_pos(0)->as_array();
+            if (arr.empty()) {
+                return mk_val<value_undefined>();
+            }
+            value result = arr[0];
+            for (size_t i = 1; i < arr.size(); ++i) {
+                if (value_compare(arr[i], result, value_compare_op::gt)) {
+                    result = arr[i];
+                }
+            }
+            return result;
+        }},
         {"sort", [](const func_args & args) -> value {
             args.ensure_count(1, 4);
             if (!is_val<value_array>(args.get_pos(0))) {
@@ -1089,7 +1171,7 @@ const func_builtins & value_array_t::get_builtins() const {
             std::reverse(arr.begin(), arr.end());
             return is_val<value_tuple>(val) ? mk_val<value_tuple>(std::move(arr)) : mk_val<value_array>(std::move(arr));
         }},
-        {"unique", array_unique_not_implemented},
+        {"unique", array_unique},
     };
     return builtins;
 }

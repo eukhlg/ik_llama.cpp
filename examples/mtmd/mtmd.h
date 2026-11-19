@@ -62,6 +62,7 @@ struct mtmd_input_chunks;
 
 struct mtmd_input_text {
     const char * text;
+    size_t text_len;
     bool add_special;
     bool parse_special;
 };
@@ -106,6 +107,8 @@ MTMD_API void mtmd_free(mtmd_context * ctx);
 
 // whether we need to set non-causal mask before llama_decode
 MTMD_API bool mtmd_decode_use_non_causal(mtmd_context * ctx);
+MTMD_API int  mtmd_get_image_max_tokens(const mtmd_context * ctx);
+MTMD_API void mtmd_set_image_max_tokens(mtmd_context * ctx, int n_tokens);
 
 // whether the current model use M-RoPE for llama_decode
 MTMD_API bool mtmd_decode_use_mrope(mtmd_context * ctx);
@@ -220,6 +223,7 @@ MTMD_API int32_t mtmd_encode_chunk(mtmd_context * ctx,
 // the reading size (in bytes) is equal to:
 // llama_model_n_embd(model) * mtmd_input_chunk_get_n_tokens(chunk) * sizeof(float)
 MTMD_API float * mtmd_get_output_embd(mtmd_context * ctx);
+MTMD_API int32_t mtmd_get_memory_usage(const mtmd_context * ctx, struct llama_memory_buft * usage, int32_t n_max);
 MTMD_API mtmd_input_chunk * mtmd_create_input_chunk(void);
 MTMD_API mtmd_input_chunk * mtmd_input_chunk_from_json(json & j);
 MTMD_API void mtmd_input_chunk_to_json(mtmd_input_chunk * chunk, json & j);

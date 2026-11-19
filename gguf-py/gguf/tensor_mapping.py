@@ -42,6 +42,7 @@ class TensorNameMap:
             "embeddings.LayerNorm",       # bert
             "emb_ln",                     # nomic-bert
             "transformer.norm",           # openelm
+            "model.embedding_norm",       # lfm2
         ),
 
         # Position embeddings
@@ -63,6 +64,7 @@ class TensorNameMap:
 
         # Output norm
         MODEL_TENSOR.OUTPUT_NORM: (
+            "model.embedding_norm",                       # lfm3
             "gpt_neox.final_layer_norm",               # gptneox
             "transformer.ln_f",                        # gpt2 gpt-j falcon jais
             "model.norm",                              # llama-hf baichuan internlm2
@@ -87,9 +89,34 @@ class TensorNameMap:
 
         MODEL_TENSOR.ROPE_FACTORS_LONG: (),
         MODEL_TENSOR.ROPE_FACTORS_SHORT: (),
+
+        # openPangu-2.0 global mHC stream-merge module (non-block)
+        MODEL_TENSOR.MHC_MERGE_PHI: (
+            "model.merge_mhc_module.phi",
+        ),
+        MODEL_TENSOR.MHC_MERGE_ALPHA: (
+            "model.merge_mhc_module.branch_alpha_pre",
+        ),
+        MODEL_TENSOR.MHC_MERGE_BETA: (
+            "model.merge_mhc_module.branch_beta_pre",
+        ),
+        MODEL_TENSOR.MHC_MERGE_GAMMA: (
+            "model.merge_mhc_module.norm_gamma",
+        ),
+        MODEL_TENSOR.DFLASH_SELECTOR_PREV: (
+            "model.candidate_selector.predecessor_codebook",
+        ),
+        MODEL_TENSOR.DFLASH_SELECTOR_NEXT: (
+            "model.candidate_selector.successor_codebook",
+        ),
+        MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN: (
+            "model.candidate_selector.hidden_projection",
+        ),
     }
 
     block_mappings_cfg: dict[MODEL_TENSOR, tuple[str, ...]] = {
+        MODEL_TENSOR.SSM_ALPHA: ('model.layers.{bid}.linear_attn.in_proj_a', 'layers.{bid}.linear_attn.in_proj_a'),
+
         # Attention norm
         MODEL_TENSOR.ATTN_NORM: (
             "gpt_neox.layers.{bid}.input_layernorm",                # gptneox
@@ -112,6 +139,7 @@ class TensorNameMap:
             "transformer.blocks.{bid}.norm_attn_norm.norm_1",       # dbrx
             "encoder.layers.{bid}.input_layernorm",                 # chatglm
             "transformer.layers.{bid}.attn_norm",                   # openelm
+            "model.layers.{bid}.operator_norm",                    # lfm2
         ),
 
         # Attention norm 2
@@ -138,6 +166,9 @@ class TensorNameMap:
             "encoder.layers.{bid}.self_attention.query_key_value",                 # chatglm
             "transformer.layers.{bid}.attn.qkv_proj",                              # openelm
             "layers.{bid}.attention.wqkv",
+            "model.layers.{bid}.self_attn.q_k_v_proj",                             # spark2_5
+            'model.layers.{bid}.linear_attn.in_proj_qkv',
+            'layers.{bid}.linear_attn.in_proj_qkv',
         ),
 
         # Attention query
@@ -183,6 +214,7 @@ class TensorNameMap:
             "transformer.h.{bid}.self_attention.dense",                     # falcon
             "h.{bid}.self_attention.dense",                                 # bloom
             "model.layers.{bid}.self_attn.o_proj",                          # llama-hf nemotron olmoe olmo2
+            "model.layers.{bid}.self_attn.out_proj",                         # lfm2
             "model.layers.{bid}.self_attn.linear_attn",                     # deci
             "layers.{bid}.attention.wo",                                    # llama-pth
             "encoder.layer.{bid}.attention.output.dense",                   # bert
@@ -211,11 +243,15 @@ class TensorNameMap:
         ),
 
         MODEL_TENSOR.ATTN_POST_NORM: (
+            "model.layers.{bid}.post_operator_norm",      # lfm3
             "model.layers.{bid}.post_attention_layernorm",     # gemma2
         ),
 
         MODEL_TENSOR.ATTN_GATE: (
+            "model.layers.{bid}.self_attn.gate_proj",     # lfm3
             "model.layers.{bid}.self_attn.g_proj",              # laguna
+            'model.layers.{bid}.linear_attn.in_proj_z',
+            'layers.{bid}.linear_attn.in_proj_z',
         ),
 
         # Rotary embeddings
@@ -255,6 +291,7 @@ class TensorNameMap:
 
         # Post feed-forward norm
         MODEL_TENSOR.FFN_POST_NORM: (
+            "model.layers.{bid}.post_ffn_norm",           # lfm3
             "model.layers.{bid}.post_feedforward_layernorm", # gemma2
             "model.layers.{bid}.post_moe_norm",              # grok-2
         ),
@@ -273,6 +310,7 @@ class TensorNameMap:
             "model.layers.{bid}.mlp.gate",                # qwen2moe
             "transformer.decoder_layer.{bid}.router",     # Grok
             "transformer.blocks.{bid}.ffn.router.layer",  # dbrx
+            "model.layers.{bid}.feed_forward.gate",       # lfm2moe
         ),
 
         MODEL_TENSOR.FFN_GATE_INP_SHEXP: (
@@ -283,9 +321,11 @@ class TensorNameMap:
             "model.layers.{bid}.mlp.gate.e_score_correction",           # deepseek-v3 dots1
             "model.layers.{bid}.mlp.moe_statics.e_score_correction",    # ernie4.5-moe
             "model.layers.{bid}.mlp.gate.expert_bias",                  # bailingmoe2
+            "model.layers.{bid}.mlp.expert_bias",                       # hy_v3
             "model.layers.{bid}.block_sparse_moe.e_score_correction",   # minimax-m2
             "model.layers.{bid}.mlp.experts.e_score_correction_bias",   # laguna
             "model.layers.{bid}.mlp.experts.e_score_correction",        # laguna
+            "model.layers.{bid}.feed_forward.expert_bias",              # lfm2moe
         ),
 
         # Feed-forward up
@@ -321,16 +361,20 @@ class TensorNameMap:
             "transformer.decoder_layer.{bid}.moe.linear_v",  # Grok (merged)
             "transformer.blocks.{bid}.ffn.experts.mlp.v1",   # dbrx
             "model.layers.{bid}.mlp.experts.up_proj",        # qwen2moe (merged)
+            "model.layers.{bid}.block_sparse_moe.experts.w3", # minimax-m2/m3 (merged)
         ),
 
         MODEL_TENSOR.FFN_GATE_UP_EXP: (
             "model.layers.{bid}.mlp.experts.gate_up_proj", # gemma4
             "model.layers.{bid}.experts.gate_up_proj",     # gemma4
+            "model.layers.{bid}.feed_forward.experts.gate_up_proj",  # lfm2moe (fused experts)
         ),
 
         MODEL_TENSOR.FFN_UP_SHEXP: (
+            "model.layers.{bid}.block_sparse_moe.shared_experts.up_proj",
             "model.layers.{bid}.mlp.shared_expert.up_proj",  # qwen2moe
             "model.layers.{bid}.mlp.shared_experts.up_proj", # deepseek2
+            "model.layers.{bid}.mlp.shared_mlp.up_proj",     # hy_v3
         ),
 
         # AWQ-activation gate
@@ -357,11 +401,14 @@ class TensorNameMap:
             "transformer.decoder_layer.{bid}.moe.linear",   # Grok (merged)
             "transformer.blocks.{bid}.ffn.experts.mlp.w1",  # dbrx
             "model.layers.{bid}.mlp.experts.gate_proj",     # qwen2moe (merged)
+            "model.layers.{bid}.block_sparse_moe.experts.w1", # minimax-m2/m3 (merged)
         ),
 
         MODEL_TENSOR.FFN_GATE_SHEXP: (
+            "model.layers.{bid}.block_sparse_moe.shared_experts.gate_proj",
             "model.layers.{bid}.mlp.shared_expert.gate_proj",  # qwen2moe
             "model.layers.{bid}.mlp.shared_experts.gate_proj", # deepseek2
+            "model.layers.{bid}.mlp.shared_mlp.gate_proj",     # hy_v3
         ),
 
         # Feed-forward down
@@ -396,11 +443,15 @@ class TensorNameMap:
             "transformer.decoder_layer.{bid}.moe.linear_1",  # Grok (merged)
             "transformer.blocks.{bid}.ffn.experts.mlp.w2",   # dbrx
             "model.layers.{bid}.mlp.experts.down_proj",      # qwen2moe (merged)
+            "model.layers.{bid}.feed_forward.experts.down_proj",  # lfm2moe (fused experts)
+            "model.layers.{bid}.block_sparse_moe.experts.w2", # minimax-m2/m3 (merged)
         ),
 
         MODEL_TENSOR.FFN_DOWN_SHEXP: (
+            "model.layers.{bid}.block_sparse_moe.shared_experts.down_proj",
             "model.layers.{bid}.mlp.shared_expert.down_proj",  # qwen2moe
             "model.layers.{bid}.mlp.shared_experts.down_proj", # deepseek2
+            "model.layers.{bid}.mlp.shared_mlp.down_proj",     # hy_v3
         ),
 
         MODEL_TENSOR.ATTN_Q_NORM: (
@@ -411,6 +462,7 @@ class TensorNameMap:
             "encoder.layer.{bid}.attention.self.layer_norm_q",                # jina-bert-v2
             "transformer.layers.{bid}.attn.q_norm",                           # openelm
             "model.layers.{bid}.attention.query_layernorm",                   # bailingmoe2
+            "model.layers.{bid}.self_attn.q_norm",                   # lfm2
         ),
 
         MODEL_TENSOR.ATTN_K_NORM: (
@@ -421,10 +473,25 @@ class TensorNameMap:
             "encoder.layer.{bid}.attention.self.layer_norm_k",                # jina-bert-v2
             "transformer.layers.{bid}.attn.k_norm",                           # openelm
             "model.layers.{bid}.attention.key_layernorm",                     # bailingmoe2
+            "model.layers.{bid}.self_attn.k_norm",                   # lfm2
         ),
 
         MODEL_TENSOR.ATTN_SINKS: (
             "model.layers.{bid}.self_attn.attention_sink_bias",                # MiMo DFlash
+            "model.layers.{bid}.self_attn.softmax_offset",                     # flint
+        ),
+
+        MODEL_TENSOR.DFLASH_ATTN_CONV_BASE: (
+            "model.layers.{bid}.attention_conv.base_kernel",
+        ),
+        MODEL_TENSOR.DFLASH_ATTN_CONV_PROJ: (
+            "model.layers.{bid}.attention_conv.kernel_projection",
+        ),
+        MODEL_TENSOR.DFLASH_FFN_CONV_BASE: (
+            "model.layers.{bid}.mlp_conv.base_kernel",
+        ),
+        MODEL_TENSOR.DFLASH_FFN_CONV_PROJ: (
+            "model.layers.{bid}.mlp_conv.kernel_projection",
         ),
 
         MODEL_TENSOR.ROPE_FREQS: (
@@ -468,6 +535,18 @@ class TensorNameMap:
             "model.layers.{bid}.post_per_layer_input_norm", # gemma4
         ),
 
+        MODEL_TENSOR.SHORTCONV_CONV: (
+            "model.layers.{bid}.conv.conv",                  # lfm2
+        ),
+
+        MODEL_TENSOR.SHORTCONV_INPROJ: (
+            "model.layers.{bid}.conv.in_proj",               # lfm2
+        ),
+
+        MODEL_TENSOR.SHORTCONV_OUTPROJ: (
+            "model.layers.{bid}.conv.out_proj",              # lfm2
+        ),
+
         MODEL_TENSOR.SSM_IN: (
             "model.layers.{bid}.in_proj",
             "backbone.layers.{bid}.mixer.in_proj",
@@ -476,6 +555,46 @@ class TensorNameMap:
         MODEL_TENSOR.SSM_CONV1D: (
             "model.layers.{bid}.conv1d",
             "backbone.layers.{bid}.mixer.conv1d",
+            'model.layers.{bid}.linear_attn.conv1d',
+            'layers.{bid}.linear_attn.conv1d',
+        ),
+
+        # Raon-1 / Kimi Linear short convolutions and RDA projections
+        MODEL_TENSOR.SSM_CONV1D_Q: (
+            "model.layers.{bid}.self_attn.q_conv1d",
+            "model.layers.{bid}.attention.q_conv1d",
+        ),
+        MODEL_TENSOR.SSM_CONV1D_K: (
+            "model.layers.{bid}.self_attn.k_conv1d",
+            "model.layers.{bid}.attention.k_conv1d",
+        ),
+        MODEL_TENSOR.SSM_CONV1D_V: (
+            "model.layers.{bid}.self_attn.v_conv1d",
+            "model.layers.{bid}.attention.v_conv1d",
+        ),
+        MODEL_TENSOR.SSM_F_A: (
+            "model.layers.{bid}.self_attn.f_a_proj",
+            "model.layers.{bid}.attention.f_a_proj",
+        ),
+        MODEL_TENSOR.SSM_F_B: (
+            "model.layers.{bid}.self_attn.f_b_proj",
+            "model.layers.{bid}.attention.f_b_proj",
+        ),
+        MODEL_TENSOR.SSM_BETA: (
+            "model.layers.{bid}.self_attn.b_proj",
+            "model.layers.{bid}.attention.b_proj",
+            'model.layers.{bid}.linear_attn.in_proj_b',
+            'layers.{bid}.linear_attn.in_proj_b',
+        ),
+        MODEL_TENSOR.SSM_RDA: (
+            "model.layers.{bid}.self_attn.rda_w_proj",
+            "model.layers.{bid}.attention.rda_w_proj",
+        ),
+        MODEL_TENSOR.SSM_NORM: (
+            "model.layers.{bid}.self_attn.o_norm",
+            "model.layers.{bid}.attention.o_norm",
+            'model.layers.{bid}.linear_attn.norm',
+            'layers.{bid}.linear_attn.norm',
         ),
 
         MODEL_TENSOR.SSM_X: (
@@ -486,11 +605,19 @@ class TensorNameMap:
         MODEL_TENSOR.SSM_DT: (
             "model.layers.{bid}.dt_proj",
             "backbone.layers.{bid}.mixer.dt_proj",
+            "model.layers.{bid}.self_attn.dt_proj",
+            "model.layers.{bid}.attention.dt_proj",
+            'model.layers.{bid}.linear_attn.dt_proj',
+            'layers.{bid}.linear_attn.dt_proj',
         ),
 
         MODEL_TENSOR.SSM_A: (
             "model.layers.{bid}.A_log",
             "backbone.layers.{bid}.mixer.A_log",
+            "model.layers.{bid}.self_attn.A_log",
+            "model.layers.{bid}.attention.A_log",
+            'model.layers.{bid}.linear_attn.A_log',
+            'layers.{bid}.linear_attn.A_log',
         ),
 
         MODEL_TENSOR.SSM_D: (
@@ -501,6 +628,8 @@ class TensorNameMap:
         MODEL_TENSOR.SSM_OUT: (
             "model.layers.{bid}.out_proj",
             "backbone.layers.{bid}.mixer.out_proj",
+            'model.layers.{bid}.linear_attn.out_proj',
+            'layers.{bid}.linear_attn.out_proj',
         ),
 
         MODEL_TENSOR.ATTN_Q_A: (
@@ -685,16 +814,147 @@ class TensorNameMap:
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM: (
             "model.layers.{bid}.shared_head.norm",
         ),
+
+        MODEL_TENSOR.INDEXER_K_NORM: (
+            "model.layers.{bid}.indexer.k_norm",
+        ),
+
+        MODEL_TENSOR.INDEXER_PROJ: (
+            "model.layers.{bid}.indexer.proj",
+        ),
+
+        MODEL_TENSOR.INDEXER_ATTN_K: (
+            "model.layers.{bid}.indexer.attn_k",
+        ),
+
+        MODEL_TENSOR.INDEXER_ATTN_Q_B: (
+            "model.layers.{bid}.indexer.attn_q_b",
+        ),
+
+        MODEL_TENSOR.INDEXER_Q_PROJ: (
+            "model.layers.{bid}.self_attn.index_q_proj", # minimax-m3
+        ),
+
+        MODEL_TENSOR.INDEXER_Q_NORM: (
+            "model.layers.{bid}.self_attn.index_q_norm", # minimax-m3
+        ),
+
+        MODEL_TENSOR.INDEXER_K_PROJ: (
+            "model.layers.{bid}.self_attn.index_k_proj", # minimax-m3
+        ),
+
+        MODEL_TENSOR.INDEX_K_NORM: (
+            "model.layers.{bid}.self_attn.index_k_norm", # minimax-m3
+        ),
     }
 
     # architecture-specific block mappings
     arch_block_mappings_cfg: dict[MODEL_ARCH, dict[MODEL_TENSOR, tuple[str, ...]]] = {
+        MODEL_ARCH.QWEN4EXP: {
+            MODEL_TENSOR.HC_ATTN_NORM: ('model.layers.{bid}.attn_hyper_connection.hc_norm',),
+            MODEL_TENSOR.HC_ATTN_DOWN: ('model.layers.{bid}.attn_hyper_connection.input_mix_weight_down',),
+            MODEL_TENSOR.HC_ATTN_UP: ('model.layers.{bid}.attn_hyper_connection.input_mix_weight_up',),
+            MODEL_TENSOR.HC_ATTN_INJECT: ('model.layers.{bid}.attn_hyper_connection.block_inject_weight',),
+            MODEL_TENSOR.HC_FFN_NORM: ('model.layers.{bid}.mlp_hyper_connection.hc_norm',),
+            MODEL_TENSOR.HC_FFN_DOWN: ('model.layers.{bid}.mlp_hyper_connection.input_mix_weight_down',),
+            MODEL_TENSOR.HC_FFN_UP: ('model.layers.{bid}.mlp_hyper_connection.input_mix_weight_up',),
+            MODEL_TENSOR.HC_FFN_INJECT: ('model.layers.{bid}.mlp_hyper_connection.block_inject_weight',),
+            MODEL_TENSOR.HC_HEAD_NORM: ('model.hyper_connection_mixer.hc_norm',),
+            MODEL_TENSOR.HC_HEAD_DOWN: ('model.hyper_connection_mixer.input_mix_weight_down',),
+            MODEL_TENSOR.HC_HEAD_UP: ('model.hyper_connection_mixer.input_mix_weight_up',),
+            MODEL_TENSOR.NEXTN_HC_HEAD_NORM: ('model.layers.{bid}.nextn_hc_head.hc_norm',),
+            MODEL_TENSOR.NEXTN_HC_HEAD_DOWN: ('model.layers.{bid}.nextn_hc_head.input_mix_weight_down',),
+            MODEL_TENSOR.NEXTN_HC_HEAD_UP: ('model.layers.{bid}.nextn_hc_head.input_mix_weight_up',),
+            MODEL_TENSOR.INDEXER_Q_NORM: ('model.layers.{bid}.self_attn.indexer.q_layernorm',),
+            MODEL_TENSOR.INDEX_K_NORM: ('model.layers.{bid}.self_attn.indexer.k_layernorm',),
+            MODEL_TENSOR.PLE_KEY: ('model.layers.{bid}.ple.key_proj',),
+            MODEL_TENSOR.PLE_VALUE: ('model.layers.{bid}.ple.value_proj',),
+            MODEL_TENSOR.PLE_NORM_KEY: ('model.layers.{bid}.ple.norm_key',),
+            MODEL_TENSOR.PLE_NORM_QUERY: ('model.layers.{bid}.ple.norm_query',),
+            MODEL_TENSOR.PLE_NORM_CONV: ('model.layers.{bid}.ple.norm_conv',),
+            MODEL_TENSOR.PLE_CONV1D: ('model.layers.{bid}.ple.conv1d',),
+        },
+
         MODEL_ARCH.ARCTIC: {
             MODEL_TENSOR.FFN_NORM: (
                 "model.layers.{bid}.residual_layernorm",
             ),
             MODEL_TENSOR.FFN_NORM_EXP: (
                 "model.layers.{bid}.post_attention_layernorm",
+            ),
+        },
+        # openPangu-2.0: disambiguate the sandwich norms (post_attention/pre_mlp/post_mlp)
+        # from the generic collisions, and pin all Pangu-only block tensors.
+        MODEL_ARCH.OPENPANGU: {
+            MODEL_TENSOR.ATTN_POST_NORM: (
+                "model.layers.{bid}.post_attention_layernorm",
+            ),
+            MODEL_TENSOR.FFN_NORM: (
+                "model.layers.{bid}.pre_mlp_layernorm",
+            ),
+            MODEL_TENSOR.FFN_POST_NORM: (
+                "model.layers.{bid}.post_mlp_layernorm",
+            ),
+            MODEL_TENSOR.BLOCK_POST_NORM: (
+                "model.layers.{bid}.block_post_layernorm",
+            ),
+            MODEL_TENSOR.FFN_EXP_PROBS_B: (
+                "model.layers.{bid}.mlp.e_score_correction",
+            ),
+            # DSA lightning indexer
+            MODEL_TENSOR.INDEXER_K_NORM: (
+                "model.layers.{bid}.self_attn.indexer.k_norm",
+            ),
+            MODEL_TENSOR.INDEXER_PROJ: (
+                "model.layers.{bid}.self_attn.indexer.weights_proj",
+            ),
+            MODEL_TENSOR.INDEXER_ATTN_K: (
+                "model.layers.{bid}.self_attn.indexer.wk",
+            ),
+            MODEL_TENSOR.INDEXER_ATTN_Q_B: (
+                "model.layers.{bid}.self_attn.indexer.wq_b",
+            ),
+            # MoME causal convs
+            MODEL_TENSOR.ATTN_QA_CONV: (
+                "model.layers.{bid}.self_attn.qa_conv",
+            ),
+            MODEL_TENSOR.ATTN_KV_CONV: (
+                "model.layers.{bid}.self_attn.compresskv_conv",
+            ),
+            MODEL_TENSOR.ATTN_O_CONV: (
+                "model.layers.{bid}.self_attn.o_conv",
+            ),
+            # learned static param sink
+            MODEL_TENSOR.ATTN_PARAM_SINK_KV: (
+                "model.layers.{bid}.self_attn.param_sink_compressed_kv",
+            ),
+            MODEL_TENSOR.ATTN_PARAM_SINK_K_PE: (
+                "model.layers.{bid}.self_attn.param_sink_k_pe",
+            ),
+            # mHC / Hyper-Connections (per attn + per mlp)
+            MODEL_TENSOR.MHC_ATTN_PHI: (
+                "model.layers.{bid}.attn_mhc_module.phi",
+            ),
+            MODEL_TENSOR.MHC_ATTN_ALPHA: (
+                "model.layers.{bid}.attn_mhc_module.branch_alpha",
+            ),
+            MODEL_TENSOR.MHC_ATTN_BETA: (
+                "model.layers.{bid}.attn_mhc_module.branch_beta",
+            ),
+            MODEL_TENSOR.MHC_ATTN_GAMMA: (
+                "model.layers.{bid}.attn_mhc_module.norm_gamma",
+            ),
+            MODEL_TENSOR.MHC_MLP_PHI: (
+                "model.layers.{bid}.mlp_mhc_module.phi",
+            ),
+            MODEL_TENSOR.MHC_MLP_ALPHA: (
+                "model.layers.{bid}.mlp_mhc_module.branch_alpha",
+            ),
+            MODEL_TENSOR.MHC_MLP_BETA: (
+                "model.layers.{bid}.mlp_mhc_module.branch_beta",
+            ),
+            MODEL_TENSOR.MHC_MLP_GAMMA: (
+                "model.layers.{bid}.mlp_mhc_module.norm_gamma",
             ),
         },
     }

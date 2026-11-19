@@ -47,6 +47,7 @@ In order to build `ik_llama.cpp` you have four different options.
     - For `Q4_0_4_4` quantization type build, add the `-DGGML_LLAMAFILE=OFF` cmake option. For example, use `cmake -B build -DGGML_LLAMAFILE=OFF`.
     - For faster compilation, add the `-j` argument to run multiple jobs in parallel. For example, `cmake --build build --config Release -j 8` will run 8 jobs in parallel.
     - For faster repeated compilation, install [ccache](https://ccache.dev/).
+    - `-DGGML_MAX_CONTEXTS=N` no longer limits the number of live GGML contexts. On Windows, values above 512 still raise the model loader's stdio limit for models with more than 512 shards; the limit is capped at 8192.
     - For debug builds, there are two cases:
 
       1. Single-config generators (e.g. default = `Unix Makefiles`; note that they just ignore the `--config` flag):
@@ -115,14 +116,14 @@ Now, ik_llama.cpp is ready-to-use, you have to copy C:\Downloads\output_compilat
 </li>
  </ol>
 
-Example of use with very effective RAM + VRAM split scheme for Zen4 AMD CPU with 16 physical cores for most of cases (this model has `qwen3moe.block_count` being 48):
+Example of use with very effective RAM + VRAM split scheme for Zen4 AMD CPU with 16 physical cores in most cases (this model has `qwen3moe.block_count` being 48):
 
-`> llama-cli -m ../Qwen3-30B-A3B-Thinking-2507-IQ4_XS.gguf -ot blk.[1-9][0-9].ffn=CPU -fa on  -ctk q8_0 -ctv q4_0 -ngl 99 --threads 16 --ctx-size 64000 --prompt "Tell me 'Good morning' in  3 difference languages." -mla 3 -amb 512 -b 64 -ub 64`
+`> llama-cli -m ../Qwen3-30B-A3B-Thinking-2507-IQ4_XS.gguf -ot blk.[1-9][0-9].ffn=CPU -fa on  -ctk q8_0 -ctv q4_0 -ngl 99 --threads 16 --ctx-size 64000 --prompt "Tell me 'Good morning' in 3 different languages." -mla 3 -amb 512 -b 64 -ub 64`
 During execution, this command will load almost all non-attention (i.e., "fat" ffn tensors which are less sensitive to slow RAM speed) tensors, starting from 10th, to RAM while keeping the rest in VRAM and answer your prompt and report RAM and VRAM usage at 27 t/s (token generation speed):
 ```
-Tensor blk.10.ffn_norm.weight buffer type overriden to CPU
+Tensor blk.10.ffn_norm.weight buffer type overridden to CPU
 ...
-Tensor blk.47.ffn_down_exps.weight buffer type overriden to CPU
+Tensor blk.47.ffn_down_exps.weight buffer type overridden to CPU
 ...
 llm_load_tensors:        CPU buffer size = 12026.22 MiB
 llm_load_tensors:        CPU buffer size =   166.92 MiB
@@ -134,7 +135,7 @@ llama_new_context_with_model:  CUDA_Host  output buffer size =     0.58 MiB
 llama_new_context_with_model:      CUDA0 compute buffer size =    38.10 MiB
 llama_new_context_with_model:  CUDA_Host compute buffer size =     8.31 MiB
 ```
-`llm_load_tensors` say that "fat" tensors from 10th to 47th took 12026.22 MiB of RAM with 167 MB of temporary data on RAM while the rest of tensors took 3780.44 MiB of VRAM (which, in sum, roughly equals the size of Qwen3-30B-A3B-Thinking-2507-IQ4_XS.gguf - 15.9 GB). `llama_kv_cache_init` says that your KV context storage is kept on VRAM and takes ~2.4GB of VRAM. `llama_new_context_with_model` say that temporary data takes ~50 MB of VRAM. Larger values of -b and -ub can increase interference speed by 5-10% while sacrificing 300-600 MB of VRAM.
+`llm_load_tensors` says that "fat" tensors from 10th to 47th took 12026.22 MiB of RAM with 167 MB of temporary data on RAM while the rest of tensors took 3780.44 MiB of VRAM (which, in sum, roughly equals the size of Qwen3-30B-A3B-Thinking-2507-IQ4_XS.gguf - 15.9 GB). `llama_kv_cache_init` says that your KV context storage is kept on VRAM and takes ~2.4GB of VRAM. `llama_new_context_with_model` says that temporary data takes ~50 MB of VRAM. Larger values of -b and -ub can increase inference speed by 5-10% while sacrificing 300-600 MB of VRAM.
  
 <ul>
     <li>
@@ -232,7 +233,14 @@ Mechanics:
   `__AVX512CD__`), and the `GGML_AVX512_VNNI=ON` / `_VBMI=ON` / `_BF16=ON`
   options add the corresponding `__AVX512VNNI__` / `__AVX512VBMI__` /
   `__AVX512BF16__` definitions explicitly. See
-  [`ggml/src/CMakeLists.txt:1352-1374`](../ggml/src/CMakeLists.txt#L1352-L1374).
+  [`ggml/src/CMakeLists.txt:1157-1174`](../ggml/src/CMakeLists.txt#L1157-L1174).
+- With `GGML_NATIVE=ON` the three extension options no longer have to be passed
+  by hand on MSVC. `ggml/cmake/FindSIMD.cmake` compiles and runs a small test
+  for VNNI, VBMI and BF16 and turns each option on only if the CPU executes it.
+  Passing them on the command line still works, but detection has the final
+  say: on a CPU that fails the test the option is turned back off, so a machine
+  without AVX512-VNNI cannot end up with `__AVX512VNNI__` defined and a binary
+  that faults on the first IQK kernel.
 - On GCC / Clang, `GGML_NATIVE=ON` resolves `-march=native` to a target
   that defines the macros (on Zen4, `znver4`; on Sapphire Rapids,
   `sapphirerapids`), and the same `GGML_AVX512_*=ON` options add explicit
@@ -360,7 +368,7 @@ Check [Optimizing and Running LLaMA2 on Intel® CPU](https://www.intel.com/conte
 
 This provides GPU acceleration using the CUDA cores of your Nvidia GPU. Make sure to have the CUDA toolkit installed. You can download it from your Linux distro's package manager (e.g. `apt install nvidia-cuda-toolkit`) or from here: [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads).
 
-For Jetson user, if you have Jetson Orin, you can try this: [Offical Support](https://www.jetson-ai-lab.com/tutorial_text-generation.html). If you are using an old model(nano/TX2), need some additional operations before compiling.
+For Jetson user, if you have Jetson Orin, you can try this: [Official Support](https://www.jetson-ai-lab.com/tutorial_text-generation.html). If you are using an old model(nano/TX2), need some additional operations before compiling.
 
 - Using `make`:
   ```bash
@@ -386,7 +394,7 @@ The following compilation options are also available to tweak performance:
 | GGML_CUDA_MMV_Y               | Positive integer       | 1       | Block size in y direction for the CUDA mul mat vec kernels. Increasing this value can improve performance on fast GPUs. Power of 2 recommended.                                                                                                                                         |
 | GGML_CUDA_FORCE_MMQ           | Boolean                | false   | Force the use of custom matrix multiplication kernels for quantized models instead of FP16 cuBLAS even if there is no int8 tensor core implementation available (affects V100, RDNA3). MMQ kernels are enabled by default on GPUs with int8 tensor core support. With MMQ force enabled, speed for large batch sizes will be worse but VRAM consumption will be lower.                       |
 | GGML_CUDA_FORCE_CUBLAS        | Boolean                | false   | Force the use of FP16 cuBLAS instead of custom matrix multiplication kernels for quantized models                                                                                                                                                                                       |
-| GGML_CUDA_F16                 | Boolean                | false   | If enabled, use half-precision floating point arithmetic for the CUDA dequantization + mul mat vec kernels and for the q4_1 and q5_1 matrix matrix multiplication kernels. Can improve performance on relatively recent GPUs.                                                           |
+| GGML_CUDA_F16                 | Boolean                | false   | If enabled, use half-precision floating point arithmetic for the CUDA dequantization + mul mat vec kernels and for the q4_1 and q5_1 matrix-matrix multiplication kernels. Can improve performance on relatively recent GPUs.                                                           |
 | GGML_CUDA_KQUANTS_ITER        | 1 or 2                 | 2       | Number of values processed per iteration and per CUDA thread for Q2_K and Q6_K quantization formats. Setting this value to 1 can improve performance for slow GPUs.                                                                                                                     |
 | GGML_CUDA_PEER_MAX_BATCH_SIZE | Positive integer       | 128     | Maximum batch size for which to enable peer access between multiple GPUs. Peer access requires either Linux or NVLink. When using NVLink enabling peer access for larger batch sizes is potentially beneficial.                                                                         |
 | GGML_CUDA_FA_ALL_QUANTS       | Boolean                | false   | Compile support for all KV cache quantization type (combinations) for the FlashAttention CUDA kernels. More fine-grained control over KV cache size but compilation takes much longer.                                                                                                  |

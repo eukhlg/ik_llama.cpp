@@ -34,9 +34,16 @@ IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int ne11, int un
         int typeA, const void * Aup, const void * Agate, long strideA,
         int typeB, const void * B, long strideB,
         const char * up_b, const char * gate_b,
-        float * C, long nb1, long nb2, const void * vrow_mapping, float limit, int ith, int nth);
+        float * C, long nb1, long nb2, const void * vrow_mapping, float limit,
+        float situ_beta, float situ_beta_linear, int ith, int nth);
 
 IQK_API int iqk_dequant_type(int type, int Ny);
+
+IQK_API void iqk_vec_dot_f8_e4m3_ks(int n, float * s, size_t bs, const void * x, size_t bx,
+        const void * y, size_t by, int nrc);
+IQK_API void iqk_vec_dot_f8_e4m3_b128(int n, float * s, size_t bs, const void * x, size_t bx,
+        const void * y, size_t by, int nrc);
+
 
 struct ggml_tensor;
 
@@ -77,6 +84,9 @@ IQK_API bool iqk_fused_delta_net(int head_dim, int n_heads, int gqa_ratio, int r
         size_t vnb1, size_t vnb2, size_t vnb3,
         const float * q_data, const float * k_data, const float * v_data, const float * g_data, const float * beta_data,
         const float * state_in, float * out_data, float * state_out, float * saved_steps, int state_step_stride, int ith, int nth);
+
+IQK_API bool iqk_indexer_topk(struct ggml_tensor * dst, void * work_buffer, barrier_t barrier, void * barrier_data, int ith, int nth);
+IQK_API size_t iqk_idx_topk_work_buffer_size(const struct ggml_tensor * dst, int nthread);
 
 #ifdef __cplusplus
 }

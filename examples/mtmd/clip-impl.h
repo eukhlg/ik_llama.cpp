@@ -40,6 +40,7 @@
 #define KEY_FEATURE_LAYER       "clip.vision.feature_layer"
 #define KEY_PROJ_SCALE_FACTOR   "clip.vision.projector.scale_factor"
 #define KEY_SPATIAL_MERGE_SIZE  "clip.vision.spatial_merge_size"
+#define KEY_TEMPORAL_PATCH_SIZE "clip.vision.temporal_patch_size"
 #define KEY_IS_DEEPSTACK_LAYERS "clip.vision.is_deepstack_layers"
 
 #define KEY_MM_PATCH_MERGE_TYPE   "clip.vision.mm_patch_merge_type"
@@ -62,9 +63,10 @@
 
 #define TN_POS_EMBD        "%s.position_embd.weight"
 #define TN_CLASS_EMBD      "v.class_embd"
-#define TN_PATCH_EMBD      "v.patch_embd.weight"  // not rename tensor with ".0" postfix for backwrad compat
+#define TN_PATCH_EMBD      "v.patch_embd.weight"  // not rename tensor with ".0" postfix for backward compat
 #define TN_PATCH_EMBD_1    "v.patch_embd.weight.1"
 #define TN_PATCH_BIAS      "v.patch_embd.bias"
+#define TN_PATCH_NORM      "v.patch_norm.%d.%s"
 #define TN_ATTN_QKV        "%s.blk.%d.attn_qkv.%s"
 #define TN_ATTN_K          "%s.blk.%d.attn_k.%s"
 #define TN_ATTN_Q          "%s.blk.%d.attn_q.%s"
@@ -73,7 +75,6 @@
 #define TN_ATTN_K_NORM     "%s.blk.%d.attn_k_norm.%s"
 #define TN_ATTN_Q_NORM     "%s.blk.%d.attn_q_norm.%s"
 #define TN_FFN_DOWN        "%s.blk.%d.ffn_down.%s"
-#define TN_FFN_GATE        "%s.blk.%d.ffn_gate.%s"
 #define TN_FFN_UP          "%s.blk.%d.ffn_up.%s"
 #define TN_FFN_GATE        "%s.blk.%d.ffn_gate.%s"
 #define TN_LN_1            "%s.blk.%d.ln1.%s" // layer norm
@@ -85,18 +86,26 @@
 #define TN_FFN_POST_NORM   "%s.blk.%d.ffn_post_norm.%s"  // post-FFN norm (gemma4)
 #define TN_LN_PRE          "%s.pre_ln.%s"
 #define TN_LN_POST         "%s.post_ln.%s"
+#define TN_NORM_EMBD       "%s.norm_embd.%s"
 #define TN_LLAVA_PROJ      "mm.%d.%s"
 #define TN_MVLM_PROJ_MLP   "mm.model.mlp.%d.%s"
 #define TN_MVLM_PROJ_BLOCK "mm.model.mb_block.%d.block.%d.%s"
 #define TN_MVLM_PROJ_PEG   "mm.model.peg.%d.%s"
 #define TN_IMAGE_NEWLINE   "model.image_newline"
+#define TN_IMAGE_NEWLINE_V "v.image_newline" // deepseek4v (fork v. prefix convention)
 #define TN_MM_INP_NORM     "mm.input_norm.weight"
 #define TN_MM_INP_NORM_B   "mm.input_norm.bias"
 #define TN_MM_INP_PROJ     "mm.input_projection.weight" // gemma3
+#define TN_A_MM_INP_PROJ   "mm.a.input_projection.%s"   // gemma4ua
 #define TN_MM_SOFT_EMB_N   "mm.soft_emb_norm.weight"    // gemma3
 #define TN_MM_PROJECTOR    "mm.model.fc.weight"         // idefics3
-#define TN_MM_PATCH_MERGER "mm.patch_merger.weight"     // mistral small 3.1
+#define TN_MM_PATCH_MERGER "mm.patch_merger.weight"     // glm4v
+#define TN_MM_PATCH_MERGER_B "mm.patch_merger.bias"     // glm4v
+#define TN_MM_POST_NORM    "mm.post_norm.%s"            // glm4v
 #define TN_TOK_IMG_BREAK   "v.token_embd.img_break"     // pixtral
+#define TN_TOK_IMG_START   "v.token_embd.img_start"     // deepseek4v
+#define TN_TOK_IMG_END     "v.token_embd.img_end"       // deepseek4v
+#define TN_TOK_IMG_PAD     "v.token_embd.img_pad"       // deepseek4v
 #define TN_TOK_GLM_BOI     "adapter.boi"                // glm-edge (these embeddings are not in text model)
 #define TN_TOK_GLM_EOI     "adapter.eoi"                // glm-edge (these embeddings are not in text model)
 #define TN_DEEPSTACK_NORM  "v.deepstack.%d.norm.%s"     // qwen3vl deepstack
@@ -140,6 +149,22 @@
 // align x to upper multiple of n
 #define CLIP_ALIGN(x, n) ((((x) + (n) - 1) / (n)) * (n))
 
+// deepseek4v: layout of the LLM token block built from the aligner grid
+struct dsv4_block_layout {
+    int rows;     // grid rows, padded to an even count
+    int row_len;  // grid width + 1 newline
+    int pad_last; // trailing pads
+    int n_out;    // total block size, including lead pads and the start/end sentinels
+};
+static inline dsv4_block_layout dsv4_get_block_layout(int n_llm_w, int n_llm_h, int lead_pad) {
+    dsv4_block_layout bl;
+    bl.rows     = n_llm_h + (n_llm_h % 2);
+    bl.row_len  = n_llm_w + 1;
+    bl.pad_last = (bl.rows / 2 * bl.row_len) % 2 * 2;
+    bl.n_out    = lead_pad + 1 + bl.rows * bl.row_len + bl.pad_last + 1;
+    return bl;
+}
+
 enum projector_type {
     PROJECTOR_TYPE_MLP,
     PROJECTOR_TYPE_MLP_NORM,
@@ -149,9 +174,12 @@ enum projector_type {
     PROJECTOR_TYPE_GLM_EDGE,
     PROJECTOR_TYPE_QWEN2VL,
     PROJECTOR_TYPE_QWEN3VL,
+    PROJECTOR_TYPE_LING3VL,
     PROJECTOR_TYPE_GEMMA3,
     PROJECTOR_TYPE_GEMMA4V,
     PROJECTOR_TYPE_GEMMA4A,
+    PROJECTOR_TYPE_GEMMA4UV,
+    PROJECTOR_TYPE_GEMMA4UA,
     PROJECTOR_TYPE_IDEFICS3,
     PROJECTOR_TYPE_PIXTRAL,
     PROJECTOR_TYPE_QWEN25VL,
@@ -167,6 +195,10 @@ enum projector_type {
     PROJECTOR_TYPE_LIGHTONOCR,
     PROJECTOR_TYPE_COGVLM,
     PROJECTOR_TYPE_JANUS_PRO,
+    PROJECTOR_TYPE_MINIMAX_M3_VL,
+    PROJECTOR_TYPE_DEEPSEEK4V,
+    PROJECTOR_TYPE_DEEPSEEK41,
+    PROJECTOR_TYPE_GLM4V,
     PROJECTOR_TYPE_UNKNOWN,
 
 };
@@ -180,9 +212,12 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_QWEN2VL,   "qwen2vl_merger"},
     { PROJECTOR_TYPE_QWEN25VL,  "qwen2.5vl_merger"},
     { PROJECTOR_TYPE_QWEN3VL,   "qwen3vl_merger"},
+    { PROJECTOR_TYPE_LING3VL,   "ling3vl"},
     { PROJECTOR_TYPE_GEMMA3,    "gemma3"},
     { PROJECTOR_TYPE_GEMMA4V,   "gemma4v"},
     { PROJECTOR_TYPE_GEMMA4A,   "gemma4a"},
+    { PROJECTOR_TYPE_GEMMA4UV,  "gemma4uv"},
+    { PROJECTOR_TYPE_GEMMA4UA,  "gemma4ua"},
     { PROJECTOR_TYPE_IDEFICS3,  "idefics3"},
     { PROJECTOR_TYPE_PIXTRAL,   "pixtral"},
     { PROJECTOR_TYPE_ULTRAVOX,  "ultravox"},
@@ -197,6 +232,10 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_LIGHTONOCR,"lightonocr"},
     { PROJECTOR_TYPE_COGVLM,    "cogvlm"},
     { PROJECTOR_TYPE_JANUS_PRO, "janus_pro"},
+    { PROJECTOR_TYPE_MINIMAX_M3_VL, "minimax_m3_vl"},
+    { PROJECTOR_TYPE_DEEPSEEK4V, "deepseek4v"},
+    { PROJECTOR_TYPE_DEEPSEEK41, "deepseek41"},
+    { PROJECTOR_TYPE_GLM4V,      "glm4v"},
 };
 
 static projector_type clip_projector_type_from_string(const std::string & str) {
@@ -225,6 +264,9 @@ struct clip_image_f32 {
     int ny;
 
     std::vector<float> buf;
+
+    // deepseek4v: leading IMAGE_PAD embeddings, aligns IMAGE_START to the compressor boundary
+    int32_t lead_pad = 0;
 };
 
 //
@@ -351,7 +393,7 @@ static std::string string_format(const char * fmt, ...) {
     GGML_ASSERT(size2 == size);
     va_end(ap2);
     va_end(ap);
-    return std::string(buf.data(), buf.size());
+    return std::string(buf.data(), size);
 }
 
 static void string_replace_all(std::string & s, const std::string & search, const std::string & replace) {

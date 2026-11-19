@@ -3189,7 +3189,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                     if (split) {
                         // src0 = weight matrix is saved as a transposed matrix for better memory layout.
                         // dst is NOT transposed.
-                        // The outputs of matrix matrix multiplications can therefore NOT simply be concatenated for >1 GPU.
+                        // The outputs of matrix-matrix multiplications can therefore NOT simply be concatenated for >1 GPU.
                         // Instead they need to be copied to the correct slice in ne0 = dst row index.
                         // If dst is a vector with ne0 == 1 then you don't have to do this but it still produces correct results.
                         float * dhf_dst_i = (float *) ((char *) dst_off_device + i02*nb2 + i03*nb3);
@@ -4409,7 +4409,7 @@ ggml_backend_sycl_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
         queue_ptr stream_src = src_ctx->stream;
         size_t size = ggml_nbytes(src);
 
-        //todo. it's dirty solutino to walkaroud known issue:device2device cross GPUs.
+        //todo. it's a dirty solution to workaround known issue:device2device cross GPUs.
         dev2dev_memcpy(*stream_dst, *stream_src, dst->data, src->data, size);
 
 //todo, it's known issue：error in device2device cross GPUs. reused when the issue is fixed. DON"T remove
@@ -4460,9 +4460,9 @@ static struct ggml_backend_buffer_i ggml_backend_sycl_buffer_interface = {
     /* .free_buffer     = */ ggml_backend_sycl_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_sycl_buffer_get_base,
     /* .init_tensor     = */ ggml_backend_sycl_buffer_init_tensor,
-    /* .memset_tensor   = */ ggml_backend_sycl_buffer_memset_tensor,	
+    /* .memset_tensor   = */ ggml_backend_sycl_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_sycl_buffer_set_tensor,
-	/* .memset_tensor   =*/  NULL,
+    /* .memset_tensor   =*/  NULL,
     /* .get_tensor      = */ ggml_backend_sycl_buffer_get_tensor,
     /* .cpy_tensor      = */ ggml_backend_sycl_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_sycl_buffer_clear,
@@ -4865,7 +4865,7 @@ static struct ggml_backend_buffer_i ggml_backend_sycl_split_buffer_interface = {
     /* .free_buffer     = */ ggml_backend_sycl_split_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_sycl_split_buffer_get_base,
     /* .init_tensor     = */ ggml_backend_sycl_split_buffer_init_tensor,
-	/* .memset_tensor   =*/  NULL,	
+    /* .memset_tensor   =*/  NULL,
     /* .set_tensor      = */ ggml_backend_sycl_split_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_sycl_split_buffer_get_tensor,
     /* .cpy_tensor      = */ NULL,
@@ -5201,7 +5201,7 @@ GGML_CALL static bool ggml_backend_sycl_supports_op(ggml_backend_t backend, cons
                     }
                 }
                 ggml_type src0_type = op->src[0]->type;
-                if (src0_type == GGML_TYPE_BF16) {
+                if (src0_type == GGML_TYPE_BF16 || src0_type == GGML_TYPE_F8_E4M3_KS || src0_type == GGML_TYPE_F8_E4M3_B128) {
                     return false;
                 }
                 return true;

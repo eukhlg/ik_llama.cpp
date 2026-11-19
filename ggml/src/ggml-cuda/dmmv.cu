@@ -667,13 +667,14 @@ static __global__ void dequantize_mul_mat_vec(const void * __restrict__ vx, cons
 
     const int tid = threadIdx.x;
 
-    const int iter_stride = 2*GGML_CUDA_DMMV_X;
-    const int vals_per_iter = iter_stride / WARP_SIZE; // num quantized vals per thread and i iter
-    const int y_offset = qr == 1 ? 1 : qk/2;
+    constexpr int iter_stride = 2*GGML_CUDA_DMMV_X;
+    constexpr int vals_per_iter = iter_stride / WARP_SIZE; // num quantized vals per thread and i iter
+    constexpr int y_offset = qr == 1 ? 1 : qk/2;
 
 // partial sum for each thread
 #ifdef GGML_CUDA_F16
     half2 tmp = {0.0f, 0.0f}; // two sums for f16 to take advantage of half2 intrinsics
+    auto yh = (const half2 *)y;
 #else
     float tmp = 0.0f;
 #endif // GGML_CUDA_F16
@@ -697,10 +698,14 @@ static __global__ void dequantize_mul_mat_vec(const void * __restrict__ vx, cons
             // matrix multiplication
             // for qr = 2 the y index needs to increase by 1 per j iter because of y_offset = qk/2
 #ifdef GGML_CUDA_F16
+            if constexpr (y_offset == 1) {
+                tmp = __hfma2(v, yh[(iybs + iqs + j/qr)/2], tmp);
+            } else {
             tmp += __hmul2(v, {
                 y[iybs + iqs + j/qr + 0],
                 y[iybs + iqs + j/qr + y_offset]
             });
+            }
 #else
             tmp += v.x * y[iybs + iqs + j/qr + 0];
             tmp += v.y * y[iybs + iqs + j/qr + y_offset];
@@ -939,6 +944,5 @@ bool ggml_cuda_dmmv_type_supported(ggml_type src0_type) {
         src0_type == GGML_TYPE_Q5_0 || src0_type == GGML_TYPE_Q5_1 ||
         src0_type == GGML_TYPE_Q8_0 || src0_type == GGML_TYPE_Q2_K ||
         src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_Q4_K ||
-        src0_type == GGML_TYPE_Q5_K || src0_type == GGML_TYPE_Q6_K ||
-        src0_type == GGML_TYPE_IQ2_KT || src0_type == GGML_TYPE_IQ3_KT || src0_type == GGML_TYPE_IQ4_KT;
+        src0_type == GGML_TYPE_Q5_K || src0_type == GGML_TYPE_Q6_K;
 }

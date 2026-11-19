@@ -26,7 +26,7 @@ See:
 
 These implementations search the token history for patterns and use matching sequences as draft candidates.
 They require no additional model but rely on patterns that have already appeared in the generated text.
-An example to use this approach can be the rewriting of source code by a LLM.
+An example to use this approach can be the rewriting of source code by an LLM.
 
 #### n-gram Map (`ngram-simple`)
 
@@ -128,6 +128,7 @@ Canonical stage keys:
 | `n_max` | Maximum drafted tokens for that stage |
 | `n_min` | Minimum usable drafted tokens for that stage |
 | `p_min` | Minimum speculative probability threshold |
+| `heads` | MTP heads to use; `1` is the default, while values above `1` and `0` (all model heads) are experimental |
 | `ngram_size_n` | Lookup n-gram size |
 | `ngram_size_m` | Draft m-gram size |
 | `ngram_min_hits` | Minimum matching hits for n-gram map stages |

@@ -119,6 +119,15 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+llama_build(test-sampling-history.cpp)
+llama_test(test-sampling-history)
+
+llama_build(test-ngram-cache.cpp)
+llama_test(test-ngram-cache)
+
+llama_build(test-mamba2.cpp)
+llama_test(test-mamba2)
+
 # build test-tokenizer-0 target once and add many tests
 add_executable(test-tokenizer-0 test-tokenizer-0.cpp)
 target_link_libraries(test-tokenizer-0 PRIVATE common)
@@ -188,6 +197,8 @@ llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
 llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp )
 llama_build_and_test(test-json-partial.cpp )
+llama_build_and_test(test-cpu-affinity.cpp )
+llama_build_and_test(test-nanbeige-loop.cpp )
 #llama_build_and_test(test-log.cpp)
 llama_build_and_test(
     test-peg-parser.cpp
@@ -202,6 +213,9 @@ llama_build_and_test(
 )
 llama_build_and_test(test-regex-partial.cpp)
 
+llama_build_and_test(test-iq4-ks-kt-decode.cpp)
+target_include_directories(test-iq4-ks-kt-decode PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
 # llama_target_and_test(test-opt.cpp) # SLOW
 
 llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")
@@ -213,4 +227,10 @@ get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
-
+add_executable(test-moe-cache-shares test-moe-cache-shares.cpp)
+target_link_libraries(test-moe-cache-shares PRIVATE llama)
+target_include_directories(test-moe-cache-shares PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/ggml/include)
+add_test(NAME test-moe-cache-shares COMMAND $<TARGET_FILE:test-moe-cache-shares>)

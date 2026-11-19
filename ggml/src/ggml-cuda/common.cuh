@@ -57,7 +57,9 @@
 #define CC_RDNA1      (CC_OFFSET_AMD + 1010)
 #define CC_RDNA2      (CC_OFFSET_AMD + 1030)
 #define CC_RDNA3      (CC_OFFSET_AMD + 1100)
-#define GGML_CUDA_CC_IS_NVIDIA(cc)   (cc < CC_OFFSET_MTHREADS)
+// CC_OFFSET_AMD is below CC_OFFSET_MTHREADS, so the AMD range has to be excluded explicitly.
+// An NVIDIA cc is 100*major + 10*minor and never comes anywhere near either offset
+#define GGML_CUDA_CC_IS_NVIDIA(cc)   (cc < CC_OFFSET_AMD)
 #define GGML_CUDA_CC_IS_AMD(cc)   (cc >= CC_OFFSET_AMD)
 
 #define MATRIX_ROW_PADDING 512 // last row of quant. matrices is a multiple of this to avoid out-of-bounds memory accesses
@@ -198,6 +200,10 @@ constexpr int ggml_cuda_highest_compiled_arch(const int arch) {
     return ggml_cuda_highest_compiled_arch_impl(arch, 0, __CUDA_ARCH_LIST__);
 }
 #else
+static constexpr bool ggml_cuda_has_arch(const int) {
+    return true;
+}
+
 static int ggml_cuda_highest_compiled_arch(const int arch) {
     return arch;
 }
@@ -246,6 +252,12 @@ static __device__ void no_device_code(
 #else
 #define NO_DEVICE_CODE //GGML_ABORT("NO_DEVICE_CODE not valid in host code.")
 #endif // __CUDA_ARCH__
+
+static __device__ __forceinline__ void ggml_cuda_syncwarp() {
+#ifndef GGML_USE_HIP
+    __syncwarp();
+#endif // GGML_USE_HIP
+}
 
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
 #pragma unroll
@@ -393,6 +405,32 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
 }
 
+#if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
+// look up the 8 nibbles of q4 in a 16 entry table. HIP emulates __byte_perm() with an 8 byte union
+// and four dynamically indexed byte loads, which end up in scratch, so the __byte_perm() version in
+// get_int_from_table_16() is an order of magnitude slower here. v_perm_b32 does the same in one
+// instruction, but takes one selector byte per output byte where prmt takes one nibble
+static __device__ __forceinline__ int2 ggml_cuda_perm_table_16(const int & q4, const int8_t * values) {
+    const uint32_t * values32 = (const uint32_t *)values;
+
+    const uint32_t q_even = q4;
+    const uint32_t q_odd  = q4 >> 4;
+
+    // indices 0-7 come from the lower half of the table, 8-15 from the upper half
+    const uint32_t v_even_low  = __builtin_amdgcn_perm(values32[1], values32[0], q_even & 0x07070707);
+    const uint32_t v_odd_low   = __builtin_amdgcn_perm(values32[1], values32[0], q_odd  & 0x07070707);
+    const uint32_t v_even_high = __builtin_amdgcn_perm(values32[3], values32[2], q_even & 0x07070707);
+    const uint32_t v_odd_high  = __builtin_amdgcn_perm(values32[3], values32[2], q_odd  & 0x07070707);
+
+    // bit 3 of each index picks the half, i.e. byte 0-3 or byte 4-7 of the pair above
+    const uint32_t mask_even = 0x03020100 | ((q_even & 0x08080808) >> 1);
+    const uint32_t mask_odd  = 0x03020100 | ((q_odd  & 0x08080808) >> 1);
+
+    return make_int2(__builtin_amdgcn_perm(v_even_high, v_even_low, mask_even),
+                     __builtin_amdgcn_perm(v_odd_high,  v_odd_low,  mask_odd));
+}
+#endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
+
 // TODO: move to ggml-common.h
 static constexpr __device__ int8_t kvalues_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
@@ -416,6 +454,12 @@ static __device__ __forceinline__ float iq1bn_fp8_to_float(uint8_t fp8) {
     return s.f;
 }
 
+static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
+    const uint32_t e = (x >> 3) & 0xf;
+    const uint32_t m = x & 0x7;
+    return e ? __uint_as_float((e + 120) << 23 | m << 20) : m*(1.0f/512);
+}
+
 template <ggml_type type>
 struct ggml_cuda_type_traits;
 
@@ -423,6 +467,13 @@ template<>
 struct ggml_cuda_type_traits<GGML_TYPE_F16> {
     static constexpr int qk = 1;
     static constexpr int qr = 1;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q2_0> {
+    static constexpr int qk = QK2_0;
+    static constexpr int qr = QR2_0;
+    static constexpr int qi = QI2_0;
 };
 
 template<>
@@ -566,6 +617,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ2_BN> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_PQ2_0> {
+    static constexpr int qk = QK_PQ2_0;
+    static constexpr int qr = PQR2_0;
+    static constexpr int qi = PQI2_0;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_IQ4_NL> {
     static constexpr int qk = QK4_NL;
     static constexpr int qr = QR4_NL;
@@ -577,6 +635,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_MXFP4> {
     static constexpr int qk = QK4_NL;
     static constexpr int qr = QR4_NL;
     static constexpr int qi = QI4_NL;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_NVFP4_KS> {
+    static constexpr int qk = QK_NVFP4;
+    static constexpr int qr = QR_NVFP4;
+    static constexpr int qi = QI_NVFP4;
 };
 
 template<>
@@ -671,6 +736,27 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ4_KS_R4> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_IQ3_KS_R16> {
+    static constexpr int qk = 32;   // block = 16 rows x 32 columns
+    static constexpr int qr = 2;
+    static constexpr int qi = 8;    // one lane per block (vdr = 8)
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_IQ4_KS_R16> {
+    static constexpr int qk = QK8_0;
+    static constexpr int qr = QR4_0;
+    static constexpr int qi = 16;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_IQ5_KS_R16> {
+    static constexpr int qk = QK8_0;
+    static constexpr int qr = QR4_0;
+    static constexpr int qi = 16;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_IQ4_KSS> {
     static constexpr int qk = QK_K;
     static constexpr int qr = QR4_XS;
@@ -741,6 +827,52 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ5_K_R4> {
 };
 
 
+#define QR_TQ 4
+#define QI_TQ (QK_TQK/QR_TQ)
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQ2_T> {
+    static constexpr int qk = QK_TQK;
+    static constexpr int qr = QR_TQ;
+    static constexpr int qi = QI_TQ;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQK6> {
+    static constexpr int qk = QK_TQK;
+    static constexpr int qr = QR_TQ;
+    static constexpr int qi = QI_TQ;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQK7> {
+    static constexpr int qk = QK_TQK;
+    static constexpr int qr = QR_TQ;
+    static constexpr int qi = QI_TQ;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQP5> {
+    static constexpr int qk = QK_TQP;
+    static constexpr int qr = QR_TQ;
+    static constexpr int qi = QI_TQ;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQP6> {
+    static constexpr int qk = QK_TQP;
+    static constexpr int qr = QR_TQ;
+    static constexpr int qi = QI_TQ;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQP7> {
+    static constexpr int qk = QK_TQP;
+    static constexpr int qr = QR_TQ;
+    static constexpr int qi = QI_TQ;
+};
+
+
 //////////////////////
 
 struct ggml_backend_cuda_context;
@@ -756,6 +888,7 @@ struct ggml_cuda_device_info {
         bool    vmm;                // virtual memory support
         size_t  vmm_granularity;    // granularity of virtual memory
         size_t  total_vram;
+        bool    integrated;
     };
 
     cuda_device_info devices[GGML_CUDA_MAX_DEVICES] = {};
@@ -840,6 +973,7 @@ struct ggml_tensor_extra_gpu {
 #endif
 
 struct ggml_cuda_graph;
+struct ggml_cuda_f8_lt_context;
 
 struct ggml_backend_cuda_context {
     int device;
@@ -850,14 +984,22 @@ struct ggml_backend_cuda_context {
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
+    void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
+
+#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11080
+    std::shared_ptr<ggml_cuda_f8_lt_context> f8_lt;
+#endif
+    std::unordered_map<const ggml_tensor *, int> f8_readers;
 
     int   fusion = GGML_CUDA_FUSION;
     int   offload_batch_size = GGML_CUDA_MIN_BATCH_OFFLOAD;
     int   offload_batch_size_per_byte = -1;
     int   mmq_id_thresh = 32;
     float fa_offset = 0.6931f; // ln(2)
+    bool  fabsum = false;      // opt-in: bound the fp16 accumulation error in the tile FA kernel
 #ifdef USE_CUDA_GRAPH
     bool use_cuda_graph = true;
+    int  max_graphs = 0;
 
     ggml_cuda_graph * cur_graph = nullptr;
 
@@ -896,6 +1038,28 @@ struct ggml_backend_cuda_context {
 
     cublasHandle_t cublas_handle() {
         return cublas_handle(device);
+    }
+
+    // cublasSetStream() resets the handle to the default workspace pool, and cuBLAS may then add
+    // memory nodes to captured CUDA graphs. Bind a per-(device, stream) workspace instead.
+    cublasHandle_t cublas_handle(int device, cudaStream_t stream) {
+        cublasHandle_t handle = cublas_handle(device);
+        CUBLAS_CHECK(cublasSetStream(handle, stream));
+#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
+        for (int is = 0; is < GGML_CUDA_MAX_STREAMS; ++is) {
+            if (streams[device][is] != stream) {
+                continue;
+            }
+            const size_t size = ggml_cuda_info().devices[device].cc >= 900 ? (size_t) 32 << 20 : (size_t) 4 << 20;
+            if (cublas_workspaces[device][is] == nullptr) {
+                ggml_cuda_set_device(device);
+                CUDA_CHECK(cudaMalloc(&cublas_workspaces[device][is], size));
+            }
+            CUBLAS_CHECK(cublasSetWorkspace(handle, cublas_workspaces[device][is], size));
+            break;
+        }
+#endif
+        return handle;
     }
 
     // pool

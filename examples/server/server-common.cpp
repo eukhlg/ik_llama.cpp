@@ -1,6 +1,7 @@
 #include "server-common.h"
 
 #include <algorithm>
+#include <cstdio>
 
 using raw_buffer = std::vector<uint8_t>;
 
@@ -33,6 +34,7 @@ void server_log(const char* level, const char* function, int line, const char* m
         {"timestamp", time(nullptr)},
     };
 
+    std::string out;
     if (server_log_json) {
         log.merge_patch({
             {"level",    level},
@@ -45,7 +47,7 @@ void server_log(const char* level, const char* function, int line, const char* m
             log.merge_patch(extra);
         }
 
-        printf("%s\n", log.dump(-1, ' ', false, json::error_handler_t::replace).c_str());
+        out = log.dump(-1, ' ', false, json::error_handler_t::replace);
     }
     else {
         char buf[1024];
@@ -62,10 +64,19 @@ void server_log(const char* level, const char* function, int line, const char* m
             ss << " " << el.key() << "=" << value;
         }
 
-        const std::string str = ss.str();
-        printf("%.*s\n", (int)str.size(), str.data());
+        out = ss.str();
     }
+    printf("%s\n", out.c_str());
     fflush(stdout);
+
+    // Mirror to --log-file when explicitly set (see log_target_changed()).
+    if (log_target_changed()) {
+        FILE * tgt = LOG_TARGET;
+        if (tgt != nullptr && tgt != stdout && tgt != stderr) {
+            fprintf(tgt, "%s\n", out.c_str());
+            fflush(tgt);
+        }
+    }
 }
 
 //
@@ -394,11 +405,16 @@ common_prefix find_common_text_token_prefix(const llama_context* ctx, const llam
     std::vector<size_t> b_list;
 
     if (exact) {
-        size_t lcp = common_part(a_str, b_str);
+        // Piece concatenation keeps the leading space that common_detokenize() strips.
+        std::string a_exact;
+        std::string b_exact;
+        for (auto t : a_sub) a_exact += common_token_to_piece(ctx, t, true);
+        for (auto t : b_sub) b_exact += common_token_to_piece(ctx, t, true);
+        const size_t lcp = common_part(a_exact, b_exact);
         string_prefix.first = lcp;
         string_prefix.second = lcp;
-        token_prefix.first = find_n_tokens_from_string(ctx, a_sub, string_prefix.first, 0, a_list);
-        token_prefix.second = find_n_tokens_from_string(ctx, b_sub, string_prefix.second, 0, b_list);
+        find_n_tokens_from_string(ctx, a_sub, string_prefix.first, 0, a_list);
+        find_n_tokens_from_string(ctx, b_sub, string_prefix.second, 0, b_list);
     }
     else {
         string_prefix = find_common_string_prefix(a_str, b_str, ignore_set);
@@ -756,7 +772,7 @@ json oaicompat_chat_params_parse(
                 }
 
                 p["type"] = "media_marker";
-                p["text"] = mtmd_default_marker();
+                p["text"] = get_media_marker();
                 p.erase("image_url");
 
             }
@@ -776,7 +792,7 @@ json oaicompat_chat_params_parse(
                 out_files.push_back(decoded_data);
 
                 p["type"] = "media_marker";
-                p["text"] = mtmd_default_marker();
+                p["text"] = get_media_marker();
                 p.erase("input_audio");
 
             }
@@ -1091,6 +1107,10 @@ json format_error_response(const std::string& message, const enum error_type typ
         type_str = "unavailable_error";
         code = 503;
         break;
+    case ERROR_TYPE_EXCEED_CONTEXT_SIZE:
+        type_str = "exceed_context_size_error";
+        code = 400;
+        break;
     }
     return json{
         {"code", code},
@@ -1126,7 +1146,6 @@ token_probabilities get_token_probabilities(llama_context* ctx, int idx, llama_t
             sampled_token_found = true;
         }
     }
-    for (int i = n_sorted; i < n_vocab; ++i) cum_sum += expf(sorted[i].first - max_l);
 
     float inv_cum_sum = 1 / cum_sum;
     for (int i = 0; i < n_sorted; ++i) cur[i].p *= inv_cum_sum;
@@ -1199,7 +1218,9 @@ size_t server_tokens::size_up_to_pos(llama_pos max_pos) const {
 
     size_t idx = 0;
     llama_pos pos = 0;
-
+    if (pos >= max_pos) {
+        return idx;
+    }
     while (idx < tokens.size()) {
         const auto media_it = map_idx_to_media.find(idx);
         if (media_it != map_idx_to_media.end()) {
@@ -1858,6 +1879,7 @@ server_tokens process_mtmd_prompt(mtmd_context* mctx, std::string prompt, std::v
     // multimodal
     mtmd_input_text inp_txt = {
         prompt.c_str(),
+        prompt.size(),
         /* add_special */   true,
         /* parse_special */ true,
     };

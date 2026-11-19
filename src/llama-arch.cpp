@@ -6,6 +6,8 @@
 
 static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_LLAMA,           "llama"        },
+    { LLM_ARCH_NANBEIGE,        "nanbeige"     },
+    { LLM_ARCH_K2_HORIZON,      "k2-horizon"   },
     { LLM_ARCH_LLAMA4,          "llama4"       },
     { LLM_ARCH_DECI,            "deci"         },
     { LLM_ARCH_FALCON,          "falcon"       },
@@ -28,11 +30,13 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_QWEN2VL,         "qwen2vl"      },
     { LLM_ARCH_QWEN3,           "qwen3"        },
     { LLM_ARCH_QWEN3MOE,        "qwen3moe"     },
+    { LLM_ARCH_FLINT,           "flint"        },
     { LLM_ARCH_QWEN3NEXT,       "qwen3next"    },
     { LLM_ARCH_QWEN3VL,         "qwen3vl"      },
     { LLM_ARCH_QWEN3VLMOE,      "qwen3vlmoe"   },
     { LLM_ARCH_QWEN35MOE,       "qwen35moe"    },
     { LLM_ARCH_QWEN35,          "qwen35"       },
+    { LLM_ARCH_QWEN4EXP,        "qwen4exp"     },
     { LLM_ARCH_MELLUM,          "mellum"       },
     { LLM_ARCH_PHI2,            "phi2"         },
     { LLM_ARCH_PHI3,            "phi3"         },
@@ -46,6 +50,8 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_GEMMA3,          "gemma3"       },
     { LLM_ARCH_STARCODER2,      "starcoder2"   },
     { LLM_ARCH_MAMBA,           "mamba"        },
+    { LLM_ARCH_NEMOTRON_H,      "nemotron_h"   },
+    { LLM_ARCH_NEMOTRON_H_MOE,  "nemotron_h_moe" },
     { LLM_ARCH_XVERSE,          "xverse"       },
     { LLM_ARCH_COMMAND_R,       "command-r"    },
     { LLM_ARCH_DBRX,            "dbrx"         },
@@ -53,6 +59,8 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_OPENELM,         "openelm"      },
     { LLM_ARCH_ARCTIC,          "arctic"       },
     { LLM_ARCH_DEEPSEEK2,       "deepseek2"    },
+    { LLM_ARCH_DEEPSEEK4,       "deepseek4"    },
+    { LLM_ARCH_DEEPSEEK41,      "deepseek41"   },
     { LLM_ARCH_CHATGLM,         "chatglm"      },
     { LLM_ARCH_GLM4,            "glm4"         },
     { LLM_ARCH_GLM4_MOE,        "glm4moe"      },
@@ -70,22 +78,40 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_ERNIE4_5,        "ernie4_5"     },
     { LLM_ARCH_ERNIE4_5_MOE,    "ernie4_5-moe" },
     { LLM_ARCH_HUNYUAN_MOE,     "hunyuan-moe"  },
+    { LLM_ARCH_HY_V3,           "hy_v3"        },
     { LLM_ARCH_OPENAI_MOE,      "gpt-oss"      },
     { LLM_ARCH_BAILINGMOE2,     "bailingmoe2"  },
+    { LLM_ARCH_BAILINGMOE3,     "bailingmoe3"  },
     { LLM_ARCH_MINIMAX_M2,      "minimax-m2"   },
     { LLM_ARCH_MINIMAX_M3,      "minimax-m3"   },
     { LLM_ARCH_SMOLLM3,         "smollm3"      },
     { LLM_ARCH_MISTRAL3,        "mistral3"     },
     { LLM_ARCH_MIMO2,           "mimo2"        },
     { LLM_ARCH_SEED_OSS,        "seed_oss"     },
+    { LLM_ARCH_STEP5,           "step5"        },
     { LLM_ARCH_STEP35,          "step35"       },
     { LLM_ARCH_LAGUNA,          "laguna"       },
     { LLM_ARCH_GLM_DSA,         "glm-dsa"      },
+    { LLM_ARCH_GLM5NEXT,        "glm5next"     },
+    { LLM_ARCH_GLM5NEXT_DASHED, "glm5-next"    },
     { LLM_ARCH_MISTRAL4,        "mistral4"     },
     { LLM_ARCH_GEMMA4,          "gemma4"       },
     { LLM_ARCH_GEMMA4_MTP,      "gemma4_mtp"   },
+    { LLM_ARCH_DFLASH,          "dflash"       },
+    { LLM_ARCH_DFLASH2,         "dflash"       },
     { LLM_ARCH_DFLASH_DRAFT,    "dflash-draft" },
     { LLM_ARCH_GEMMA4_ASSISTANT,"gemma4-assistant"   },
+    { LLM_ARCH_OPENPANGU,       "openpangu"    },
+    { LLM_ARCH_MUSE_GLIMMER,    "muse-glimmer" },
+    { LLM_ARCH_RICURSIVE,       "ricursive"    },
+    { LLM_ARCH_LFM2,            "lfm2"         },
+    { LLM_ARCH_LFM2MOE,         "lfm2moe"      },
+    { LLM_ARCH_LFM3,            "lfm3"         },
+    { LLM_ARCH_MAPLE,           "maple"        },
+    { LLM_ARCH_SPARK2_5,        "spark2_5"     },
+    { LLM_ARCH_RAON1,           "raon1"        },
+    { LLM_ARCH_RAON1_NANO,      "raon1nano"    },
+    { LLM_ARCH_XING4_0,         "xing4_0"      },
     { LLM_ARCH_UNKNOWN,         "(unknown)"    },
 };
 
@@ -125,9 +151,12 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_VOCAB_SIZE,                        "%s.vocab_size"                        },
     { LLM_KV_CONTEXT_LENGTH,                    "%s.context_length"                    },
     { LLM_KV_EMBEDDING_LENGTH,                  "%s.embedding_length"                  },
+    { LLM_KV_EMBEDDING_LENGTH_OUT,              "%s.embedding_length_out"              },
     { LLM_KV_EMBEDDING_LENGTH_PER_LAYER,        "%s.embedding_length_per_layer_input"  },
     { LLM_KV_BLOCK_COUNT,                       "%s.block_count"                       },
     { LLM_KV_LEADING_DENSE_BLOCK_COUNT,         "%s.leading_dense_block_count"         },
+    { LLM_KV_ACTIVATION_SITU_BETA,              "%s.activation.situ_beta"              },
+    { LLM_KV_ACTIVATION_SITU_LINEAR_BETA,       "%s.activation.situ_linear_beta"       },
     { LLM_KV_FEED_FORWARD_LENGTH,               "%s.feed_forward_length"               },
     { LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        "%s.expert_feed_forward_length"        },
     { LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, "%s.expert_shared_feed_forward_length" },
@@ -139,8 +168,14 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_EXPERT_GROUP_COUNT,                "%s.expert_group_count"                },
     { LLM_KV_EXPERT_GROUP_USED_COUNT,           "%s.expert_group_used_count"           },
     { LLM_KV_EXPERT_WEIGHTS_SCALE,              "%s.expert_weights_scale"              },
+    { LLM_KV_MOE_LATENT_SIZE,                   "%s.moe_latent_size"                   },
     { LLM_KV_EXPERT_WEIGHTS_NORM,               "%s.expert_weights_norm"               },
     { LLM_KV_EXPERT_GATING_FUNC,                "%s.expert_gating_func"                },
+    // K2 Horizon MoVA
+    { LLM_KV_ATTENTION_GROUPNORM_GROUPS,       "%s.attention.group_norm_groups"        },
+    { LLM_KV_ATTENTION_VALUE_EXPERT_COUNT,     "%s.attention.value_expert_count"       },
+    { LLM_KV_ATTENTION_VALUE_EXPERT_USED_COUNT,"%s.attention.value_expert_used_count"  },
+
     { LLM_KV_NEXTN_PREDICT_LAYERS,              "%s.nextn_predict_layers"              },
     { LLM_KV_NUM_DEEPSTACK_LAYERS,              "%s.n_deepstack_layers"                },
     { LLM_KV_POOLING_TYPE,                      "%s.pooling_type"                      },
@@ -157,6 +192,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_SWIGLU_LIMITS_SHARED,              "%s.swiglu_limits_shared"              },
     { LLM_KV_SWIGLU_CLAMP_EXP,                  "%s.swiglu_clamp_exp"                  },
     { LLM_KV_SWIGLU_CLAMP_SHEXP,                "%s.swiglu_clamp_shexp"                },
+    { LLM_KV_SWIGLU_CLAMP,                      "%s.swiglu_clamp"                      },
     { LLM_KV_MTP_BACKBONE_EMBEDDING_LENGTH,     "%s.backbone_embedding_length"         },
     { LLM_KV_MTP_USE_ORDERED_EMBEDDINGS,        "%s.use_ordered_embeddings"            },
     { LLM_KV_MTP_CENTROID_COUNT,                "%s.centroid_count"                    },
@@ -164,8 +200,14 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_DFLASH_BLOCK_SIZE,                 "%s.dflash.block_size"                 },
     { LLM_KV_DFLASH_MASK_TOKEN_ID,              "%s.dflash.mask_token_id"              },
     { LLM_KV_DFLASH_TARGET_LAYER_IDS,           "%s.dflash.target_layer_ids"           },
+    { LLM_KV_DFLASH_TARGET_LAYERS,              "%s.target_layers"                      },
     { LLM_KV_DFLASH_N_TARGET_FEATURES,          "%s.dflash.n_target_features"          },
     { LLM_KV_DFLASH_BACKBONE_ROTARY_BASE,       "%s.dflash.backbone_rotary_base"       },
+    { LLM_KV_DFLASH_LAGUNA,                     "%s.dflash.laguna"                     },
+    { LLM_KV_DFLASH_CONV_KERNEL_SIZE,            "%s.conv_kernel_size"                   },
+    { LLM_KV_DFLASH_CONV_GROUP_SIZE,             "%s.conv_group_size"                    },
+    { LLM_KV_DFLASH_SELECTOR_RANK,               "%s.selector_rank"                      },
+    { LLM_KV_DFLASH_SELECTOR_TOP_K,              "%s.selector_top_k"                     },
 
     { LLM_KV_ATTENTION_HEAD_COUNT,             "%s.attention.head_count"             },
     { LLM_KV_ATTENTION_HEAD_COUNT_KV,          "%s.attention.head_count_kv"          },
@@ -175,12 +217,14 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_VALUE_LENGTH,           "%s.attention.value_length"           },
     { LLM_KV_ATTENTION_LAYERNORM_EPS,          "%s.attention.layer_norm_epsilon"     },
     { LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,      "%s.attention.layer_norm_rms_epsilon" },
+    { LLM_KV_ATTENTION_LATENT_NORM_RMS_EPS,    "%s.attention.latent_norm_rms_epsilon" },
     { LLM_KV_ATTENTION_CAUSAL,                 "%s.attention.causal"                 },
     { LLM_KV_ATTENTION_Q_LORA_RANK,            "%s.attention.q_lora_rank"            },
     { LLM_KV_ATTENTION_KV_LORA_RANK,           "%s.attention.kv_lora_rank"           },
     { LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT, "%s.attention.relative_buckets_count" },
     { LLM_KV_ATTENTION_SLIDING_WINDOW,         "%s.attention.sliding_window"         },
     { LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, "%s.attention.sliding_window_pattern" },
+    { LLM_KV_ATTENTION_ROPE_PATTERN,           "%s.attention.rope_pattern"           },
     { LLM_KV_ATTENTION_SCALE,                  "%s.attention.scale"                  },
     { LLM_KV_ATTENTION_OUTPUT_SCALE,           "%s.attention.output_scale"           },
     { LLM_KV_ATTENTION_TEMPERATURE_LENGTH,     "%s.attention.temperature_length"     },
@@ -190,11 +234,47 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,     "%s.attention.indexer.head_count"     },
     { LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,     "%s.attention.indexer.key_length"     },
     { LLM_KV_ATTENTION_INDEXER_TOP_K,          "%s.attention.indexer.top_k"          },
+    { LLM_KV_ATTENTION_INDEXER_KPOOL,          "%s.attention.indexer.kpool"          },
+    { LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,     "%s.attention.indexer.block_size"     },
+    { LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,     "%s.attention.output_group_count"     },
+    { LLM_KV_ATTENTION_OUTPUT_LORA_RANK,       "%s.attention.output_lora_rank"       },
+    { LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,"%s.attention.compress_rope_freq_base"},
+    { LLM_KV_ATTENTION_COMPRESS_RATIOS,        "%s.attention.compress_ratios"        },
     { LLM_KV_FULL_ATTENTION_INTERVAL,          "%s.full_attention_interval"          },
     { LLM_KV_ATTENTION_SHARED_KV_LAYERS,       "%s.attention.shared_kv_layers"       },
     { LLM_KV_ATTENTION_KEY_LENGTH_SWA,         "%s.attention.key_length_swa"         },
     { LLM_KV_ATTENTION_VALUE_LENGTH_SWA,       "%s.attention.value_length_swa"       },
     { LLM_KV_ATTENTION_VALUE_SCALE,            "%s.attention.value_scale"            },
+
+    { LLM_KV_HYPER_CONNECTION_COUNT,               "%s.hyper_connection.count"               },
+    { LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, "%s.hyper_connection.sinkhorn_iterations" },
+    { LLM_KV_HYPER_CONNECTION_EPSILON,          "%s.hyper_connection.epsilon"          },
+    { LLM_KV_HYPER_CONNECTION_MAGNITUDE,        "%s.hyper_connection.magnitude"        },
+    { LLM_KV_HYPER_CONNECTION_LOW_RANK,         "%s.hyper_connection.low_rank"         },
+
+    { LLM_KV_PLE_LAYERS,                       "%s.ple.layers"                      },
+    { LLM_KV_PLE_NGRAM_SIZE,                   "%s.ple.ngram_size"                  },
+    { LLM_KV_PLE_HEADS_PER_NGRAM,              "%s.ple.heads_per_ngram"             },
+    { LLM_KV_PLE_CONV_KERNEL,                  "%s.ple.conv_kernel"                 },
+    { LLM_KV_PLE_LAYER_MULTIPLIERS,            "%s.ple.layer_multipliers"           },
+    { LLM_KV_PLE_HEAD_OFFSETS,                 "%s.ple.head_offsets"                },
+    { LLM_KV_PLE_HEAD_VOCAB_SIZES,             "%s.ple.head_vocab_sizes"            },
+    { LLM_KV_PLE_EOS_TOKEN_ID,                 "%s.ple.eos_token_id"                },
+    { LLM_KV_PLE_IMAGE_TOKEN_ID,               "%s.ple.image_token_id"              },
+
+    { LLM_KV_HASH_LAYER_COUNT,                 "%s.hash_layer_count"                },
+    { LLM_KV_ENGRAM_HEAD_COUNT,      "%s.engram.head_count" },
+    { LLM_KV_ENGRAM_KEY_LENGTH,      "%s.engram.key_length" },
+    { LLM_KV_ENGRAM_MAX_NGRAM_SIZE,  "%s.engram.max_ngram_size" },
+    { LLM_KV_ENGRAM_LAYER_IDS,       "%s.engram.layer_ids" },
+    { LLM_KV_ENGRAM_MULTIPLIERS,     "%s.engram.multipliers" },
+    { LLM_KV_ENGRAM_PRIMES,          "%s.engram.primes" },
+    { LLM_KV_ENGRAM_OFFSETS,         "%s.engram.offsets" },
+    { LLM_KV_ENGRAM_TOKEN_MAP,       "%s.engram.token_map" },
+    { LLM_KV_ENGRAM_PAD_ID,          "%s.engram.pad_id" },
+    { LLM_KV_CANDIDATE_SOURCE_LAYER,         "%s.attention.candidate_source_layer_id" },
+    { LLM_KV_CANDIDATE_BLOCK_SIZE,           "%s.attention.candidate_block_size"      },
+    { LLM_KV_CANDIDATE_TOPK_BLOCKS,          "%s.attention.candidate_topk_blocks"     },
 
     { LLM_KV_ROPE_DIMENSION_COUNT,          "%s.rope.dimension_count"                 },
     { LLM_KV_ROPE_DIMENSION_COUNT_SWA,      "%s.rope.dimension_count_swa"             },
@@ -202,6 +282,8 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ROPE_DIMENSION_SECTIONS,       "%s.rope.dimension_sections"              },
     { LLM_KV_ROPE_FREQ_BASE,                "%s.rope.freq_base"                       },
     { LLM_KV_ROPE_FREQ_BASE_PER_LAYER,      "%s.rope.freq_base_per_layer"             },
+    { LLM_KV_NUM_LOOPS,                     "%s.num_loops"                            },
+    { LLM_KV_SKIP_LOOP_FINAL_NORM,          "%s.skip_loop_final_norm"                 },
     { LLM_KV_ROPE_FREQ_BASE_SWA,            "%s.rope.freq_base_swa"                   },
     { LLM_KV_ROPE_SCALE_LINEAR,             "%s.rope.scale_linear"                    },
     { LLM_KV_ROPE_SCALING_TYPE,             "%s.rope.scaling.type"                    },
@@ -219,14 +301,20 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_SPLIT_COUNT,                   "split.count"         },
     { LLM_KV_SPLIT_TENSORS_COUNT,           "split.tensors.count" },
 
+    { LLM_KV_SHORTCONV_L_CACHE,              "%s.shortconv.l_cache"  },
+
     { LLM_KV_SSM_CONV_KERNEL,               "%s.ssm.conv_kernel"    },
     { LLM_KV_SSM_INNER_SIZE,                "%s.ssm.inner_size"     },
     { LLM_KV_SSM_STATE_SIZE,                "%s.ssm.state_size"     },
     { LLM_KV_SSM_TIME_STEP_RANK,            "%s.ssm.time_step_rank" },
     { LLM_KV_SSM_GROUP_COUNT,               "%s.ssm.group_count"    },
+    { LLM_KV_KDA_HEAD_DIM,                  "%s.kda.head_dim"       },
+    { LLM_KV_KDA_SAFE_GATE,                 "%s.kda.safe_gate"      },
+    { LLM_KV_KDA_GATE_LOWER_BOUND,          "%s.kda.gate_lower_bound" },
 
     { LLM_KV_TOKENIZER_MODEL,                "tokenizer.ggml.model"                    },
     { LLM_KV_TOKENIZER_PRE,                  "tokenizer.ggml.pre"                      },
+    { LLM_KV_TOKENIZER_NORMALIZER_NFC,       "tokenizer.ggml.normalizer.nfc"           },
     { LLM_KV_TOKENIZER_LIST,                 "tokenizer.ggml.tokens"                   },
     { LLM_KV_TOKENIZER_TOKEN_TYPE,           "tokenizer.ggml.token_type"               },
     { LLM_KV_TOKENIZER_TOKEN_TYPE_COUNT,     "tokenizer.ggml.token_type_count"         },
@@ -264,13 +352,23 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
 
     { LLM_KV_ADAPTER_TYPE,                  "adapter.type"       },
     { LLM_KV_ADAPTER_LORA_ALPHA,            "adapter.lora.alpha" },
+
+    { LLM_KV_OPENPANGU_MHC_NUM_STREAM,      "%s.mhc_num_stream"     },
+    { LLM_KV_OPENPANGU_MHC_RECUR_NORM,      "%s.mhc_recur_norm"     },
+    { LLM_KV_OPENPANGU_PARAM_SINK_NUMBER,   "%s.param_sink_number"  },
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char* suffix) : arch(arch), suffix(suffix) {}
 
 std::string LLM_KV::operator()(llm_kv kv) const {
-    return suffix ? ::format(LLM_KV_NAMES.at(kv), LLM_ARCH_NAMES.at(arch), suffix)
-        : ::format(LLM_KV_NAMES.at(kv), LLM_ARCH_NAMES.at(arch));
+    std::string name = ::format(LLM_KV_NAMES.at(kv), LLM_ARCH_NAMES.at(arch));
+
+    if (suffix != nullptr) {
+        name += ".";
+        name += suffix;
+    }
+
+    return name;
 }
 
 const char * llama_model_arch_name(llm_arch arch) {
@@ -290,13 +388,52 @@ bool llm_arch_is_recurrent(const llm_arch & arch) {
     }
 }
 
+bool llm_arch_uses_qnext_state_layout(const llm_arch & arch) {
+    // Used to be inferred from ssm_n_group > 0, but Nemotron-H also sets ssm_n_group
+    // (grouped B/C) while using the standard Mamba-2 layout, so the set is explicit.
+    // RAON1 (KDA) and BAILINGMOE3 qualified through ssm_n_group before and keep that layout.
+    switch (arch) {
+        case LLM_ARCH_QWEN3NEXT:
+        case LLM_ARCH_QWEN4EXP:
+        case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_GLM5NEXT:
+        case LLM_ARCH_RAON1:
+        case LLM_ARCH_BAILINGMOE3:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool llm_arch_is_hybrid(const llm_arch & arch) {
     switch (arch) {
     case LLM_ARCH_QWEN3NEXT:
     case LLM_ARCH_QWEN35MOE:
     case LLM_ARCH_QWEN35:
+    case LLM_ARCH_QWEN4EXP:
+    case LLM_ARCH_DEEPSEEK4:
+    case LLM_ARCH_DEEPSEEK41:
+    case LLM_ARCH_OPENPANGU:
+    case LLM_ARCH_BAILINGMOE3:
+    case LLM_ARCH_GLM5NEXT:
+    case LLM_ARCH_LFM2:
+    case LLM_ARCH_LFM2MOE:
+    case LLM_ARCH_LFM3:
+    case LLM_ARCH_RAON1:
+    case LLM_ARCH_RAON1_NANO:
+    case LLM_ARCH_NEMOTRON_H:
+    case LLM_ARCH_NEMOTRON_H_MOE:
         return true;
     default:
         return false;
     }
+}
+
+bool llm_arch_is_dflash_family(const llm_arch & arch) {
+    return arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_DFLASH2 || arch == LLM_ARCH_DFLASH_DRAFT;
+}
+
+bool llm_arch_requires_all_graph_output_rows(const llm_arch & arch) {
+    return arch == LLM_ARCH_DFLASH2;
 }

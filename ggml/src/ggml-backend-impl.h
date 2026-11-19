@@ -69,7 +69,6 @@ extern "C" {
 
     // buffer that contains a collection of buffers
     GGML_CALL ggml_backend_buffer_t ggml_backend_multi_buffer_alloc_buffer(ggml_backend_buffer_t * buffers, size_t n_buffers);
-    GGML_CALL bool                  ggml_backend_buffer_is_multi_buffer(ggml_backend_buffer_t buffer);
     GGML_CALL void                  ggml_backend_multi_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage);
 
     //
@@ -123,10 +122,13 @@ extern "C" {
         void                 (*GGML_CALL event_free)        (ggml_backend_event_t event);
         // record an event on the backend instance that created it
         void                 (*GGML_CALL event_record)      (ggml_backend_event_t event);
-        // wait for an event on on a different backend instance
+        // wait for an event on a different backend instance
         void                 (*GGML_CALL event_wait)        (ggml_backend_t backend, ggml_backend_event_t event);
         // block until an event is recorded
         void                 (*GGML_CALL event_synchronize) (ggml_backend_event_t event);
+        bool         (*GGML_CALL cpy_all_inputs)(ggml_backend_sched_t sched, ggml_backend_t backend, int n_inputs,
+                      struct ggml_tensor ** inputs, struct ggml_tensor ** input_copies,
+                const struct ggml_tensor * node0, bool has_lru_cache);
     };
 
     struct ggml_backend {

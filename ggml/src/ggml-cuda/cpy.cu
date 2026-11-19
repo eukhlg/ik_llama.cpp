@@ -2,6 +2,7 @@
 #include "dequantize.cuh"
 #include "graph.cuh"
 #include "cpy-utils.cuh"
+#include "convert.cuh"
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
 #include "ggml-musa/mudnn.cuh"
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
@@ -211,8 +212,8 @@ static void ggml_cpy_f32_q8_0_cuda(
     const int nb03, const int ne10, const int ne11, const int ne12, const int nb10, const int nb11, const int nb12, const int nb13, cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
 
     GGML_ASSERT(ne % QK8_0 == 0);
-    const int num_blocks = ne / QK8_0;
-    cpy_f32_q<cpy_blck_f32_q8_0, QK8_0><<<num_blocks, 1, 0, stream>>>
+    const int num_blocks = (ne / QK8_0 + CUDA_CPY_BLOCK_SIZE - 1)/CUDA_CPY_BLOCK_SIZE;
+    cpy_f32_q<cpy_blck_f32_q8_0, QK8_0><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++);
 }
 
@@ -221,8 +222,9 @@ static void ggml_cpy_q8_0_f32_cuda(
     const int ne00, const int ne01, const int ne02, const int nb00, const int nb01, const int nb02,
     const int nb03, const int ne10, const int ne11, const int ne12, const int nb10, const int nb11, const int nb12, const int nb13, cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
 
-    const int num_blocks = ne;
-    cpy_q_f32<cpy_blck_q8_0_f32, QK8_0><<<num_blocks, 1, 0, stream>>>
+    GGML_ASSERT(ne % QK8_0 == 0);
+    const int num_blocks = (ne/QK8_0 + CUDA_CPY_BLOCK_SIZE - 1)/CUDA_CPY_BLOCK_SIZE;
+    cpy_q_f32<cpy_blck_q8_0_f32, QK8_0><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++);
 }
 
@@ -231,8 +233,9 @@ static void ggml_cpy_q8_0_f16_cuda(
     const int ne00, const int ne01, const int ne02, const int nb00, const int nb01, const int nb02,
     const int nb03, const int ne10, const int ne11, const int ne12, const int nb10, const int nb11, const int nb12, const int nb13, cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
 
-    const int num_blocks = ne;
-    cpy_q_f32<cpy_blck_q8_0_f16, QK8_0><<<num_blocks, 1, 0, stream>>>
+    GGML_ASSERT(ne % QK8_0 == 0);
+    const int num_blocks = (ne/QK8_0 + CUDA_CPY_BLOCK_SIZE - 1)/CUDA_CPY_BLOCK_SIZE;
+    cpy_q_f32<cpy_blck_q8_0_f16, QK8_0><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++);
 }
 
@@ -242,8 +245,8 @@ static void ggml_cpy_f32_q4_0_cuda(
     const int nb03, const int ne10, const int ne11, const int ne12, const int nb10, const int nb11, const int nb12, const int nb13, cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
 
     GGML_ASSERT(ne % QK4_0 == 0);
-    const int num_blocks = ne / QK4_0;
-    cpy_f32_q<cpy_blck_f32_q4_0, QK4_0><<<num_blocks, 1, 0, stream>>>
+    const int num_blocks = (ne / QK4_0 + CUDA_CPY_BLOCK_SIZE - 1)/CUDA_CPY_BLOCK_SIZE;
+    cpy_f32_q<cpy_blck_f32_q4_0, QK4_0><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++);
 }
 
@@ -254,8 +257,9 @@ static void ggml_cpy_q4_0_f32_cuda(
     const int nb03, const int ne10, const int ne11, const int ne12,
     const int nb10, const int nb11, const int nb12, const int nb13,
     cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
-    const int num_blocks = ne;
-    cpy_q_f32<cpy_blck_q_f32<dequantize_q4_0, QK4_0>, QK4_0><<<num_blocks, 1, 0, stream>>>(
+    GGML_ASSERT(ne % QK4_0 == 0);
+    const int num_blocks = (ne / QK4_0 + CUDA_CPY_BLOCK_SIZE - 1)/CUDA_CPY_BLOCK_SIZE;
+    cpy_q_f32<cpy_blck_q_f32<dequantize_q4_0, QK4_0>, QK4_0><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(
         cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
          ne10, ne11, ne12, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++);
 }
@@ -267,8 +271,9 @@ static void ggml_cpy_q4_0_f16_cuda(
     const int nb03, const int ne10, const int ne11, const int ne12,
     const int nb10, const int nb11, const int nb12, const int nb13,
     cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
-    const int num_blocks = ne;
-    cpy_q_f32<cpy_blck_q_f16<dequantize_q4_0, QK4_0>, QK4_0><<<num_blocks, 1, 0, stream>>>(
+    GGML_ASSERT(ne % QK4_0 == 0);
+    const int num_blocks = (ne / QK4_0 + CUDA_CPY_BLOCK_SIZE - 1)/CUDA_CPY_BLOCK_SIZE;
+    cpy_q_f32<cpy_blck_q_f16<dequantize_q4_0, QK4_0>, QK4_0><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(
         cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
          ne10, ne11, ne12, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++);
 }
@@ -279,8 +284,8 @@ static void ggml_cpy_f32_q4_1_cuda(
     const int nb03, const int ne10, const int ne11, const int ne12, const int nb10, const int nb11, const int nb12, const int nb13, cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
 
     GGML_ASSERT(ne % QK4_1 == 0);
-    const int num_blocks = ne / QK4_1;
-    cpy_f32_q<cpy_blck_f32_q4_1, QK4_1><<<num_blocks, 1, 0, stream>>>
+    const int num_blocks = (ne / QK4_1 + CUDA_CPY_BLOCK_SIZE - 1)/CUDA_CPY_BLOCK_SIZE;
+    cpy_f32_q<cpy_blck_f32_q4_1, QK4_1><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++);
 }
 
@@ -291,8 +296,9 @@ static void ggml_cpy_q4_1_f32_cuda(
     const int nb03, const int ne10, const int ne11, const int ne12,
     const int nb10, const int nb11, const int nb12, const int nb13,
     cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
-    const int num_blocks = ne;
-    cpy_q_f32<cpy_blck_q_f32<dequantize_q4_1, QK4_1>, QK4_1><<<num_blocks, 1, 0, stream>>>(
+    GGML_ASSERT(ne % QK4_1 == 0);
+    const int num_blocks = (ne / QK4_1 + CUDA_CPY_BLOCK_SIZE - 1)/CUDA_CPY_BLOCK_SIZE;
+    cpy_q_f32<cpy_blck_q_f32<dequantize_q4_1, QK4_1>, QK4_1><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(
         cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
          ne10, ne11, ne12, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++);
 }
@@ -304,8 +310,9 @@ static void ggml_cpy_q4_1_f16_cuda(
     const int nb03, const int ne10, const int ne11, const int ne12,
     const int nb10, const int nb11, const int nb12, const int nb13,
     cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
-    const int num_blocks = ne;
-    cpy_q_f32<cpy_blck_q_f16<dequantize_q4_1, QK4_1>, QK4_1><<<num_blocks, 1, 0, stream>>>(
+    GGML_ASSERT(ne % QK4_1 == 0);
+    const int num_blocks = (ne / QK4_1 + CUDA_CPY_BLOCK_SIZE - 1)/CUDA_CPY_BLOCK_SIZE;
+    cpy_q_f32<cpy_blck_q_f16<dequantize_q4_1, QK4_1>, QK4_1><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(
         cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
          ne10, ne11, ne12, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++);
 }
@@ -317,8 +324,9 @@ static void ggml_cpy_iq4_nl_f32_cuda(
     const int nb03, const int ne10, const int ne11, const int ne12,
     const int nb10, const int nb11, const int nb12, const int nb13,
     cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
-    const int num_blocks = ne;
-    cpy_q_f32<cpy_blck_q_f32<dequantize_iq4_nl, QK4_NL>, QK4_NL><<<num_blocks, 1, 0, stream>>>(
+    GGML_ASSERT(ne % QK4_NL == 0);
+    const int num_blocks = (ne / QK4_NL + CUDA_CPY_BLOCK_SIZE - 1)/CUDA_CPY_BLOCK_SIZE;
+    cpy_q_f32<cpy_blck_q_f32<dequantize_iq4_nl, QK4_NL>, QK4_NL><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(
         cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
          ne10, ne11, ne12, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++);
 }
@@ -330,8 +338,9 @@ static void ggml_cpy_iq4_nl_f16_cuda(
     const int nb03, const int ne10, const int ne11, const int ne12,
     const int nb10, const int nb11, const int nb12, const int nb13,
     cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
-    const int num_blocks = ne;
-    cpy_q_f32<cpy_blck_q_f16<dequantize_iq4_nl, QK4_NL>, QK4_NL><<<num_blocks, 1, 0, stream>>>(
+    GGML_ASSERT(ne % QK4_NL == 0);
+    const int num_blocks = (ne / QK4_NL + CUDA_CPY_BLOCK_SIZE - 1)/CUDA_CPY_BLOCK_SIZE;
+    cpy_q_f32<cpy_blck_q_f16<dequantize_iq4_nl, QK4_NL>, QK4_NL><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(
         cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
          ne10, ne11, ne12, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++);
 }
@@ -340,10 +349,9 @@ static void ggml_cpy_f32_q5_0_cuda(
     const char * cx, char * cdst, const int ne,
     const int ne00, const int ne01, const int ne02, const int nb00, const int nb01, const int nb02,
     const int nb03, const int ne10, const int ne11, const int ne12, const int nb10, const int nb11, const int nb12, const int nb13, cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
-
     GGML_ASSERT(ne % QK5_0 == 0);
-    const int num_blocks = ne / QK5_0;
-    cpy_f32_q<cpy_blck_f32_q5_0, QK5_0><<<num_blocks, 1, 0, stream>>>
+    const int num_blocks = (ne / QK5_0 + CUDA_CPY_BLOCK_SIZE - 1)/CUDA_CPY_BLOCK_SIZE;
+    cpy_f32_q<cpy_blck_f32_q5_0, QK5_0><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++);
 }
 
@@ -354,8 +362,9 @@ static void ggml_cpy_q5_0_f32_cuda(
     const int nb03, const int ne10, const int ne11, const int ne12,
     const int nb10, const int nb11, const int nb12, const int nb13,
     cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
-    const int num_blocks = ne;
-    cpy_q_f32<cpy_blck_q_f32<dequantize_q5_0, QK5_0>, QK5_0><<<num_blocks, 1, 0, stream>>>(
+    GGML_ASSERT(ne % QK5_0 == 0);
+    const int num_blocks = (ne / QK5_0 + CUDA_CPY_BLOCK_SIZE - 1)/CUDA_CPY_BLOCK_SIZE;
+    cpy_q_f32<cpy_blck_q_f32<dequantize_q5_0, QK5_0>, QK5_0><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(
         cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
         ne10, ne11, ne12, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++);
 }
@@ -367,8 +376,9 @@ static void ggml_cpy_q5_0_f16_cuda(
     const int nb03, const int ne10, const int ne11, const int ne12,
     const int nb10, const int nb11, const int nb12, const int nb13,
     cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
-    const int num_blocks = ne;
-    cpy_q_f32<cpy_blck_q_f16<dequantize_q5_0, QK5_0>, QK5_0><<<num_blocks, 1, 0, stream>>>(
+    GGML_ASSERT(ne % QK5_0 == 0);
+    const int num_blocks = (ne / QK5_0 + CUDA_CPY_BLOCK_SIZE - 1)/CUDA_CPY_BLOCK_SIZE;
+    cpy_q_f32<cpy_blck_q_f16<dequantize_q5_0, QK5_0>, QK5_0><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(
         cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
         ne10, ne11, ne12, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++);
 }
@@ -379,8 +389,8 @@ static void ggml_cpy_f32_q5_1_cuda(
     const int nb03, const int ne10, const int ne11, const int ne12, const int nb10, const int nb11, const int nb12, const int nb13, cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
 
     GGML_ASSERT(ne % QK5_1 == 0);
-    const int num_blocks = ne / QK5_1;
-    cpy_f32_q<cpy_blck_f32_q5_1, QK5_1><<<num_blocks, 1, 0, stream>>>
+    const int num_blocks = (ne / QK5_1 + CUDA_CPY_BLOCK_SIZE - 1)/CUDA_CPY_BLOCK_SIZE;
+    cpy_f32_q<cpy_blck_f32_q5_1, QK5_1><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++);
 }
 
@@ -391,8 +401,9 @@ static void ggml_cpy_q5_1_f32_cuda(
     const int nb03, const int ne10, const int ne11, const int ne12,
     const int nb10, const int nb11, const int nb12, const int nb13,
     cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
-    const int num_blocks = ne;
-    cpy_q_f32<cpy_blck_q_f32<dequantize_q5_1, QK5_1>, QK5_1><<<num_blocks, 1, 0, stream>>>(
+    GGML_ASSERT(ne % QK5_1 == 0);
+    const int num_blocks = (ne / QK5_1 + CUDA_CPY_BLOCK_SIZE - 1)/CUDA_CPY_BLOCK_SIZE;
+    cpy_q_f32<cpy_blck_q_f32<dequantize_q5_1, QK5_1>, QK5_1><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(
         cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
         ne10, ne11, ne12, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++);
 }
@@ -404,8 +415,9 @@ static void ggml_cpy_q5_1_f16_cuda(
     const int nb03, const int ne10, const int ne11, const int ne12,
     const int nb10, const int nb11, const int nb12, const int nb13,
     cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
-    const int num_blocks = ne;
-    cpy_q_f32<cpy_blck_q_f16<dequantize_q5_1, QK5_1>, QK5_1><<<num_blocks, 1, 0, stream>>>(
+    GGML_ASSERT(ne % QK5_1 == 0);
+    const int num_blocks = (ne / QK5_1 + CUDA_CPY_BLOCK_SIZE - 1)/CUDA_CPY_BLOCK_SIZE;
+    cpy_q_f32<cpy_blck_q_f16<dequantize_q5_1, QK5_1>, QK5_1><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(
         cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
         ne10, ne11, ne12, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++);
 }
@@ -416,8 +428,8 @@ static void ggml_cpy_f32_iq4_nl_cuda(
     const int nb03, const int ne10, const int ne11, const int ne12, const int nb10, const int nb11, const int nb12, const int nb13, cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
 
     GGML_ASSERT(ne % QK4_NL == 0);
-    const int num_blocks = ne / QK4_NL;
-    cpy_f32_q<cpy_blck_f32_iq4_nl, QK4_NL><<<num_blocks, 1, 0, stream>>>
+    const int num_blocks = (ne / QK4_NL + CUDA_CPY_BLOCK_SIZE - 1)/CUDA_CPY_BLOCK_SIZE;
+    cpy_f32_q<cpy_blck_f32_iq4_nl, QK4_NL><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++);
 }
 
@@ -427,8 +439,8 @@ static void ggml_cpy_f32_q6_0_cuda(
     const int nb03, const int ne10, const int ne11, const int ne12, const int nb10, const int nb11, const int nb12, const int nb13, cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
 
     GGML_ASSERT(ne % QK6_0 == 0);
-    const int num_blocks = ne / QK6_0;
-    cpy_f32_q<cpy_blck_f32_q6_0, QK6_0><<<num_blocks, 1, 0, stream>>>
+    const int num_blocks = (ne / QK6_0 + CUDA_CPY_BLOCK_SIZE - 1)/CUDA_CPY_BLOCK_SIZE;
+    cpy_f32_q<cpy_blck_f32_q6_0, QK6_0><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++);
 }
 
@@ -439,8 +451,9 @@ static void ggml_cpy_q6_0_f32_cuda(
     const int nb03, const int ne10, const int ne11, const int ne12,
     const int nb10, const int nb11, const int nb12, const int nb13,
     cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
-    const int num_blocks = ne;
-    cpy_q_f32<cpy_blck_q_f32<dequantize_q6_0, QK6_0>, QK6_0><<<num_blocks, 1, 0, stream>>>(
+    GGML_ASSERT(ne % QK6_0 == 0);
+    const int num_blocks = (ne / QK6_0 + CUDA_CPY_BLOCK_SIZE - 1)/CUDA_CPY_BLOCK_SIZE;
+    cpy_q_f32<cpy_blck_q_f32<dequantize_q6_0, QK6_0>, QK6_0><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(
         cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
         ne10, ne11, ne12, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++);
 }
@@ -452,8 +465,9 @@ static void ggml_cpy_q6_0_f16_cuda(
     const int nb03, const int ne10, const int ne11, const int ne12,
     const int nb10, const int nb11, const int nb12, const int nb13,
     cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
-    const int num_blocks = ne;
-    cpy_q_f32<cpy_blck_q_f16<dequantize_q6_0, QK6_0>, QK6_0><<<num_blocks, 1, 0, stream>>>(
+    GGML_ASSERT(ne % QK6_0 == 0);
+    const int num_blocks = (ne / QK6_0 + CUDA_CPY_BLOCK_SIZE - 1)/CUDA_CPY_BLOCK_SIZE;
+    cpy_q_f32<cpy_blck_q_f16<dequantize_q6_0, QK6_0>, QK6_0><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(
         cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
         ne10, ne11, ne12, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++);
 }
@@ -506,6 +520,46 @@ static void transpose_q8_0(ggml_backend_cuda_context & ctx, const ggml_tensor * 
 }
 
 
+// A strided copy whose contiguous prefix covers whole rows is just a 2-D block copy, which the
+// copy engine does far cheaper than the scalar kernel (per element index arithmetic). The same
+// cont() of a strided view therefore costs ~4x less. Ported from mainline.
+static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tensor * src1,
+        size_t & width, size_t & height, size_t & spitch, size_t & dpitch) {
+    // a reshaped copy maps elements by flat order, which the prefix walk below does not handle
+    if (src0->type != src1->type || !ggml_are_same_shape(src0, src1)) {
+        return false;
+    }
+
+    // grow the contiguous prefix block shared by both tensors
+    size_t block_nb = ggml_element_size(src0);
+    int d = 0;
+    for (; d < GGML_MAX_DIMS; ++d) {
+        if (src0->nb[d] != block_nb || src1->nb[d] != block_nb) {
+            break;
+        }
+        block_nb *= src0->ne[d];
+    }
+
+    // d == 0: nothing contiguous; d == GGML_MAX_DIMS: fully contiguous (handled by memcpy)
+    if (d == 0 || d == GGML_MAX_DIMS) {
+        return false;
+    }
+
+    // dim d carries the rows; everything above it must be a single element
+    for (int i = d + 1; i < GGML_MAX_DIMS; ++i) {
+        if (src0->ne[i] != 1) {
+            return false;
+        }
+    }
+
+    width  = block_nb;
+    height = src0->ne[d];
+    spitch = src0->nb[d];
+    dpitch = src1->nb[d];
+
+    return spitch >= width && dpitch >= width;
+}
+
 void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1, bool disable_indirection_for_this_node) {
     const int64_t ne = ggml_nelements(src0);
     GGML_ASSERT(ne == ggml_nelements(src1));
@@ -539,6 +593,9 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
 
     bool fast_cpy = ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_are_same_shape(src0, src1);
 
+    // 2-D memcpy candidate (see ggml_cuda_cpy_as_memcpy_2d)
+    size_t mc_width = 0, mc_height = 0, mc_spitch = 0, mc_dpitch = 0;
+
     char ** dest_ptrs_d = nullptr;
     int graph_cpynode_index = -1;
 #if defined(GGML_CUDA_USE_GRAPHS) || defined(GGML_HIP_GRAPHS) || defined(GGML_MUSA_GRAPHS)
@@ -563,6 +620,14 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
                 CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, ggml_nbytes(src0), cudaMemcpyDeviceToDevice, main_stream));
             }
         }
+    } else if ((src0->type == GGML_TYPE_F8_E4M3_KS || src0->type == GGML_TYPE_F8_E4M3_B128) && src1->type == GGML_TYPE_F32) {
+        ggml_get_to_fp32_cuda(src0->type)(src0_ddc, (float *)src1_ddc, ggml_nrows(src0), ne00, main_stream);
+    } else if (dest_ptrs_d == nullptr &&
+               ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
+        // The graph indirection writes the destination through a device-side pointer table, which
+        // a memcpy cannot do - only take this path when the plain destination is valid.
+        CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch, mc_width, mc_height,
+                                     cudaMemcpyDeviceToDevice, main_stream));
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         if (fast_cpy) {
             ggml_cpy_flt_contiguous_cuda<float, float>(src0_ddc, src1_ddc, ne, main_stream, dest_ptrs_d, graph_cpynode_index);
@@ -680,6 +745,8 @@ void* ggml_cuda_cpy_fn(const ggml_tensor * src0, ggml_tensor * src1) {
         } else {
             return nullptr;
         }
+    } else if (src0->type == GGML_TYPE_F8_E4M3_KS || src0->type == GGML_TYPE_F8_E4M3_B128) {
+        return nullptr;
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         return fast_cpy ? (void *)cpy_flt_contiguous<float, float> : (void*) cpy_flt<cpy_1_flt<float, float>>;
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_BF16) {

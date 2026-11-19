@@ -47,10 +47,10 @@
 #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
 
 #define LLAMA_SESSION_MAGIC   LLAMA_FILE_MAGIC_GGSN
-#define LLAMA_SESSION_VERSION 9
+#define LLAMA_SESSION_VERSION 11 // 11: the whole-context blob gained the Mamba-2 conv-state block
 
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
-#define LLAMA_STATE_SEQ_VERSION 3
+#define LLAMA_STATE_SEQ_VERSION 5 // 5: standard Mamba-2 conv state block
 
 #define LLAMA_SERVER_MAGIC 0x6c6d7376u // 'lmsv'
 #define LLAMA_SERVER_VERSION 1
@@ -192,7 +192,9 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q4_0_4_8      = 34, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q4_0_8_8      = 35, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_MXFP4         = 38, // except 1d tensors, 38 to be compatible with mainline
+        LLAMA_FTYPE_MOSTLY_NVFP4         = 39,
         LLAMA_FTYPE_MOSTLY_Q1_0_G128     = 41, // except 1d tensors, 38 to be compatible with mainline
+        LLAMA_FTYPE_MOSTLY_F8_E4M3       = 42,
         //
         LLAMA_FTYPE_MOSTLY_Q6_0          = 135, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_IQ1_BN        = 136, // except 1d tensors
@@ -214,7 +216,21 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_IQ3_KS        = 154, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_IQ2_KL        = 155, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_IQ1_KT        = 156, // except 1d tensors
-                                                //
+        LLAMA_FTYPE_MOSTLY_PQ2_0         = 157, // except 1d tensors (Prism ternary, group-128)
+        LLAMA_FTYPE_MOSTLY_PTQ1_0        = 158, // except 1d tensors (Prism ternary, base-3)
+
+        LLAMA_FTYPE_MOSTLY_Q1_0_G128_R8  = 160, // except 1d tensors, 38 to be compatible with mainline
+        LLAMA_FTYPE_MOSTLY_PQ2_0_R8      = 161, // except 1d tensors (Prism ternary, group-128)
+        LLAMA_FTYPE_MOSTLY_PTQ1_0_R8     = 162, // except 1d tensors (Prism ternary, base-3)
+        LLAMA_FTYPE_MOSTLY_TQK6          = 163, // except 1d tensors (trellis, group-128)
+        LLAMA_FTYPE_MOSTLY_TQK7          = 164, // except 1d tensors (trellis, group-128)
+        LLAMA_FTYPE_MOSTLY_TQ2_T         = 165, // except 1d tensors (trellis, group-128)
+        LLAMA_FTYPE_MOSTLY_TQP5          = 166, // except 1d tensors (trellis, group-128)
+        LLAMA_FTYPE_MOSTLY_TQP6          = 167, // except 1d tensors (trellis, group-128)
+        LLAMA_FTYPE_MOSTLY_TQP7          = 168, // except 1d tensors (trellis, group-128)
+        LLAMA_FTYPE_MOSTLY_NVFP4_KS      = 169,
+        LLAMA_FTYPE_MOSTLY_F8_E4M3_KS    = 170,
+        LLAMA_FTYPE_MOSTLY_F8_E4M3_B128  = 171,
         LLAMA_FTYPE_MOSTLY_Q4_0_R8       = 202, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q8_0_R8       = 207, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q5_0_R4       = 208, // except 1d tensors
@@ -240,7 +256,13 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_IQ4_K_R4      = 340, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_IQ5_K_R4      = 341, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_IQ4_KS_R4     = 345, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_IQ4_KS_R16    = 346, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_IQ3_KS_R16    = 347, // except 1d tensors (16-row interleaved iq3ks-class codebook 3-bit)
+        LLAMA_FTYPE_MOSTLY_IQ5_KS_R16    = 348, // except 1d tensors (16-row interleaved iq3ks-class codebook 3-bit)
         LLAMA_FTYPE_MOSTLY_IQ5_KS_R4     = 350, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_MXFP4_R8      = 351, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_Q2_0_R8       = 352, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_Q8_K_R16      = 397, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q8_KV_R8      = 398, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q8_K_R8       = 399, // except 1d tensors
 
@@ -279,8 +301,7 @@ extern "C" {
     enum llama_split_mode {
         LLAMA_SPLIT_MODE_NONE    = 0, // single GPU
         LLAMA_SPLIT_MODE_LAYER   = 1, // split layers and KV across GPUs
-        LLAMA_SPLIT_MODE_ATTN    = 2, // splits self-attention computations across GPUs
-        LLAMA_SPLIT_MODE_GRAPH   = 3, // splits computations across GPUs
+        LLAMA_SPLIT_MODE_GRAPH   = 2, // splits computations across GPUs
     };
 
     enum llama_mtp_op_type {
@@ -289,6 +310,17 @@ extern "C" {
         MTP_OP_UPDATE_ACCEPTED  = 2,
         MTP_OP_DRAFT_GEN        = 3,
     };
+
+    enum llama_ckpt_type {
+        LLAMA_CHECKPOINT_SPEC = 0,
+        LLAMA_CHECKPOINT_REWIND = 1,
+    };
+
+    typedef struct llama_ckpt_data {
+        enum llama_ckpt_type type;
+        llama_pos pos1;
+        llama_pos pos2;
+    } llama_ckpt_data;
 
     typedef struct llama_token_data {
         llama_token id; // token id
@@ -360,6 +392,18 @@ extern "C" {
         ggml_backend_buffer_type_t buft;
     };
 
+    enum llama_nvfp4_precision {
+        LLAMA_NVFP4_PRECISION_AUTO = 0,
+        LLAMA_NVFP4_PRECISION_W4A4 = 1,
+        LLAMA_NVFP4_PRECISION_INT8 = 2,
+    };
+
+    enum llama_fp8_precision {
+        LLAMA_FP8_PRECISION_AUTO = 0,
+        LLAMA_FP8_PRECISION_W8A16 = 1,
+        LLAMA_FP8_PRECISION_W8A8 = 2,
+    };
+
     struct llama_model_params {
         // comma separated list of devices to use for offloading
         const char* devices;
@@ -418,6 +462,11 @@ extern "C" {
 
         const struct llama_model_tensor_buft_override * tensor_buft_overrides;
 
+        // separate GGUF with the n-gram tables (per-layer token embedding, Engram), NULL if none
+        const char * ngram_file;
+        enum llama_nvfp4_precision nvfp4_precision;
+        enum llama_fp8_precision fp8_precision;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;    // only load the vocabulary, no weights
         bool use_mmap;      // use mmap if possible
@@ -429,9 +478,17 @@ extern "C" {
         bool merge_qkv;     // if true, merge separate Q, K, V tensors into a single, contiguous tensor
         bool merge_up_gate_exps;  // if true, merge ffn_up_exps and ffn_gate_exps tensors into a single, contiguous tensor
         bool mtp;           // if true, load MTP layers if present
+        bool dsa;           // if true, load the MiniMax-M3 sparse attention indexer if present
         bool dry_run;       // skip loading tensors
         bool flash_attn;
         bool defer_experts;    // defer expert mmap residency to speed up model loading (Linux only)
+        bool defer_ple;        // keep sparse tables (PLE, engram) on the file instead of resident in memory (Linux and Windows only)
+        bool swa_compress;     // must match llama_context_params::swa_compress; the fit also assumes that context's n_ubatch
+    };
+
+    enum llama_moe_cache_policy {
+        LLAMA_MOE_CACHE_POLICY_LRU = 0,
+        LLAMA_MOE_CACHE_POLICY_CLASSLRU = 1,
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
@@ -466,6 +523,9 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+        size_t moe_cache_size; // total device-cache budget for host-resident MoE experts, split across GPUs [EXPERIMENTAL]
+        enum llama_moe_cache_policy moe_cache_policy; // replacement policy for the MoE cache
+        float moe_cache_cpu_share; // fixed fraction of unique cache misses assigned to CPU [EXPERIMENTAL]
         enum ggml_type idx_type_k; // data type for indexer K cache [EXPERIMENTAL]
         enum ggml_type type_reduce; // data type for reduce operations
         enum ggml_type type_graph_attn; // flash-attn precision under -sm graph
@@ -492,12 +552,19 @@ extern "C" {
         bool rope_cache;        // whether to use RoPE cache [EXPERIMENTAL]
         bool graph_reuse;       // whether to reuse graphs when possible [EXPERIMENTAL]
         bool dsa;               // enable GLM DSA sparse attention (off by default) [EXPERIMENTAL]
+        bool fused_idx_topk;    // enable the fused indexer topk op (on by default) [EXPERIMENTAL]
+        bool swa_compress;      // allocate sliding-window layers at window size instead of n_ctx (off by default) [EXPERIMENTAL]
+        bool force_experts_offload_device; // If true, force experts left in RAM to be offloaded to the default GPU for this layer
+        int  dsv41_replay_keep; // DeepSeek-V4.1 prefill: run the decoder layers on the last N prompt tokens only, N=0 disables (requires swa_compress) [EXPERIMENTAL]
+        bool dsv4_legacy_state; // write DeepSeek-V4 state in the legacy full-slice layout (no MAGIC), byte-identical to main [EXPERIMENTAL]
         int  dsa_top_k;         // DSA top-k override (<0 => model's configured indexer_top_k) [EXPERIMENTAL]
         int  min_experts;
         float thresh_experts;
         bool only_active_experts;
-        bool k_cache_hadamard;  // if true, apply Hadamard transfrom to K-cache
-        bool v_cache_hadamard;  // if true, apply Hadamard transfrom to V-cache (needs FA)
+        bool prefetch_experts;  // if true, stream mmap'd MoE expert weights into the page cache (Linux only)
+        int  prefetch_experts_threads; // number of expert prefetch workers (<=0 = auto)
+        bool k_cache_hadamard;  // if true, apply Hadamard transform to K-cache
+        bool v_cache_hadamard;  // if true, apply Hadamard transform to V-cache (needs FA)
         bool split_mode_graph_scheduling; // if true, force split mode graph scheduling
         //bool split_mode_f16;    // if true, cast intermediate results to f16 before copying to other GPUs
         bool scheduler_async;   // if true, with split mode "graph" graph evaluation will be done using multiple threads
@@ -511,6 +578,12 @@ extern "C" {
         void *              abort_callback_data;
         void *              offload_policy;
         void *              cuda_params;
+        int32_t             dflash_query_capacity; // internal DFlash query capacity override
+
+        // optional CPU affinity for the CPU worker threads (Linux only); thread t is
+        // pinned to cpu_affinity[t % n_cpu_affinity], NULL = no pinning
+        const int32_t * cpu_affinity;
+        int32_t         n_cpu_affinity;
     };
 
     // model quantization parameters
@@ -520,6 +593,7 @@ extern "C" {
         enum llama_ftype ftype;              // quantize to this llama_ftype
         enum ggml_type output_tensor_type;   // output tensor type
         enum ggml_type token_embedding_type; // token embeddings tensor type
+        enum ggml_type per_layer_token_embedding_type; // token embeddings tensor type
         enum ggml_type attn_q_type;          // attention query tensor type
         enum ggml_type attn_k_type;          // attention key tensor type
         enum ggml_type attn_v_type;          // attention value tensor type
@@ -528,8 +602,8 @@ extern "C" {
         enum ggml_type ffn_gate_type;        // feedforward network gate type
         enum ggml_type ffn_down_type;        // feedforward network down type
         enum ggml_type ffn_up_type;          // feedforward network up type
-        enum ggml_type ffn_gate_inp_type;    // routed experts probabilities typy (relevant for MoE models only)
-        enum ggml_type extra_output_type;    // routed experts probabilities typy (relevant for MoE models only)
+        enum ggml_type ffn_gate_inp_type;    // routed experts probabilities type (relevant for MoE models only)
+        enum ggml_type extra_output_type;    // routed experts probabilities type (relevant for MoE models only)
         bool allow_requantize;               // allow quantizing non-f32/f16 tensors
         bool quantize_output_tensor;         // quantize output.weight
         bool only_copy;                      // only copy tensors - ftype, allow_requantize and quantize_output_tensor are ignored
@@ -539,6 +613,13 @@ extern "C" {
         bool only_repack;                    // Only repack tensors
         bool dry_run;                        //
         bool partial_requant;                // quantize only missing split files in the split quantized .gguf destination directory
+        bool estimate_imatrix;               // If true, use an estimated imatrix, possibly combining with the input imatrix
+        size_t slab_size;                    // tensors larger than this many bytes of f32 are processed in slabs of up to this size (at least one slice or row group), 0 = never
+        bool cuda_quantize;                  // quantize IQ4_KT, IQ3_KT, IQ2_KT, IQ1_KT, IQ3_KS, IQ4_KS, IQ4_KS_R4, IQ4_KS_R16, IQ5_KS, and IQ5_KS_R4 on a CUDA device
+        int  cuda_quantize_device;           // CUDA device index used by --cuda-quantize (default 0)
+        int  cuda_quantize_n_devices;        // row-split device count, 0 = off
+        int  cuda_quantize_devices[16];      // row-split ordinals (-dev CUDA0,CUDA1,CUDA2)
+        float cuda_quantize_split[16];       // row-split shares, sum 1 (-ts 3,3,2)
         void * imatrix;                      // pointer to importance matrix data
         void * kv_overrides;                 // pointer to vector containing overrides
         void * custom_quants;                // pointer to vector containing custom quantization rules
@@ -653,6 +734,8 @@ extern "C" {
     // - The output string is always null-terminated and cleared on failure
     // - GGUF array values are not supported by these functions
 
+    LLAMA_API bool llama_model_fp8_w8a8(const struct llama_model * model);
+
     // Get metadata value as a string by key name
     LLAMA_API int32_t llama_model_meta_val_str(const struct llama_model * model, const char * key, char * buf, size_t buf_size);
 
@@ -670,6 +753,34 @@ extern "C" {
 
     // Returns the total size of all the tensors in the model in bytes
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
+
+    struct llama_memory_buft {
+        ggml_backend_buffer_type_t buft;
+        size_t                     size;
+    };
+
+    struct llama_memory_row {
+        char   name[96];
+        bool   is_device;
+        size_t model;
+        size_t context;
+        size_t compute;
+        size_t mmproj;
+        size_t total;
+        size_t free;
+    };
+
+    // Fills one row per offload device, then the host, then one row per other buffer type in use.
+    // Sums the memory of all contexts in ctxs, such as a target and its draft contexts.
+    // A context listed twice, or weights that several contexts share, are counted once.
+    // Returns the number of rows, which can be larger than n_rows.
+    LLAMA_API int32_t llama_memory_breakdown(
+            const struct llama_context * const * ctxs,
+                                   int32_t   n_ctxs,
+            const struct llama_memory_buft * mmproj,
+                                   int32_t   n_mmproj,
+                  struct llama_memory_row * rows,
+                                   int32_t   n_rows);
 
     // Returns the total number of parameters in the model
     LLAMA_API uint64_t llama_model_n_params(const struct llama_model * model);
@@ -695,12 +806,41 @@ extern "C" {
 
     LLAMA_API bool llama_model_has_recurrent(const struct llama_model * model);
 
+    // Returns whether the model uses the DeepSeek-V4 architecture.
+    LLAMA_API bool llama_model_is_deepseek4(const struct llama_model * model);
+
+    // Returns true if the model is openPangu (conv-only recurrent state that rides the spec-rollback checkpoint)
+    LLAMA_API bool llama_model_is_openpangu(const struct llama_model * model);
+
+    LLAMA_API bool llama_kv_cache_is_compacted(const struct llama_context * ctx);
+
+    LLAMA_API llama_pos llama_kv_cache_swa_rewind_floor(const struct llama_context * ctx);
+
+    LLAMA_API llama_pos llama_kv_cache_n_swa(const struct llama_context * ctx);
+
     // Returns true if the model is a Gemma 4 MTP assistant (external frozen-KV speculative drafter)
     LLAMA_API bool llama_model_is_gemma4_mtp_assistant(const struct llama_model * model);
+
+    LLAMA_API bool llama_model_is_step35(const struct llama_model * model);
+
+    LLAMA_API bool llama_model_is_qwen35_family(const struct llama_model * model);
+
+    LLAMA_API bool llama_model_is_qwen4exp(const struct llama_model * model);
 
     LLAMA_API bool llama_is_gemma4_mtp_file(const char * path);
 
     LLAMA_API bool llama_model_is_split_mode_graph(const struct llama_model * model);
+
+    // Returns false for models whose KV cache cannot be re-positioned after the fact
+    // (K-shift / context shift / self-extend), e.g. openPangu's latent cache.
+    LLAMA_API bool llama_model_supports_ctx_shift(const struct llama_model * model);
+
+    // Currently true for every model; no architecture is excluded from partial KV reuse.
+    LLAMA_API bool llama_model_supports_partial_kv_reuse(const struct llama_model * model);
+
+    // The complete answer for a context: the model-level query above, plus the context options it
+    // cannot see (--swa-compress). Matches the gate the engine applies before a K-shift.
+    LLAMA_API bool llama_supports_ctx_shift(const struct llama_context * ctx);
 
     LLAMA_API const char * llama_model_arch_string(const struct llama_model * model);
 
@@ -828,18 +968,38 @@ extern "C" {
         LLAMA_SPEC_CKPT_CPU         =  3,
     };
 
+    enum llama_spec_ckpt_restore_result {
+        LLAMA_SPEC_CKPT_RESTORE_FAILED = 0,
+        LLAMA_SPEC_CKPT_RESTORE_DIRECT = 1,
+        LLAMA_SPEC_CKPT_RESTORE_BASE_REPLAY_REQUIRED = 2,
+    };
+
     // Initialise the checkpoint system for the upcoming speculation window.
-    LLAMA_API int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens);
+    LLAMA_API int llama_spec_ckpt_init(struct llama_context * ctx, llama_ckpt_data ckpt_type, int mode, int max_tokens);
 
     // Save the current recurrent state as a speculative checkpoint.
-    LLAMA_API bool llama_spec_ckpt_save(struct llama_context * ctx, llama_seq_id seq_id);
+    LLAMA_API bool llama_spec_ckpt_save(struct llama_context * ctx, llama_ckpt_data ckpt_type, llama_seq_id seq_id);
+
+    // Save the current recurrent state as a rewind checkpoint
+    LLAMA_API bool llama_rewind_ckpt_save(struct llama_context * ctx, llama_ckpt_data ckpt_type, llama_seq_id seq_id, int max_tokens);
+
+    LLAMA_API bool llama_rewind_ckpt_discard(struct llama_context * ctx, llama_ckpt_data ckpt_type, llama_seq_id seq_id);
+
+    LLAMA_API bool llama_rewind_ckpt_release(struct llama_context * ctx, llama_ckpt_data ckpt_type, llama_seq_id seq_id);
+
+    LLAMA_API llama_pos llama_rewind_ckpt_pos(struct llama_context * ctx, llama_ckpt_data ckpt_type, llama_seq_id seq_id);
+
 
     // Restore the recurrent state after speculative decode.
-    LLAMA_API bool llama_spec_ckpt_restore(struct llama_context * ctx, llama_seq_id seq_id,
+    LLAMA_API bool llama_spec_ckpt_restore(struct llama_context * ctx, llama_ckpt_data ckpt_type, llama_seq_id seq_id,
                                             llama_pos n_past, int accepted_step);
 
+    LLAMA_API enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
+            struct llama_context * ctx, llama_ckpt_data ckpt_type, llama_seq_id seq_id,
+            llama_pos n_past, int accepted_step);
+
     // Discard the saved checkpoint and reset internal mode state.
-    LLAMA_API void llama_spec_ckpt_discard(struct llama_context * ctx);
+    LLAMA_API void llama_spec_ckpt_discard(struct llama_context * ctx, llama_ckpt_data ckpt_type);
 
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails
@@ -1046,7 +1206,7 @@ extern "C" {
     // Frees a batch of tokens allocated with llama_batch_init()
     LLAMA_API void llama_batch_free(struct llama_batch batch);
 
-    // Processes a batch of tokens with the ecoder part of the encoder-decoder model.
+    // Processes a batch of tokens with the encoder part of the encoder-decoder model.
     // Stores the encoder output internally for later use by the decoder cross-attention layers.
     //   0 - success
     // < 0 - error
@@ -1067,6 +1227,10 @@ extern "C" {
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
     LLAMA_API void llama_set_n_threads(struct llama_context * ctx, uint32_t n_threads, uint32_t n_threads_batch);
 
+    // pin CPU worker threads to the given logical CPUs (Linux only); thread t ->
+    // cpus[t % n_cpus]. Configure before compute, n_cpus == 0 disables pinning.
+    LLAMA_API void llama_set_cpu_affinity(struct llama_context * ctx, const int32_t * cpus, int n_cpus);
+
     // Get the number of threads used for generation of a single token.
     LLAMA_API uint32_t llama_n_threads(struct llama_context * ctx);
 
@@ -1080,6 +1244,9 @@ extern "C" {
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
+
+    // Set whether the model is in warmup mode or not
+    LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
@@ -1098,13 +1265,25 @@ extern "C" {
 
     // Logits for the ith token. For positive indices, Equivalent to:
     // llama_get_logits(ctx) + ctx->output_ids[i]*n_vocab
-    // Negative indicies can be used to access logits in reverse order, -1 is the last logit.
+    // Negative indices can be used to access logits in reverse order, -1 is the last logit.
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
     // Get the argmax token ID for DFlash draft position i without materializing full logits.
     // Returns LLAMA_TOKEN_NULL if argmax is not available (falls back to logits path).
     LLAMA_API llama_token llama_get_dflash_draft_token_ith(struct llama_context * ctx, int32_t i);
+
+    // Materialize the DFlash draft logits on the host for llama_get_logits_ith(); off by default.
+    LLAMA_API void llama_set_dflash_want_logits(struct llama_context * ctx, bool want);
+
+    // Copy DFlash2 selector lattice after a draft decode with top_k*top_k scores
+    // and top_k candidate IDs per position.
+    LLAMA_API int32_t llama_get_dflash_draft_lattice_top_k(struct llama_context * ctx);
+    LLAMA_API int32_t llama_get_dflash_draft_lattice_n_positions(struct llama_context * ctx);
+    LLAMA_API bool llama_copy_dflash_draft_lattice(
+            struct llama_context * ctx,
+            float * scores, size_t score_count,
+            int32_t * ids, size_t id_count);
 
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
@@ -1116,7 +1295,7 @@ extern "C" {
 
     // Get the embeddings for the ith token. For positive indices, Equivalent to:
     // llama_get_embeddings(ctx) + ctx->output_ids[i]*n_embd
-    // Negative indicies can be used to access embeddings in reverse order, -1 is the last embedding.
+    // Negative indices can be used to access embeddings in reverse order, -1 is the last embedding.
     // shape: [n_embd] (1-dimensional)
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
@@ -1419,7 +1598,7 @@ extern "C" {
 
 LLAMA_API void                   llama_sampler_reset(struct llama_sampler* smpl);
 
-/// @details Intializes a GBNF grammar, see grammars/README.md for details.
+/// @details Initializes a GBNF grammar, see grammars/README.md for details.
 /// @param vocab The vocabulary that this grammar will be used with.
 /// @param grammar_str The production rules for the grammar, encoded as a string. Returns an empty grammar if empty. Returns NULL if parsing of grammar_str fails.
 /// @param grammar_root The name of the start symbol for the grammar.
@@ -1482,7 +1661,7 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     /// @details Adaptive p sampler initializer
     /// @param target Select tokens near this probability (valid range 0.0 to 1.0; <0 = disabled)
     /// @param decay Decay rate for target adaptation over time. lower values -> faster but less stable adaptation. (valid range 0.0 to 1.0; ≤0 = no adaptation)
-    LLAMA_API struct llama_sampler_adaptive_p * llama_init_adaptive_p(int n_vocab,
+    LLAMA_API struct llama_sampler_adaptive_p * llama_init_adaptive_p(
            const float target,
            const float decay,
             const bool updt_w_cur,
@@ -1537,12 +1716,6 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
             struct llama_context * ctx,
           llama_token_data_array * candidates);
 
-    /// @details Randonly selects a token from the candidates following adaptive p sampler.
-    llama_token llama_sample_token_adaptive_p(
-            struct llama_context * ctx,
-          llama_token_data_array * candidates,
- struct llama_sampler_adaptive_p * adapt_p_ctx);
-
     //
     // Model split
     //
@@ -1576,7 +1749,21 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     // MTP
     //
 
+    enum llama_mtp_package {
+        LLAMA_MTP_PACKAGE_NONE = 0,
+        LLAMA_MTP_PACKAGE_EMBEDDED,
+        LLAMA_MTP_PACKAGE_TARGET_ONLY,
+        LLAMA_MTP_PACKAGE_COMPANION,
+        LLAMA_MTP_PACKAGE_INVALID,
+    };
+
     LLAMA_API int32_t llama_model_n_nextn_layer(const struct llama_model * model);
+
+    LLAMA_API enum llama_mtp_package llama_model_mtp_package(const struct llama_model * model);
+
+    LLAMA_API uint32_t llama_model_mtp_feature_width(const struct llama_model * model);
+
+    LLAMA_API bool llama_model_step35_has_nextn_weights(const struct llama_model * model);
 
     // Set which, if any, MTP operation the context will use
     LLAMA_API void llama_set_mtp_op_type(struct llama_context * ctx, enum llama_mtp_op_type mtp_op_type);
@@ -1584,6 +1771,11 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     LLAMA_API void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float * hidden_state);
 
     LLAMA_API bool llama_reload_changed_tensors(struct llama_context * ctx);
+
+    LLAMA_API uint32_t llama_compute_analytical_imatrix(
+            const char * fname_inp,
+            const char * fname_out,
+            const llama_model_quantize_params * params);
 
 #ifdef __cplusplus
 }
@@ -1606,6 +1798,9 @@ const std::vector<std::pair<std::string, struct ggml_tensor *>> & llama_internal
 // Randomly selects a token from the candidates based on their probabilities using given std::mt19937.
 // This is a temporary workaround in order to fix race conditions when sampling with multiple sequences.
 llama_token llama_sample_token_with_rng(struct llama_context * ctx, llama_token_data_array * candidates, std::mt19937 & rng);
+
+// Randomly selects a token from the candidates following adaptive p sampler.
+llama_token llama_sample_token_adaptive_p(struct llama_context * ctx, llama_token_data_array * candidates, struct llama_sampler_adaptive_p * adapt_p_ctx, std::mt19937 & rng);
 
 #endif // LLAMA_API_INTERNAL
 

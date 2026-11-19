@@ -8,6 +8,8 @@
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
 
+#include <vector>
+
 using json = nlohmann::ordered_json;
 
 enum stop_type {
@@ -23,6 +25,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
     SERVER_TASK_TYPE_EMBEDDING,
     SERVER_TASK_TYPE_RERANK,
+    SERVER_TASK_TYPE_DECISION,
     SERVER_TASK_TYPE_INFILL,
     SERVER_TASK_TYPE_CANCEL,
     SERVER_TASK_TYPE_NEXT_RESPONSE,
@@ -94,8 +97,16 @@ struct server_task {
     server_task_type type;
     json data;
 
+    bool metrics_memory = false;
+
     bool infill = false;
     bool embedding = false;
+
+    // used by SERVER_TASK_TYPE_DECISION
+    struct decision {
+        std::vector<llama_token> labels; // logits of these tokens, at the last prompt token
+    };
+    decision decision;
 
     server_task() = default;
     server_task(server_task_type type) : type(type) {}
@@ -130,6 +141,8 @@ struct result_timings {
     // Optional speculative metrics - only included when > 0
     int32_t draft_n = 0;
     int32_t draft_n_accepted = 0;
+    std::vector<int32_t> draft_n_by_depth;
+    std::vector<int32_t> draft_n_accepted_by_depth;
 
     json to_json() const;
 };
@@ -140,7 +153,7 @@ struct server_task_result {
 
     json data;
 
-    bool stop;
+    stop_type stop = STOP_TYPE_NONE;
     bool error;
     bool final_result = false;
     result_timings timings;
@@ -308,6 +321,10 @@ struct server_task_result_error : server_task_result {
 
     virtual json to_json() override {
         json res = format_error_response(err_msg, err_type);
+        if (err_type == ERROR_TYPE_EXCEED_CONTEXT_SIZE) {
+            res["n_prompt_tokens"] = n_prompt_tokens;
+            res["n_ctx"]           = n_ctx;
+        }
         return res;
     }
 };
@@ -343,6 +360,19 @@ struct server_task_result_embd : server_task_result {
     }
 };
 
+struct server_task_result_decision : server_task_result {
+    std::vector<float> scores; // one raw model output per option
+
+    int32_t n_tokens;
+
+    virtual json to_json() override {
+        return json{
+            {"index",            index},
+            {"scores",           scores},
+            {"tokens_evaluated", n_tokens},
+        };
+    }
+};
 
 // using shared_ptr for polymorphism of server_task_result
 using server_task_result_ptr = std::unique_ptr<server_task_result>;
@@ -350,23 +380,25 @@ using server_task_result_ptr = std::unique_ptr<server_task_result>;
 struct server_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
-    llama_pos pos_min_prompt;
-    llama_pos pos_max_prompt;
 
     int64_t n_tokens;
 
+    // the checkpoint taken at the end of the prompt; kept while another entry can be evicted instead
+    bool prompt_end = false;
+
     std::vector<uint8_t> data;
+
+    // disk-spill location when data was offloaded (empty = resident / no spill)
+    std::string spill_path;
 
     size_t size() const {
         return data.size();
     }
 
-    json to_json() {
+    json to_json() const {
         json j;
         j["pos_min"] = pos_min;
         j["pos_max"] = pos_max;
-        j["pos_min_prompt"] = pos_min_prompt;
-        j["pos_max_prompt"] = pos_max_prompt;
         j["n_tokens"] = n_tokens;
         return j;
     }
@@ -374,8 +406,6 @@ struct server_prompt_checkpoint {
     void from_json(const json & j) {
         pos_min = j.value<llama_pos>("pos_min", 0);
         pos_max = j.value<llama_pos>("pos_max", 0);
-        pos_min_prompt = j.value<llama_pos>("pos_min_prompt", 0);
-        pos_max_prompt = j.value<llama_pos>("pos_max_prompt", 0);
         n_tokens = j.value<int64_t>("n_tokens", 0);
     }
 };
@@ -408,7 +438,7 @@ struct server_prompt {
         };
     }
 
-    json to_json()
+    json to_json() const
     {
         json j;
         j["tokens"] = tokens.to_json();
@@ -421,7 +451,6 @@ struct server_prompt {
         tokens.from_json(j.at("tokens"));
         n_kept_prompt = j.value<llama_pos>("n_kept_prompt", 0);
         n_discarded_prompt = j.value<llama_pos>("n_discarded_prompt", 0);
-        n_kept_prompt = j.value<llama_pos>("n_kept_prompt", 0);
     }
 };
 
@@ -446,7 +475,7 @@ struct server_prompt_cache {
 
     server_prompt* alloc(const server_prompt& prompt, size_t state_size);
 
-    bool load(server_prompt& prompt, const server_tokens& tokens_new, llama_context* ctx, int32_t id_slot);
+    bool load(server_prompt& prompt, const server_tokens& tokens_new, llama_context* ctx, int32_t id_slot, float min_reusable_fraction);
 
     void update();
 };

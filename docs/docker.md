@@ -1,7 +1,7 @@
 # Docker
 
 >[!IMPORTANT]
->`ik_llama.cpp` provides to official support for docker images. All of the following has been inheritted from `llama.cpp` when I forked the project, and has never been updated. As such, it is outdated and likely inaccurate. I have still left it behind in case it is useful for someone interested in preparing theor own docker images.
+>`ik_llama.cpp` provides no official support for docker images. All of the following has been inherited from `llama.cpp` when I forked the project, and has never been updated. As such, it is outdated and likely inaccurate. I have still left it behind in case it is useful for someone interested in preparing their own docker images.
 
 ## Prerequisites
 * Docker must be installed and running on your system.
@@ -23,7 +23,7 @@ Additionally, there the following images, similar to the above:
 - `ghcr.io/ggerganov/llama.cpp:light-rocm`: Same as `light` but compiled with ROCm support. (platforms: `linux/amd64`, `linux/arm64`)
 - `ghcr.io/ggerganov/llama.cpp:server-rocm`: Same as `server` but compiled with ROCm support. (platforms: `linux/amd64`, `linux/arm64`)
 
-The GPU enabled images are not currently tested by CI beyond being built. They are not built with any variation from the ones in the Dockerfiles defined in [.devops/](.devops/) and the GitHub Action defined in [.github/workflows/docker.yml](.github/workflows/docker.yml). If you need different settings (for example, a different CUDA or ROCm library, you'll need to build the images locally for now).
+The GPU enabled images are not currently tested by CI beyond being built. They are not built with any variation from the ones in the Dockerfiles defined in [.devops/](../.devops/) and the GitHub Action defined in [.github/workflows/docker.yml](.github/workflows/docker.yml). If you need different settings (for example, a different CUDA or ROCm library, you'll need to build the images locally for now).
 
 ## Usage
 

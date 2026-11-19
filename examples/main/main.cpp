@@ -137,7 +137,9 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    common_speculative_prepare_startup(params);
+    if (!common_speculative_prepare_startup(params)) {
+        return 1;
+    }
 
     common_params_sampling & sparams = params.sparams;
 
@@ -286,10 +288,6 @@ int main(int argc, char ** argv) {
 
     auto chat_templates = common_chat_templates_init(model, params.chat_template);
 
-    if (params.has_mtp) {
-        llama_set_embeddings(ctx, true);
-    }
-
     if (requested_spec) {
         if (!common_speculative_is_compat(ctx)) {
             LOG_TEE("%s: error: speculative decoding is not supported by this context\n", __func__);
@@ -316,6 +314,11 @@ int main(int argc, char ** argv) {
         case COMMON_SPECULATIVE_INIT_SKIPPED:
             break;
         }
+    }
+
+    // all-token embeddings are only needed by MTP variants that consume them
+    if (params.has_mtp && common_speculative_needs_all_target_hidden(spec)) {
+        llama_set_embeddings(ctx, true);
     }
 
     const int n_ctx_train = llama_n_ctx_train(model);
@@ -712,7 +715,12 @@ int main(int argc, char ** argv) {
                 // if we run out of context:
                 // - take the n_keep first tokens from the original prompt (via n_past)
                 // - take half of the last (n_ctx - n_keep) tokens and recompute the logits in batches
-                if (n_past + (int) embd.size() + std::max<int>(0, guidance_offset) >= n_ctx) {
+                const bool context_full = n_past + (int) embd.size() + std::max<int>(0, guidance_offset) >= n_ctx;
+                if (context_full && !params.ctx_shift) {
+                    LOG_TEE("\n\n%s: context full and context shifting is disabled, stopping\n", __func__);
+                    break;
+                }
+                if (context_full) {
                     if (params.n_predict == -2) {
                         LOG_TEE("\n\n%s: context full and n_predict == -%d => stopping\n", __func__, params.n_predict);
                         break;
@@ -724,7 +732,7 @@ int main(int argc, char ** argv) {
                     LOG("context full, swapping: n_past = %d, n_left = %d, n_ctx = %d, n_keep = %d, n_discard = %d\n",
                             n_past, n_left, n_ctx, params.n_keep, n_discard);
 
-                    llama_kv_cache_seq_rm (ctx, 0, params.n_keep            , params.n_keep + n_discard);
+                    llama_kv_cache_seq_rm (ctx, 0, params.n_keep , params.n_keep + n_discard);
                     llama_kv_cache_seq_add(ctx, 0, params.n_keep + n_discard, n_past, -n_discard);
                     if (spec != nullptr) {
                         common_speculative_context_shift(spec, 0, params.n_keep, n_discard, n_past);
@@ -842,11 +850,14 @@ int main(int argc, char ** argv) {
 
                 LOG("eval: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd).c_str());
 
-                const bool need_prompt_target_features =
+                const bool prompt_needs_target_features =
                     embd_is_prompt &&
                     spec != nullptr &&
-                    (params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP) ||
-                     params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH));
+                    params.speculative.uses_target_features();
+                // stateless MTP: only the last prompt hidden is needed
+                const bool need_prompt_target_features =
+                    prompt_needs_target_features &&
+                    common_speculative_needs_all_target_hidden(spec);
 
                 llama_batch batch = {};
                 if (need_prompt_target_features) {
@@ -874,6 +885,10 @@ int main(int argc, char ** argv) {
                             return 1;
                         }
                         final_prompt_output_index = n_eval - 1;
+                        final_prompt_hidden_pos = n_past + n_eval - 1;
+                    } else if (prompt_needs_target_features) {
+                        // last prompt ubatch has a single output row
+                        final_prompt_output_index = 0;
                         final_prompt_hidden_pos = n_past + n_eval - 1;
                     } else if (!embd_is_prompt) {
                         speculative_tokens.insert(speculative_tokens.end(), embd.begin() + i, embd.begin() + i + n_eval);
@@ -941,17 +956,20 @@ int main(int argc, char ** argv) {
 
             const int n_predict_budget = n_remain < 0 ? std::numeric_limits<int>::max() : n_remain;
             bool used_speculative = false;
+            const bool sampled_before_from_carry = have_speculative_sampled;
+            llama_token sampled_before = LLAMA_TOKEN_NULL;
+            if (sampled_before_from_carry) {
+                sampled_before = speculative_sampled;
+                have_speculative_sampled = false;
+                speculative_sampled = LLAMA_TOKEN_NULL;
+            }
+            bool sampled_before_ready = sampled_before_from_carry;
 
             if (spec != nullptr && n_predict_budget != 1) {
-                const bool sampled_before_from_carry = have_speculative_sampled;
-                llama_token sampled_before = LLAMA_TOKEN_NULL;
-                if (sampled_before_from_carry) {
-                    sampled_before = speculative_sampled;
-                    have_speculative_sampled = false;
-                    speculative_sampled = LLAMA_TOKEN_NULL;
-                } else {
+                if (!sampled_before_ready) {
                     sampled_before = common_sampler_sample_legacy(ctx_sampling, ctx, ctx_guidance);
                     common_sampler_accept(ctx_sampling, ctx, sampled_before, /* apply_grammar= */ true);
+                    sampled_before_ready = true;
                 }
                 static const llama_tokens empty_speculative_tokens;
                 const llama_tokens & draft_history =
@@ -966,9 +984,11 @@ int main(int argc, char ** argv) {
                     draft_history,
                     sampled_before,
                     n_past,
-                    0);
+                    0,
+                    &sparams);
 
                 auto & draft = draft_result.tokens;
+                auto & proposal_dists = draft_result.proposal_dists;
                 int max_usable_draft = (int) draft.size();
                 if (n_predict_budget >= 0 && n_predict_budget != std::numeric_limits<int>::max()) {
                     max_usable_draft = std::min(max_usable_draft, std::max(0, n_predict_budget - 2));
@@ -977,11 +997,14 @@ int main(int argc, char ** argv) {
                 max_usable_draft = std::min(max_usable_draft, std::max(0, (int) llama_n_batch(ctx) - 1));
                 if ((int) draft.size() > max_usable_draft) {
                     draft.resize(max_usable_draft);
+                    if (!proposal_dists.empty()) {
+                        proposal_dists.resize(max_usable_draft);
+                    }
                 }
 
                 const int min_usable_draft = params.speculative.get_min_usable_stage_n_min();
                 if ((int) draft.size() >= min_usable_draft && (!draft.empty() || n_predict_budget > 1)) {
-                    if (llama_model_has_recurrent(model)) {
+                    if (common_speculative_needs_checkpoint(model)) {
                         if (!common_speculative_before_draft(
                             spec,
                             model,
@@ -992,13 +1015,13 @@ int main(int argc, char ** argv) {
                             n_past,
                             sampled_before,
                             (int) draft.size() + 1,
-                            params.speculative.recurrent_ckpt_mode)) {
+                            params.speculative.spec_ckpt_mode)) {
                             LOG_TEE("%s: speculative checkpoint setup failed, falling back to one-token decode\n", __func__);
                             draft.clear();
                         }
                     }
 
-                    if (!draft.empty()) {
+                    if (!draft.empty() || draft_result.target_only) {
                         llama_batch verify_batch = llama_batch_init((int) draft.size() + 1, 0, 1);
                         std::vector<int> verify_indices;
                         verify_indices.reserve(draft.size() + 1);
@@ -1015,22 +1038,22 @@ int main(int argc, char ** argv) {
                             LOG_TEE("%s : failed to eval speculative batch\n", __func__);
                             return 1;
                         }
-
                         std::vector<llama_token> ids;
                         try {
-                            ids = common_sampler_sample_and_accept_n(ctx_sampling, ctx, verify_indices, draft);
+                            ids = proposal_dists.empty()
+                                ? common_sampler_sample_and_accept_n(ctx_sampling, ctx, verify_indices, draft)
+                                : common_sampler_sample_and_accept_n(ctx_sampling, ctx, verify_indices, draft, proposal_dists);
                         } catch (const std::exception & e) {
                             llama_batch_free(verify_batch);
                             LOG_TEE("%s: speculative sampling failed: %s\n", __func__, e.what());
                             return 1;
                         }
-
                         std::vector<int32_t> accepted_output_indices;
                         if (!ids.empty()) {
                             accepted_output_indices.assign(verify_indices.begin(), verify_indices.begin() + ids.size());
                         }
 
-                        common_speculative_commit(
+                        if (!common_speculative_commit(
                             spec,
                             ctx,
                             ctx_sampling,
@@ -1039,8 +1062,11 @@ int main(int argc, char ** argv) {
                             ids,
                             (int) draft.size(),
                             n_past + 1,
-                            accepted_output_indices);
-
+                            accepted_output_indices)) {
+                            llama_batch_free(verify_batch);
+                            LOG_TEE("%s: speculative checkpoint restore/commit failed\n", __func__);
+                            return 1;
+                        }
                         llama_batch_free(verify_batch);
 
                         if (!ids.empty()) {
@@ -1066,23 +1092,42 @@ int main(int argc, char ** argv) {
             }
 
             if (!used_speculative) {
-                const llama_token id = common_sampler_sample_legacy(ctx_sampling, ctx, ctx_guidance);
-                common_sampler_accept(ctx_sampling, ctx, id, /* apply_grammar= */ true);
+                if (sampled_before_ready) {
+                    // A carried token was already displayed by the previous speculative step but
+                    // still needs to be decoded. If a new draft is unusable, stage that token instead
+                    // of sampling the unchanged logits again and emitting it twice.
+                    embd.push_back(sampled_before);
+                    embd_is_prompt = false;
+                    input_echo = true;
 
-                LOG("last: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, ctx_sampling->prev).c_str());
+                    if (sampled_before_from_carry) {
+                        emitted_generated = false;
+                    } else {
+                        emitted = embd;
+                        emitted_generated = true;
+                        --n_remain;
+                    }
 
-                embd.push_back(id);
-                emitted = embd;
-                embd_is_prompt = false;
-                emitted_generated = true;
+                    LOG("n_remain: %d\n", n_remain);
+                } else {
+                    const llama_token id = common_sampler_sample_legacy(ctx_sampling, ctx, ctx_guidance);
+                    common_sampler_accept(ctx_sampling, ctx, id, /* apply_grammar= */ true);
 
-                // echo this to console
-                input_echo = true;
+                    LOG("last: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, ctx_sampling->prev).c_str());
 
-                // decrement remaining sampling budget
-                --n_remain;
+                    embd.push_back(id);
+                    emitted = embd;
+                    embd_is_prompt = false;
+                    emitted_generated = true;
 
-                LOG("n_remain: %d\n", n_remain);
+                    // echo this to console
+                    input_echo = true;
+
+                    // decrement remaining sampling budget
+                    --n_remain;
+
+                    LOG("n_remain: %d\n", n_remain);
+                }
             } else {
                 input_echo = true;
             }

@@ -38,6 +38,16 @@ static __global__ void silu_f32(const float * x, float * dst, const int k) {
     dst[i] = x[i] / (1.0f + expf(-x[i]));
 }
 
+static __global__ void scaled_silu_f32(const float * x, float * dst, const int k, float scale) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+    float sx = scale*x[i];
+    dst[i] = sx / (1.0f + expf(-sx));
+}
+
 #if 0
 static __global__ void swiglu_f32(const float * x, float * dst, const int k, const int ne0, const int64_t nb1) {
     const int i = blockDim.x*blockIdx.x + threadIdx.x;
@@ -92,6 +102,15 @@ static __global__ void fused_mul_sigmoid_f32(int ne0, const float * x, const flo
     dst[i] = y[i] / (1.0f + expf(-x[row]));
 }
 
+static __global__ void fused_mul_sigmoid_f32(const float * x, const float * y, float * dst, const int k) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+    dst[i] = y[i] / (1.0f + expf(-x[i]));
+}
+
 static __global__ void fused_mul_silu_f32(int ne0, const float * x, const float * y, float * dst, const int k, float limit) {
     const int i = blockDim.x*blockIdx.x + threadIdx.x;
 
@@ -113,7 +132,7 @@ static __global__ void fused_mul_silu_f32(const float * x, float * dst, const in
     int row = i / ne0;
     int j   = i % ne0;
     auto x_row = x + 2*row*ne0;
-    //dst[i] = x_row[j] * x_row[j + ne0] / (1.0f + expf(-x_row[j + ne0]));
+    // Note: gate is at the beginning of each row, up is offset by ne0
     dst[i] = x_row[j] * x_row[j + ne0] / (1.0f + expf(-x_row[j]));
 }
 
@@ -126,9 +145,10 @@ static __global__ void fused_mul_silu_f32(const float * x, float * dst, const in
     int row = i / ne0;
     int j   = i % ne0;
     auto x_row = x + 2*row*ne0;
-    float g = x_row[j + ne0] / (1.0f + expf(-x_row[j + ne0]));
+    // Note: gate is at the beginning of each row, up is offset by ne0
+    float g = x_row[j] / (1.0f + expf(-x_row[j]));
     g = min(g, limit);
-    dst[i] = max(-limit, min(limit, x_row[j])) * g;
+    dst[i] = max(-limit, min(limit, x_row[j + ne0])) * g;
 }
 
 static __global__ void fused_mul_relu_f32(const float * x, const float * y, float * dst, const int k) {
@@ -203,6 +223,15 @@ static __global__ void sigmoid_f32(const float * x, float * dst, const int k) {
         return;
     }
     dst[i] = 1.0f / (1.0f + expf(-x[i]));
+}
+
+static __global__ void scaled_sigmoid_f32(const float * x, float * dst, const int k, float scale) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+    dst[i] = 1.0f / (1.0f + expf(-scale*x[i]));
 }
 
 static __global__ void biased_sigmoid_f32(const float * x, const float * bias, float * dst, float * dst_biased, const int k, const int ncols) {
@@ -309,6 +338,11 @@ static void fused_mul_relu_f32_cuda(const float * x, const float * y, float * ds
     fused_mul_relu_f32<<<num_blocks, CUDA_SILU_BLOCK_SIZE, 0, stream>>>(x, y, dst, k);
 }
 
+static void fused_mul_sigmoid_f32_cuda(const float * x, const float * y, float * dst, const int k, cudaStream_t stream) {
+    const int num_blocks = (k + CUDA_RELU_BLOCK_SIZE - 1) / CUDA_RELU_BLOCK_SIZE;
+    fused_mul_sigmoid_f32<<<num_blocks, CUDA_SILU_BLOCK_SIZE, 0, stream>>>(x, y, dst, k);
+}
+
 static void fused_mul_gelu_f32_cuda(const float * x, const float * y, float * dst, const int k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_GELU_BLOCK_SIZE - 1) / CUDA_GELU_BLOCK_SIZE;
     fused_mul_gelu_f32<<<num_blocks, CUDA_SILU_BLOCK_SIZE, 0, stream>>>(x, y, dst, k);
@@ -346,6 +380,16 @@ static void relu_f32_cuda(const float * x, float * dst, const int k, cudaStream_
 static void sigmoid_f32_cuda(const float * x, float * dst, const int k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_SIGMOID_BLOCK_SIZE - 1) / CUDA_SIGMOID_BLOCK_SIZE;
     sigmoid_f32<<<num_blocks, CUDA_SIGMOID_BLOCK_SIZE, 0, stream>>>(x, dst, k);
+}
+
+static void scaled_sigmoid_f32_cuda(const float * x, float * dst, const int k, float scale, cudaStream_t stream) {
+    const int num_blocks = (k + CUDA_SIGMOID_BLOCK_SIZE - 1) / CUDA_SIGMOID_BLOCK_SIZE;
+    scaled_sigmoid_f32<<<num_blocks, CUDA_SIGMOID_BLOCK_SIZE, 0, stream>>>(x, dst, k, scale);
+}
+
+static void scaled_silu_f32_cuda(const float * x, float * dst, const int k, float scale, cudaStream_t stream) {
+    const int num_blocks = (k + CUDA_SIGMOID_BLOCK_SIZE - 1) / CUDA_SIGMOID_BLOCK_SIZE;
+    scaled_silu_f32<<<num_blocks, CUDA_SIGMOID_BLOCK_SIZE, 0, stream>>>(x, dst, k, scale);
 }
 
 static void biased_sigmoid_f32_cuda(const float * x, const float * bias, float * dst, float * dst_biased, const int k, const int ncols, cudaStream_t stream) {
@@ -432,6 +476,7 @@ void ggml_fused_mul_unary(ggml_backend_cuda_context & ctx, ggml_unary_op op,
         case GGML_UNARY_OP_SILU: fused_mul_silu_f32_cuda(src0_d, src1_d, dst_d, nelements, limit, stream); break;
         case GGML_UNARY_OP_RELU: fused_mul_relu_f32_cuda(src0_d, src1_d, dst_d, nelements, stream); break;
         case GGML_UNARY_OP_GELU: fused_mul_gelu_f32_cuda(src0_d, src1_d, dst_d, nelements, stream); break;
+        case GGML_UNARY_OP_SIGMOID: fused_mul_sigmoid_f32_cuda(src0_d, src1_d, dst_d, nelements, stream); break;
         default: GGML_ASSERT(false);
     }
 }
@@ -534,6 +579,23 @@ void ggml_cuda_op_sigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT( dst->type == GGML_TYPE_F32);
 
     sigmoid_f32_cuda(src0_d, dst_d, ggml_nelements(src0), stream);
+}
+
+bool ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    auto src = dst->src[0];
+    if (src->op != GGML_OP_SCALE) return false;
+    auto src0 = src->src[0];
+    if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+    auto op = (ggml_unary_op)dst->op_params[0];
+    if (op != GGML_UNARY_OP_SILU && op != GGML_UNARY_OP_SIGMOID) return false;
+    float scale;
+    memcpy(&scale, src->op_params, sizeof(scale));
+    if (op == GGML_UNARY_OP_SILU) {
+        scaled_silu_f32_cuda((const float *)src0->data, (float *)dst->data, ggml_nelements(src0), scale, ctx.stream());
+    } else {
+        scaled_sigmoid_f32_cuda((const float *)src0->data, (float *)dst->data, ggml_nelements(src0), scale, ctx.stream());
+    }
+    return true;
 }
 
 void ggml_cuda_op_biased_sigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -740,6 +802,10 @@ static __device__ __forceinline__ float op_softplus(float x) {
     return (x > 20.0f) ? x : logf(1.0f + expf(x));
 }
 
+static __device__ __forceinline__ float op_sqrt_softplus(float x) {
+    return (x > 20.0f) ? sqrtf(x) : sqrtf(logf(1.0f + expf(x)));
+}
+
 static __device__ __forceinline__ float op_sin(float x) {
     return sinf(x);
 }
@@ -838,6 +904,71 @@ void ggml_cuda_op_exp(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_unary<op_softplus>(ctx, dst);
+}
+
+static __device__ __forceinline__ float op_softplus_scaled(float x, float s_before, float s_after) {
+    x *= s_before;
+    float r = (x > 20.0f) ? x : logf(1.0f + expf(x));
+    return r*s_after;
+}
+
+template <typename T>
+static __global__ void scaled_softplus_kernel(const T * x, T * dst, const int k, float s_before, float s_after) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+    dst[i] = (T)op_softplus_scaled((float)x[i], s_before, s_after);
+}
+
+template <typename T>
+static __global__ void scaled_sigmoid_kernel(const T * x, T * dst, const int k, float s_before, float s_after) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+    dst[i] = (T)(s_after / (1.0f + expf(-s_before * (float)x[i])));
+}
+
+bool ggml_cuda_op_scale_unary_scale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (dst->op != GGML_OP_SCALE) return false;
+    auto unary = dst->src[0];
+    if (unary->op != GGML_OP_UNARY) return false;
+    auto unary_op = (ggml_unary_op)unary->op_params[0];
+    if (unary_op != GGML_UNARY_OP_SOFTPLUS && unary_op != GGML_UNARY_OP_SIGMOID) return false;
+    auto src = unary->src[0];
+    if (src->op != GGML_OP_SCALE) return false;
+    auto src0 = src->src[0];
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(dst)) return false;
+    if (src0->type != dst->type) return false;
+    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) return false;
+
+    float s_before, s_after;
+    memcpy(&s_before, src->op_params, sizeof(float));
+    memcpy(&s_after, dst->op_params, sizeof(float));
+
+    auto nelem = ggml_nelements(src0);
+    const int num_blocks = (nelem + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    if (unary_op == GGML_UNARY_OP_SOFTPLUS) {
+        if (src0->type == GGML_TYPE_F16) {
+            scaled_softplus_kernel<<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream()>>>((const half *)src0->data, (half *)dst->data, nelem, s_before, s_after);
+        } else {
+            scaled_softplus_kernel<<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream()>>>((const float *)src0->data, (float *)dst->data, nelem, s_before, s_after);
+        }
+    } else {
+        if (src0->type == GGML_TYPE_F16) {
+            scaled_sigmoid_kernel<<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream()>>>((const half *)src0->data, (half *)dst->data, nelem, s_before, s_after);
+        } else {
+            scaled_sigmoid_kernel<<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream()>>>((const float *)src0->data, (float *)dst->data, nelem, s_before, s_after);
+        }
+    }
+    return true;
+}
+
+void ggml_cuda_op_sqrt_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_op_unary<op_sqrt_softplus>(ctx, dst);
 }
 
 // === gated ops

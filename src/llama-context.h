@@ -7,14 +7,54 @@
 #include "llama-spec-features.h"
 
 struct llama_model;
+class llama_moe_cache;
 
 #include <vector>
 #include <map>
+#include <tuple>
 #include <set>
 #include <memory>
 
+struct llama_swa_window_view {
+    int64_t w_view  = 0;
+    int64_t win_off = 0;
+    bool engaged    = false;
+};
+
+static inline llama_swa_window_view llama_swa_calc_window_view(
+        int64_t n_kv, int64_t n_tokens, int64_t window, int64_t pad) {
+    llama_swa_window_view result;
+    if (window <= 0 || n_kv <= 0) {
+        result.w_view = n_kv;
+        return result;
+    }
+
+    const int64_t unpadded = window + pad + n_tokens;
+    const int64_t overcovered = pad > 1 ? ((unpadded + pad - 1) / pad) * pad : unpadded;
+    result.w_view  = overcovered < n_kv ? overcovered : n_kv;
+    result.win_off = n_kv - result.w_view;
+    result.engaged = result.w_view < n_kv;
+    return result;
+}
+
+static inline llama_swa_window_view llama_swa_calc_window_view_compact(
+        int64_t live, int64_t sink_rows, int64_t n_tokens, int64_t window, int64_t pad) {
+    llama_swa_window_view result;
+    const int64_t live_padded = pad > 1 ? ((live + pad - 1) / pad) * pad : live;
+
+    const int64_t unpadded = window + pad + n_tokens;
+    const int64_t overcovered = pad > 1 ? ((unpadded + pad - 1) / pad) * pad : unpadded;
+    result.w_view  = overcovered < live_padded ? overcovered : live_padded;
+    result.win_off = sink_rows + live_padded - result.w_view;
+    result.engaged = true;
+    return result;
+}
+
 struct llama_kv_cell {
     llama_pos pos   = -1;
+    // the token stored in this cell; n-gram architectures (DeepSeek-V4.1 engram)
+    // read a token's predecessors from here, which can sit in an earlier decode call
+    llama_token tok = -1;
     llama_pos delta = 0;
     int32_t   src   = 0; // used by recurrent state models to copy states
 
@@ -35,12 +75,29 @@ struct llama_kv_cell {
 
 // ring-buffer of cached KV data
 struct llama_kv_cache {
+    // the FA kernels require padding to avoid extra runtime boundary checks
+    static uint32_t get_padding(bool flash_attn) { return flash_attn ? 256u : 32u; }
+
     bool has_shift = false;
+    // cell-index order no longer matches position order; index-based SWA attention
+    // windowing must not be used
+    bool cells_disordered = false;
     bool do_defrag = false;
     bool do_copy   = false;
     bool recurrent = false; // with recurrent state models, a cell can hold the state for more than one past token
     bool hybrid    = false;
     bool v_trans   = true;  // the value tensor is transposed
+
+    // openPangu s_l holds position-strict MoME conv state, not per-sequence recurrent slots: qnext
+    // seq ops and generic serialization skip it, the openPangu state layouts carry it instead.
+    bool s_l_position_strict = false;
+
+    // standard Mamba-2 (Nemotron-H): the rolling conv window in k_l is keyed by absolute position,
+    // so a cell shift would corrupt it. Set when such a cache is created.
+    bool conv_state_position_strict = false;
+    // row width of the rolling conv state (k-side slot); 0 when this cache has none. The
+    // checkpoint shadows only rows of this width, so attention layers' K caches are skipped.
+    uint32_t conv_state_width = 0;
 
     // Note: The value of head isn't only used to optimize searching
     // for a free KV slot. llama_decode_internal also uses it, so it
@@ -48,6 +105,28 @@ struct llama_kv_cache {
     uint32_t head = 0;
     uint32_t size = 0;
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
+
+    std::vector<uint32_t> row_count;
+
+    bool any_compacted() const { return !row_count.empty(); }
+
+    uint32_t rows(int il) const {
+        return row_count.empty() ? size : row_count[il];
+    }
+
+    bool is_compacted(int il) const {
+        return !row_count.empty() && row_count[il] < size;
+    }
+
+    // rows [sinks|window]; row(pos) = sink_rows + pos - pos_base_swa
+    // sink_rows == hparams.param_sink_number, which only the openPangu loader sets (0 elsewhere)
+    uint32_t  size_swa     = 0;
+    uint32_t  sink_rows    = 0;
+    uint32_t  window_swa   = 0;
+    uint32_t  head_swa     = 0;
+    llama_pos pos_base_swa = 0;
+
+    uint32_t live_swa() const { return head_swa - sink_rows; }
 
     // computed before each graph build
     uint32_t n = 0;
@@ -61,11 +140,15 @@ struct llama_kv_cache {
     std::vector<struct ggml_tensor *> v_l;
     std::vector<struct ggml_tensor *> s_l; // per layer recurrent state storage (Qwen3Next)
 
-    // DSA lightning-indexer key cache (GLM-5.2 / DeepSeek-V3.2). One per layer, MQA single
-    // head: [indexer_head_size, kv_size]. Mirrors k_l but stores the (Hadamard-rotated)
-    // indexer keys so a decoded token scores against ALL past indexer keys, not just the
-    // current batch. Empty unless the model has the DSA indexer.
+    // Persistent DSA indexer-key cache. One per indexer layer, MQA single head:
+    // [indexer_head_size, kv_size]. Stores architecture-specific indexer keys in their
+    // scoring representation so a decoded token scores against all past indexer keys.
+    // Empty unless the model has the DSA indexer.
     std::vector<struct ggml_tensor *> kr_l;
+
+    // Pooled block keys for Qwen sparse attention: [indexer_head_size, kv_size/compress_ratio],
+    // already normalized and rotated. Empty unless the model scores blocks.
+    std::vector<struct ggml_tensor *> kp_l;
 
     // When true, the delta_net graph builder will enable per-step SSM state saves
     bool save_per_step_ssm = false;
@@ -104,6 +187,9 @@ struct llama_kv_cache {
         uint32_t used_snapshot = 0;
 
         std::vector<ggml_tensor *> s_l_shadow;
+        // the standard Mamba-2 layout keeps the rolling conv window in the k-side cache, so a
+        // full-state checkpoint has to shadow that row as well
+        std::vector<ggml_tensor *> k_l_shadow;
 
         std::vector<std::vector<ggml_tensor *>> split_s_l_shadow;
 
@@ -115,6 +201,10 @@ struct llama_kv_cache {
         // One tensor per recurrent layer, each sized [conv_dim * max_tokens].
         //std::vector<std::vector<ggml_tensor *>> per_step_qkv;
         std::vector<std::vector<ggml_tensor *>> per_step_conv;
+        // Qwen4Exp PLE checkpoint state
+        std::vector<std::vector<ggml_tensor *>> per_step_ple;
+        std::vector<int64_t> per_step_ple_dim;
+        std::vector<int64_t> per_step_ple_offset;
 
         int32_t per_step_n_tokens = 0;
         int32_t per_step_max_allocated = 0;
@@ -123,12 +213,38 @@ struct llama_kv_cache {
         int64_t per_step_conv_dim = 0;
         int32_t per_step_d_conv = 0;
 
+        // DSV4 per-step compressor-state base and per-row deltas.
+        std::vector<ggml_tensor *> dsv4_per_step_state;
+        std::vector<ggml_tensor *> dsv4_per_step_state_shadow;
+        std::vector<ggml_tensor *> dsv4_per_step_delta;
+        std::vector<ggml_context *> dsv4_per_step_shadow_ctxs;
+        std::vector<ggml_backend_buffer_t> dsv4_per_step_shadow_bufs;
+        std::vector<int32_t> dsv4_per_step_csa_dst;
+        std::vector<int32_t> dsv4_per_step_hca_dst;
+        std::vector<int32_t> dsv4_per_step_lid_dst;
+        std::vector<int32_t> dsv4_per_step_csa_src;
+        std::vector<int32_t> dsv4_per_step_hca_src;
+        std::vector<int32_t> dsv4_per_step_lid_src;
+        bool dsv4_per_step_allocated = false;
+        bool dsv4_per_step_saved = false;
+        int32_t dsv4_per_step_max_tokens = 0;
+        size_t dsv4_per_step_base_bytes = 0;
+        size_t dsv4_per_step_delta_bytes = 0;
+
         int selected_spec_mode = -1;
         int fixed_spec_mode = LLAMA_SPEC_CKPT_NONE;
         int32_t fixed_max_tokens = 0;
 
-        // Serialised sequence state for CPU mode
+        // Serialized sequence state for CPU mode
         std::vector<uint8_t> cpu_state_data;
+
+        // Private DSV4 state snapshot used by GPU/CPU fallback modes.
+        std::vector<std::vector<uint8_t>> dsv4_state_data;
+        std::vector<ggml_tensor *> dsv4_state_shadow;
+        std::vector<struct ggml_context *> dsv4_shadow_ctxs;
+        std::vector<ggml_backend_buffer_t> dsv4_shadow_bufs;
+        bool dsv4_shadow_allocated = false;
+        bool dsv4_shadow_saved = false;
 
         // Separate storage for per-step allocations
         std::vector<struct ggml_context *>   per_step_ctxs;
@@ -141,33 +257,74 @@ struct llama_kv_cache {
         bool shadow_conv_only = false;
         bool saved     = false;
 
-        ~gpu_checkpoint() {
-            for (struct ggml_context * ctx : shadow_ctxs) {
-                ggml_free(ctx);
-            }
-            for (ggml_backend_buffer_t buf : shadow_bufs) {
-                ggml_backend_buffer_free(buf);
-            }
+        void release_dsv4_per_step();
+        void release_dsv4_snapshot();
+
+        void release_per_step() {
             for (struct ggml_context * ctx : per_step_ctxs) {
                 ggml_free(ctx);
             }
             for (ggml_backend_buffer_t buf : per_step_bufs) {
                 ggml_backend_buffer_free(buf);
             }
+            per_step_ctxs.clear();
+            per_step_bufs.clear();
+            per_step_ssm.clear();
+            per_step_conv.clear();
+            per_step_ple.clear();
+            per_step_ple_dim.clear();
+            per_step_ple_offset.clear();
+            per_step_n_tokens = 0;
+            per_step_max_allocated = 0;
+            per_step_ssm_state_size = 0;
+            per_step_conv_state_dim = 0;
+            per_step_conv_dim = 0;
+            per_step_d_conv = 0;
+        }
+
+        void release() {
+            release_dsv4_per_step();
+            release_dsv4_snapshot();
+
+            for (struct ggml_context * ctx : shadow_ctxs) {
+                ggml_free(ctx);
+            }
+            shadow_ctxs.clear();
+            for (ggml_backend_buffer_t buf : shadow_bufs) {
+                ggml_backend_buffer_free(buf);
+            }
+            shadow_bufs.clear();
+            s_l_shadow.clear();
+            k_l_shadow.clear();
+            split_s_l_shadow.clear();
+            allocated = false;
+            saved = false;
+
+            release_per_step();
+        }
+
+        ~gpu_checkpoint() {
+            release();
         }
     };
 
     gpu_checkpoint ckpt;
+    std::map<llama_pos, gpu_checkpoint *> ckpt_rewind_map;
+    std::vector<std::unique_ptr<gpu_checkpoint>> ckpt_rewind_pool;
 
-    bool checkpoint_alloc_shadows(bool conv_only_shadow = false);
+    bool checkpoint_alloc_shadows(llama_ckpt_data ckpt_type, bool conv_only_shadow = false);
     bool checkpoint_supported() const;
-    bool checkpoint_save(ggml_backend_sched_t sched);
-    bool checkpoint_restore(ggml_backend_sched_t sched);
-    void checkpoint_delete();
+    bool checkpoint_save(ggml_backend_sched_t sched, llama_ckpt_data ckpt_type);
+    bool checkpoint_restore(ggml_backend_sched_t sched, llama_ckpt_data ckpt_type);
+    void checkpoint_delete(llama_ckpt_data ckpt_type);
+
+    gpu_checkpoint & llama_get_ckpt(llama_ckpt_data ckpt_type);
+
+    bool llama_ckpt_mode_equal(llama_ckpt_data ckpt_type, int mode) const;
 
     // Per-step checkpoint: allocate, restore step k's full state (SSM + conv) to cache
     bool per_step_alloc(const llama_model & model, int max_tokens);
-    bool per_step_restore(const llama_model & model, ggml_backend_sched_t sched, int step);
+    bool per_step_restore(ggml_backend_sched_t sched, llama_ckpt_data ckpt_type, int step, uint32_t slot);
 
     ~llama_kv_cache() {
         // release NUMA mirror per-tensor pointer tables and the extra node-local KV copies
@@ -206,13 +363,24 @@ struct llama_control_vector {
         return tensors[il];
     }
 
+    // split mode graph: a copy of each layer's direction on every device, [il][device]
+    std::vector<std::vector<struct ggml_tensor *>> dev_tensors;
+    // graph currently being built (set by llm_build_context::new_graph_custom), used by apply_to
+    struct ggml_cgraph * graph = nullptr;
+
     struct ggml_tensor * apply_to(struct ggml_context * ctx, struct ggml_tensor * cur, int  il) const {
         ggml_tensor * layer_dir = tensor_for(il);
-        if (layer_dir != nullptr) {
-            cur = ggml_add(ctx, cur, layer_dir);
+        if (layer_dir == nullptr) {
+            return cur;
         }
-        return cur;
+        if (ggml_tensor * res = apply_to_reduce(ctx, cur, il)) {
+            return res;
+        }
+        return ggml_add(ctx, cur, layer_dir);
     }
+
+    struct ggml_tensor * apply_to_device(struct ggml_context * ctx, struct ggml_tensor * cur, int il, int id) const;
+    struct ggml_tensor * apply_to_reduce(struct ggml_context * ctx, struct ggml_tensor * cur, int il) const;
 
     ~llama_control_vector() {
         for (struct ggml_context * ctx : ctxs) {
@@ -225,6 +393,20 @@ struct llama_control_vector {
 };
 
 struct llama_context {
+
+    struct periodic_tg_completion_state {
+        bool pending = false;
+
+        void arm(bool eligible, bool submitted) {
+            pending |= eligible && submitted;
+        }
+
+        bool consume(bool synchronization_eligible) {
+            const bool completed = pending && synchronization_eligible;
+            pending = false;
+            return completed;
+        }
+    };
 
     llama_context(const llama_model & model);
 
@@ -243,6 +425,7 @@ struct llama_context {
     std::unordered_map<struct llama_lora_adapter *, float> lora_adapters;
 
     std::vector<ggml_backend_t> backends;
+    std::unique_ptr<llama_moe_cache> moe_cache;
 #ifdef GGML_USE_METAL
     ggml_backend_t backend_metal = nullptr;
 #endif
@@ -257,6 +440,7 @@ struct llama_context {
 
     int64_t t_compute_start_us = 0;
     int64_t n_queued_tokens = 0;
+    periodic_tg_completion_state periodic_tg_completion;
 
     int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     int32_t n_eval   = 0; // number of eval calls
@@ -294,6 +478,11 @@ struct llama_context {
     // memory buffers used to evaluate the model
     std::vector<uint8_t> buf_compute_meta;
     ggml_backend_sched_t sched = nullptr;
+
+    static bool sched_copy_moe_cache(ggml_backend_t backend, const ggml_tensor * src,
+            ggml_tensor * dst, ggml_cgraph * graph, ggml_backend_sched_copy_phase phase, void * user_data);
+    static size_t sched_copy_moe_cache_expert_range(ggml_backend_t backend, const ggml_tensor * src,
+            ggml_tensor * dst, int32_t first_expert, size_t max_experts, int64_t n_tokens, void * user_data);
 
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;
@@ -348,6 +537,7 @@ struct llama_context {
             int32_t cache_graph_write_pos = 0;
             struct ggml_tensor * cache_input_target_features = nullptr;
             struct ggml_tensor * cache_input_pos_ctx = nullptr;
+            struct ggml_tensor * cache_input_rows = nullptr;
             struct ggml_tensor * kq_mask_tensor = nullptr;
             struct ggml_tensor * kq_mask_swa_tensor = nullptr;
             struct ggml_tensor * draft_tail_rows_tensor = nullptr;
@@ -356,10 +546,21 @@ struct llama_context {
         struct capture_state {
             std::vector<int32_t> layer_ids;
             std::vector<std::vector<float>> layer_rows;
+            struct capture_chunk {
+                int32_t row_offset = 0;
+                int32_t row_count = 0;
+                size_t byte_offset = 0;
+                ggml_type type = GGML_TYPE_COUNT;
+            };
+            std::vector<std::vector<capture_chunk>> layer_chunks;
+            std::vector<int32_t> layer_rows_written;
             int32_t row_count = 0;
             int32_t row_width = 0;
+            int32_t expected_rows = 0;
             uint64_t capture_batch_id = 0;
             std::vector<uint64_t> layer_seen_batch_id;
+            bool readback_pending = false;
+            bool invalid = false;
             ggml_backend_sched_eval_callback prev_cb_eval = nullptr;
             void * prev_cb_eval_user_data = nullptr;
         };
@@ -377,22 +578,162 @@ struct llama_context {
         std::vector<float> feature_view_buffer;
         input_state inputs;
         int32_t visible_cross_ctx = 0;
+        bool dspark = false;
+        bool want_dspark_logits = false;
 
-        // Argmax token IDs from the DFlash draft graph, computed via GPU argmax.
-        // Populated in llama_decode_internal after graph compute.
         std::vector<llama_token> draft_tokens;
         struct ggml_tensor * draft_tokens_tensor = nullptr;
+        struct ggml_tensor * draft_lattice_tensor = nullptr;
+        struct ggml_tensor * draft_lattice_ids_tensor = nullptr;
+        std::vector<float> draft_lattice;
+        std::vector<int32_t> draft_lattice_ids;
+        int32_t draft_lattice_top_k = 0;
     };
     dflash_runtime dflash;
     using dflash_capture_state = dflash_runtime::capture_state;
 
+    struct dsv4_runtime {
+        static constexpr uint32_t CSA_RATIO = 4;
+        static constexpr uint32_t HCA_RATIO = 128;
+
+        struct slot_info {
+            int32_t s0 = 0;
+            int32_t s1 = 0;
+            std::vector<llama_seq_id> strm;
+            std::vector<std::vector<uint32_t>> idxs;
+
+            void resize(size_t n) {
+                strm.resize(n);
+                idxs.resize(n);
+            }
+
+            size_t size() const {
+                GGML_ASSERT(strm.size() == idxs.size());
+                if (idxs.empty()) {
+                    return 0;
+                }
+
+                return idxs[0].size();
+            }
+
+            size_t n_stream() const {
+                GGML_ASSERT(strm.size() == idxs.size());
+                return strm.size();
+            }
+
+            bool empty() const {
+                return idxs.empty();
+            }
+        };
+
+        struct raw_context {
+            std::vector<int32_t> write_src_idxs;
+            std::vector<int32_t> write_dst_idxs;
+            std::vector<int32_t> read_dst_idxs;
+            std::vector<int32_t> write_counts;
+            std::vector<int32_t> read_counts;
+            slot_info sinfo_write;
+            slot_info sinfo_read;
+            int64_t graph_n_stream = 1;
+            int64_t n_kv = 0;
+        };
+
+        struct comp_context {
+            slot_info sinfo;
+            int64_t graph_n_stream = 1;
+            int64_t n_kv = 0;
+        };
+
+        struct comp_plan {
+            std::vector<int32_t> state_pos;
+            std::vector<int32_t> state_delta_src_idxs;
+            std::vector<int32_t> state_delta_dst_idxs;
+            std::vector<int32_t> state_persist_src_idxs;
+            std::vector<int32_t> state_persist_dst_idxs;
+            std::vector<int32_t> state_read_idxs;
+            std::vector<int64_t> state_write_idxs;
+            std::vector<int64_t> state_write_idxs_lid;
+            std::vector<int32_t> state_write_pos;
+            std::vector<int32_t> n_visible;
+            int64_t n_stream = 1;
+            int64_t n_kv = 0;
+        };
+
+        struct comp_inputs {
+            struct ggml_tensor * state_pos = nullptr;
+            struct ggml_tensor * state_persist_src_idxs = nullptr;
+            struct ggml_tensor * state_persist_dst_idxs = nullptr;
+            struct ggml_tensor * state_read_idxs = nullptr;
+            struct ggml_tensor * state_write_idxs = nullptr;
+            struct ggml_tensor * state_write_idxs_lid = nullptr;
+            struct ggml_tensor * cand_pin = nullptr;
+            struct ggml_tensor * state_write_pos = nullptr;
+            struct ggml_tensor * kq_mask = nullptr;
+            struct ggml_tensor * n_visible = nullptr;
+        };
+
+        struct storage {
+            std::vector<struct ggml_tensor *> csa_k;
+            std::vector<struct ggml_tensor *> hca_k;
+            std::vector<struct ggml_tensor *> lid_k;
+
+            std::vector<struct ggml_tensor *> csa_state_kv;
+            std::vector<struct ggml_tensor *> csa_state_score;
+            std::vector<struct ggml_tensor *> hca_state_kv;
+            std::vector<struct ggml_tensor *> hca_state_score;
+            std::vector<struct ggml_tensor *> lid_state_kv;
+            std::vector<struct ggml_tensor *> lid_state_score;
+
+            struct ggml_tensor * cand_topk = nullptr;
+
+            struct ggml_context * cache_ctx = nullptr;
+            std::vector<ggml_backend_buffer_t> cache_bufs;
+            uint32_t n_stream = 1;
+        };
+
+        struct input_state {
+            struct ggml_tensor * raw_k_write_src_idxs = nullptr;
+            struct ggml_tensor * raw_k_write_idxs = nullptr;
+            struct ggml_tensor * raw_k_read_idxs = nullptr;
+            comp_inputs csa;
+            comp_inputs hca;
+            comp_inputs lid;
+        };
+
+        storage cache;
+        input_state inputs;
+        raw_context raw;
+        comp_context csa_ctx;
+        comp_context hca_ctx;
+        comp_context lid_ctx;
+        comp_plan csa_plan;
+        comp_plan hca_plan;
+        comp_plan lid_plan;
+        // compressor state ring -> per-token state rows of the current graph (per-step checkpoint capture)
+        std::map<const ggml_tensor *, ggml_tensor *> capture_rows;
+        // compressor state rings the current graph persists into
+        std::set<const ggml_tensor *> persisted_rings;
+
+        std::vector<float> csa_mask_data;
+        std::vector<float> hca_mask_data;
+
+        // the indexer top-k an index source picked, reused by its stream; one graph build only
+        struct ggml_tensor * top_k_a = nullptr;
+        struct ggml_tensor * top_k_b = nullptr;
+    };
+    dsv4_runtime dsv4;
+
     // input tensors
     struct ggml_tensor * inp_tokens;      // I32 [n_batch]
+    std::vector<struct ggml_tensor *> inp_engram_rows; // I32 [n_cols*n_batch], one per engram layer
+    std::vector<struct ggml_tensor *> inp_engram_gate_ids; // I32 [hc]: 0..hc-1, dequantizes the gate scales via get_rows
+    struct ggml_tensor * inp_engram_gate_mask = nullptr; // F32 [n_batch]: 0 at image tokens (engram gate shut), 1 elsewhere
     struct ggml_tensor * inp_embd;        // F32 [n_embd, n_batch]
     struct ggml_tensor * inp_pos;         // I32 [n_batch]
     struct ggml_tensor * inp_out_ids;     // I32 [n_outputs]
     struct ggml_tensor * inp_KQ_mask;     // F32 [kv_size, n_batch]
     struct ggml_tensor * inp_KQ_mask_swa; // F32 [kv_size, n_batch]
+    struct ggml_tensor * inp_KQ_mask_swa_win = nullptr; // F32 [SWA W_view, n_batch]
     struct ggml_tensor * inp_K_shift;     // I32 [kv_size]
     struct ggml_tensor * inp_mean;        // F32 [n_batch, n_batch]
     struct ggml_tensor * inp_cls;         // I32 [n_batch]
@@ -400,22 +741,87 @@ struct llama_context {
     struct ggml_tensor * inp_s_mask;      // F32 [1, n_kv]
     struct ggml_tensor * inp_s_seq;       // I32 [n_kv, n_batch]
     struct ggml_tensor * inp_s_seq_qnext; // I32 [1, n_batch]
+    struct ggml_tensor * inp_ssm_ids;     // I32 [n_seqs] — ssm_scan source state ids (Mamba-2 / Nemotron-H)
+    struct ggml_tensor * inp_ple_rows = nullptr; // I32 [ple_n_heads * n_batch], qwen4exp n-gram rows
     struct ggml_tensor * inp_pos_bucket;    // I32 [n_batch|n_kv, n_batch]
     struct ggml_tensor * inp_embd_enc;      // F32 [n_embd, n_outputs_enc]
     struct ggml_tensor * inp_KQ_mask_cross; // F32 [n_outputs_enc, n_batch]
     struct ggml_tensor * inp_scale = nullptr; // F32 [n_tokens]
     struct ggml_tensor * inp_mtp_states = nullptr;
+    struct ggml_tensor * inp_mtp_carry = nullptr; // F32 [n_embd, nextn-1] per-head hidden at the last committed position
     struct ggml_tensor * inp_dsa_sink = nullptr; // F32 [n_kv, n_tokens] per-sequence attention-sink boost for DSA indexer top-k
-    struct ggml_tensor * inp_mask_inf = nullptr;
+    struct ggml_tensor * inp_kpool_cells     = nullptr; // I32 [kpool*n_pool] cell index of each pool member (pool b, member j at [b*kpool+j])
+    struct ggml_tensor * inp_kpool_bias      = nullptr; // F32 [n_pool, n_tokens] 0 if pool complete & visible to query, else -inf
+    struct ggml_tensor * inp_kpool_tail      = nullptr; // I32 [kpool-1, n_tokens] trailing incomplete pool cells (null when kpool==1)
+    struct ggml_tensor * inp_kpool_ape_slots = nullptr; // I32 [kpool] identity [0..kpool-1], gathers the ape rows in order
+    struct ggml_tensor * inp_msa_cells       = nullptr; // I32 [n_kv] identity, MiniMax-M3 expands selected blocks to cells with it
+    struct ggml_tensor * inp_msa_bias        = nullptr; // F32 [n_blocks, 1, n_tokens] forces each query's own block into the selection
+
+    // Qwen sparse attention: everything that depends on cache layout is computed on the host,
+    // so the graph only gathers, pools and scores. One entry per distinct compress ratio.
+    struct qsa_input {
+        int32_t ratio    = 0;
+        struct ggml_tensor * cell_blk  = nullptr; // I32 [n_kv]           block each cell belongs to
+        struct ggml_tensor * bias      = nullptr; // F32 [n_kv, n_tokens] causal mask plus the tail boost
+        // only the blocks this ubatch writes into are pooled again; the rest are read from kp_l
+        struct ggml_tensor * win_blocks = nullptr; // I32 [n_win]         which block each entry rebuilds
+        struct ggml_tensor * win_cells  = nullptr; // I32 [ratio*n_win]   member cells of those blocks
+        struct ggml_tensor * win_pos    = nullptr; // I32 [4*n_win]       mrope position of those blocks
+        struct ggml_tensor * head_w     = nullptr; // F32 [n_idx_h, n_tokens] all ones; the head sum is unweighted
+        struct ggml_tensor * cut_mask   = nullptr;
+    };
+    std::vector<qsa_input> inp_qsa;
+
+    // the pooled block keys no longer match the raw indexer keys and the next built graph must
+    // pool every block; set on state restore and defrag, cleared by that graph's host fill
+    bool qsa_pooled_stale = false;
+
+    // token at each position of a sequence, read by the PLE n-gram hash
+    std::map<llama_seq_id, std::vector<llama_token>> ple_hist;
+
+    // per-graph memo of Hadamard-rotated activations (prism.hadamard folded weights):
+    // several folded weights consume the same input activation; rotate it once per graph.
+    // Keyed by content (signs tensor + transform params), not by the per-weight transform
+    // pointer, so weights sharing one rotation reuse a single rotated tensor.
+    std::map<std::tuple<const struct ggml_tensor *, const struct ggml_tensor *, int64_t, int64_t, int64_t, int64_t>, struct ggml_tensor *> hadamard_memo;
+
+    struct swa_window_view_state {
+        bool active       = false;
+        bool compacted    = false;
+        int32_t n_kv      = 0;
+        int32_t n_tokens  = 0;
+        uint32_t window   = 0;
+        uint32_t pad      = 0;
+        int64_t w_view    = 0;
+        int64_t win_off   = 0;
+    } swa_window_view;
+
+    // keep slice chosen by the builder for this ubatch, read by the capture row accounting
+    struct dsv41_replay_state {
+        bool    active = false;
+        int64_t keep   = 0;
+    } dsv41_replay;
+
+    // multi-head MTP chaining state: head k's output row at the last committed position,
+    // written back after each warmup/update decode and fed into the next MTP graph through
+    // inp_mtp_carry (zeroed when a prompt warmup restarts from position 0). The readback is
+    // issued async after compute; mtp_carry_pending marks a copy that must be synchronized
+    // before the host buffer is read or resized.
+    std::vector<float> mtp_carry;
+    bool mtp_carry_pending = false;
+
+    std::vector<uint8_t> swa_compact_buf;
 
     ggml_backend_t ggml_backend_by_name(const char * name);
 
     struct Prev;
     std::unique_ptr<Prev> prev;
     std::unique_ptr<Prev> prev_mtp;
+    int32_t mtp_step_idx = 0;
+    int32_t mtp_n_heads = 0;
 
     void reset_scheduler();
-    bool can_reuse_graph(const llama_batch & u_batch);
+    bool can_reuse_graph(const llama_batch & u_batch, uint64_t seq_fingerprint, uint64_t model_state_hash);
 
     struct CacheCopy {
         ggml_tensor * cpy = nullptr;
@@ -430,15 +836,21 @@ struct llama_context {
     // uninitialized -> wrong block-max-pool/top-k -> degraded/NaN sparse-FA decode). Register the
     // kr_l cpy per layer here and patch its offset in update_cache_copies(), exactly like K/V.
     std::vector<CacheCopy> dsa_cache_copies;
+    std::vector<CacheCopy> openpangu_cache_copies;
+    std::vector<CacheCopy> openpangu_cache_copies_mtp;
 
     bool update_cache_copies();
 
     bool ensure_dflash_kv_cache_tensors(int32_t cross_ctx);
     void free_dflash_kv_cache_tensors();
+    bool ensure_dsv4_cache_tensors();
+    void free_dsv4_cache_tensors();
 
     bool prepare_mtp_graph_inputs(
         struct llama_context & lctx);
     void set_mtp_op_type(llama_mtp_op_type value);
+    void set_mtp_step_idx(int32_t value);
+    void set_mtp_n_heads(int32_t value);
 
     int max_nodes(int n_tokens, int n_kv) const;
 };

@@ -337,6 +337,8 @@ enum ggml_metal_kernel_type {
     GGML_METAL_KERNEL_TYPE_ROPE_NORM_F16,
     GGML_METAL_KERNEL_TYPE_ROPE_NEOX_F32,
     GGML_METAL_KERNEL_TYPE_ROPE_NEOX_F16,
+    GGML_METAL_KERNEL_TYPE_ROPE_MULTI_F32,
+    GGML_METAL_KERNEL_TYPE_ROPE_MULTI_F16,
     GGML_METAL_KERNEL_TYPE_IM2COL_F16,
     GGML_METAL_KERNEL_TYPE_IM2COL_F32,
     GGML_METAL_KERNEL_TYPE_UPSCALE_F32,
@@ -1005,6 +1007,8 @@ static struct ggml_backend_metal_context * ggml_metal_init(int n_cb) {
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_ROPE_NORM_F16,                 rope_norm_f16,                  true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_ROPE_NEOX_F32,                 rope_neox_f32,                  true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_ROPE_NEOX_F16,                 rope_neox_f16,                  true);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_ROPE_MULTI_F32,                rope_multi_f32,                 true);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_ROPE_MULTI_F16,                rope_multi_f16,                 true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_IM2COL_F16,                    im2col_f16,                     true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_IM2COL_F32,                    im2col_f32,                     true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_UPSCALE_F32,                   upscale_f32,                    true);
@@ -1204,6 +1208,9 @@ static bool ggml_metal_supports_op(const struct ggml_backend_metal_context * ctx
             if (!ctx->support_simdgroup_mm) {
                 return false; // TODO: over-restricted for vec-kernels
             }
+            if (!op->src[3] && op->src[5]) {
+                return false;
+            }
             if (op->src[1]->type != op->src[2]->type ||
                (op->src[1]->type != GGML_TYPE_F16 && op->src[1]->type != GGML_TYPE_Q8_0)) {
                 return false;
@@ -1216,11 +1223,17 @@ static bool ggml_metal_supports_op(const struct ggml_backend_metal_context * ctx
                     op->src[1]->ne[0] ==  96 || op->src[1]->ne[0] == 112 ||
                     op->src[1]->ne[0] == 128 || op->src[1]->ne[0] == 256);
         case GGML_OP_MUL_MAT:
-            return ctx->support_simdgroup_reduction &&
+            return ctx->support_simdgroup_reduction && op->src[0]->type != GGML_TYPE_IQ1_KT && op->src[0]->type != GGML_TYPE_IQ4_KT && op->src[0]->type != GGML_TYPE_NVFP4_KS &&
+                op->src[0]->type != GGML_TYPE_F8_E4M3_KS && op->src[0]->type != GGML_TYPE_F8_E4M3_B128 &&
+                (op->src[0]->type != GGML_TYPE_IQ2_KT || op->src[0]->ne[0] % ggml_blck_size(GGML_TYPE_IQ2_KT) == 0) &&
+                (op->src[0]->type != GGML_TYPE_IQ3_KT || op->src[0]->ne[0] % ggml_blck_size(GGML_TYPE_IQ3_KT) == 0) &&
                 (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
                !(op->src[0]->type >= GGML_TYPE_Q4_0_R8 && op->src[0]->type <= GGML_TYPE_Q8_K_R8);
         case GGML_OP_MUL_MAT_ID:
-            return ctx->support_simdgroup_reduction &&
+            return ctx->support_simdgroup_reduction && op->src[0]->type != GGML_TYPE_IQ1_KT && op->src[0]->type != GGML_TYPE_IQ4_KT && op->src[0]->type != GGML_TYPE_NVFP4_KS &&
+                op->src[0]->type != GGML_TYPE_F8_E4M3_KS && op->src[0]->type != GGML_TYPE_F8_E4M3_B128 &&
+                (op->src[0]->type != GGML_TYPE_IQ2_KT || op->src[0]->ne[0] % ggml_blck_size(GGML_TYPE_IQ2_KT) == 0) &&
+                (op->src[0]->type != GGML_TYPE_IQ3_KT || op->src[0]->ne[0] % ggml_blck_size(GGML_TYPE_IQ3_KT) == 0) &&
                 (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F32);
         case GGML_OP_CPY:
         case GGML_OP_DUP:
@@ -1254,8 +1267,12 @@ static bool ggml_metal_supports_op(const struct ggml_backend_metal_context * ctx
                         return false;
                 };
             }
-        case GGML_OP_DIAG_MASK_INF:
         case GGML_OP_GET_ROWS:
+            return op->ne[3] == 1 && op->src[0]->type != GGML_TYPE_IQ1_KT && op->src[0]->type != GGML_TYPE_IQ4_KT && op->src[0]->type != GGML_TYPE_NVFP4_KS &&
+                op->src[0]->type != GGML_TYPE_F8_E4M3_KS && op->src[0]->type != GGML_TYPE_F8_E4M3_B128 &&
+                (op->src[0]->type != GGML_TYPE_IQ2_KT || op->src[0]->ne[0] % ggml_blck_size(GGML_TYPE_IQ2_KT) == 0) &&
+                (op->src[0]->type != GGML_TYPE_IQ3_KT || op->src[0]->ne[0] % ggml_blck_size(GGML_TYPE_IQ3_KT) == 0);
+        case GGML_OP_DIAG_MASK_INF:
             {
                 return op->ne[3] == 1;
             }
@@ -1622,7 +1639,7 @@ static void ggml_metal_encode_node(
                 const bool inplace = (bool) ((int32_t *) dst->op_params)[4];
 
                 if (!inplace) {
-                    // run a separete kernel to cpy src->dst
+                    // run a separate kernel to cpy src->dst
                     // not sure how to avoid this
                     // TODO: make a simpler cpy_bytes kernel
 
@@ -3279,8 +3296,6 @@ static void ggml_metal_encode_node(
             } break;
         case GGML_OP_ROPE:
             {
-                GGML_ASSERT(ne10 == ne02);
-
                 const int nth = MIN(1024, ne00);
 
                 const int n_past     = ((int32_t *) dst->op_params)[0];
@@ -3303,11 +3318,33 @@ static void ggml_metal_encode_node(
                 memcpy(&beta_fast,   (int32_t *) dst->op_params +  9, sizeof(float));
                 memcpy(&beta_slow,   (int32_t *) dst->op_params + 10, sizeof(float));
 
-                const bool is_neox = mode & 2;
+                const bool is_neox   = mode & GGML_ROPE_TYPE_NEOX;
+                const bool is_mrope  = mode & GGML_ROPE_TYPE_MROPE;  // also true for imrope
+                const bool is_imrope = mode == GGML_ROPE_TYPE_IMROPE;
+                const bool is_vision = mode == GGML_ROPE_TYPE_VISION;
+
+                GGML_ASSERT(!is_vision); // vision mrope not implemented in metal
+
+                int sections[4] = {0, 0, 0, 0};
+                memcpy(sections, (int32_t *) dst->op_params + 11, sizeof(sections));
+
+                if (is_mrope) {
+                    // mrope: 4 position ids per token (t/h/w/e blocks)
+                    GGML_ASSERT(ne10 == ne02*4);
+                    GGML_ASSERT(sections[0] > 0 || sections[1] > 0 || sections[2] > 0);
+                } else {
+                    GGML_ASSERT(ne10 == ne02);
+                }
 
                 id<MTLComputePipelineState> pipeline = nil;
 
-                if (!is_neox) {
+                if (is_mrope) {
+                    switch (src0->type) {
+                        case GGML_TYPE_F32: pipeline = ctx->kernels[GGML_METAL_KERNEL_TYPE_ROPE_MULTI_F32].pipeline; break;
+                        case GGML_TYPE_F16: pipeline = ctx->kernels[GGML_METAL_KERNEL_TYPE_ROPE_MULTI_F16].pipeline; break;
+                        default: GGML_ABORT("fatal error");
+                    };
+                } else if (!is_neox) {
                     switch (src0->type) {
                         case GGML_TYPE_F32: pipeline = ctx->kernels[GGML_METAL_KERNEL_TYPE_ROPE_NORM_F32].pipeline; break;
                         case GGML_TYPE_F16: pipeline = ctx->kernels[GGML_METAL_KERNEL_TYPE_ROPE_NORM_F16].pipeline; break;
@@ -3355,6 +3392,16 @@ static void ggml_metal_encode_node(
                 [encoder setBytes:&attn_factor length:sizeof(   float) atIndex:26];
                 [encoder setBytes:&beta_fast   length:sizeof(   float) atIndex:27];
                 [encoder setBytes:&beta_slow   length:sizeof(   float) atIndex:28];
+                if (is_mrope) {
+                    // must match ggml_metal_mrope_args in ggml-metal.metal
+                    struct {
+                        int32_t sect[4];
+                        int32_t is_imrope;
+                    } margs;
+                    memcpy(margs.sect, sections, sizeof(sections));
+                    margs.is_imrope = is_imrope ? 1 : 0;
+                    [encoder setBytes:&margs length:sizeof(margs) atIndex:29];
+                }
 
                 [encoder dispatchThreadgroups:MTLSizeMake(ne01, ne02, ne03) threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
             } break;
@@ -4315,6 +4362,21 @@ GGML_CALL ggml_backend_buffer_type_t ggml_backend_metal_buffer_type(void) {
     return &ggml_backend_buffer_type_metal;
 }
 
+// unified memory: report the working set the GPU may use, not free host RAM
+void ggml_backend_metal_get_device_memory(size_t * free, size_t * total) {
+    *free  = 0;
+    *total = 0;
+    if (@available(macOS 10.12, iOS 16.0, *)) {
+        id<MTLDevice> device = ggml_backend_metal_get_device();
+        if (device != nil) {
+            *total = device.recommendedMaxWorkingSetSize;
+            size_t used = device.currentAllocatedSize;
+            *free  = *total > used ? *total - used : 0;
+        }
+        ggml_backend_metal_free_device();
+    }
+}
+
 // buffer from ptr
 
 GGML_CALL ggml_backend_buffer_t ggml_backend_metal_buffer_from_ptr(void * data, size_t size, size_t max_size) {
@@ -4474,6 +4536,8 @@ ggml_backend_t ggml_backend_metal_init(void) {
         /* .interface = */ ggml_backend_metal_i,
         /* .context   = */ ctx,
     };
+
+    ggml_backend_metal_set_n_cb(metal_backend, 1);
 
     return metal_backend;
 }

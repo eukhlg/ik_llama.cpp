@@ -14,7 +14,7 @@ Continue reading for the details.
 ## overview
 
 This simple web frontend, allows triggering/testing the server's /completions or /chat/completions endpoints
-in a simple way with minimal code from a common code base. Inturn additionally it tries to allow single or
+in a simple way with minimal code from a common code base. In turn additionally it tries to allow single or
 multiple independent back and forth chatting to an extent, with the ai llm model at a basic level, with their
 own system prompts.
 
@@ -23,22 +23,22 @@ or potentially as it is being generated, in a streamed manner from the server/ai
 
 ![Chat and Settings screens](./simplechat_screens.webp "Chat and Settings screens")
 
-Auto saves the chat session locally as and when the chat is progressing and inturn at a later time when you
+Auto saves the chat session locally as and when the chat is progressing and in turn at a later time when you
 open SimpleChat, option is provided to restore the old chat session, if a matching one exists.
 
 The UI follows a responsive web design so that the layout can adapt to available display space in a usable
 enough manner, in general.
 
 Allows developer/end-user to control some of the behaviour by updating gMe members from browser's devel-tool
-console. Parallely some of the directly useful to end-user settings can also be changed using the provided
+console. In parallel, some of the directly useful to end-user settings can also be changed using the provided
 settings ui.
 
-NOTE: Current web service api doesnt expose the model context length directly, so client logic doesnt provide
+NOTE: Current web service api doesn't expose the model context length directly, so client logic doesn't provide
 any adaptive culling of old messages nor of replacing them with summary of their content etal. However there
 is a optional sliding window based chat logic, which provides a simple minded culling of old messages from
 the chat history before sending to the ai model.
 
-NOTE: Wrt options sent with the request, it mainly sets temperature, max_tokens and optionaly stream for now.
+NOTE: Wrt options sent with the request, it mainly sets temperature, max_tokens and optionally stream for now.
 However if someone wants they can update the js file or equivalent member in gMe as needed.
 
 NOTE: One may be able to use this to chat with openai api web-service /chat/completions endpoint, in a very
@@ -80,32 +80,32 @@ Once inside
   * oneshot or streamed mode.
 
 * In completion mode
-  * one normally doesnt use a system prompt in completion mode.
-  * logic by default doesnt insert any role specific "ROLE: " prefix wrt each role's message.
+  * one normally doesn't use a system prompt in completion mode.
+  * logic by default doesn't insert any role specific "ROLE: " prefix wrt each role's message.
     If the model requires any prefix wrt user role messages, then the end user has to
     explicitly add the needed prefix, when they enter their chat message.
     Similarly if the model requires any prefix to trigger assistant/ai-model response,
     then the end user needs to enter the same.
     This keeps the logic simple, while still giving flexibility to the end user to
     manage any templating/tagging requirement wrt their messages to the model.
-  * the logic doesnt insert newline at the begining and end wrt the prompt message generated.
+  * the logic doesn't insert newline at the beginning and end wrt the prompt message generated.
     However if the chat being sent to /completions end point has more than one role's message,
     then insert newline when moving from one role's message to the next role's message, so
     that it can be clearly identified/distinguished.
-  * given that /completions endpoint normally doesnt add additional chat-templating of its
+  * given that /completions endpoint normally doesn't add additional chat-templating of its
     own, the above ensures that end user can create a custom single/multi message combo with
     any tags/special-tokens related chat templating to test out model handshake. Or enduser
     can use it just for normal completion related/based query.
 
 * If you want to provide a system prompt, then ideally enter it first, before entering any user query.
-  Normally Completion mode doesnt need system prompt, while Chat mode can generate better/interesting
+  Normally Completion mode doesn't need system prompt, while Chat mode can generate better/interesting
   responses with a suitable system prompt.
   * if chat.add_system_begin is used
-    * you cant change the system prompt, after it is has been submitted once along with user query.
-    * you cant set a system prompt, after you have submitted any user query
+    * you can't change the system prompt, after it is has been submitted once along with user query.
+    * you can't set a system prompt, after you have submitted any user query
   * if chat.add_system_anytime is used
     * one can change the system prompt any time during chat, by changing the contents of system prompt.
-    * inturn the updated/changed system prompt will be inserted into the chat session.
+    * in turn the updated/changed system prompt will be inserted into the chat session.
     * this allows for the subsequent user chatting to be driven by the new system prompt set above.
 
 * Enter your query and either press enter or click on the submit button.
@@ -129,8 +129,8 @@ Once inside
 
 ### Reason behind this
 
-The idea is to be easy enough to use for basic purposes, while also being simple and easily discernable
-by developers who may not be from web frontend background (so inturn may not be familiar with template /
+The idea is to be easy enough to use for basic purposes, while also being simple and easily discernible
+by developers who may not be from web frontend background (so in turn may not be familiar with template /
 end-use-specific-language-extensions driven flows) so that they can use it to explore/experiment things.
 
 And given that the idea is also to help explore/experiment for developers, some flexibility is provided
@@ -144,7 +144,7 @@ Me/gMe consolidates the settings which control the behaviour into one object.
 One can see the current settings, as well as change/update them using browsers devel-tool/console.
 It is attached to the document object. Some of these can also be updated using the Settings UI.
 
-  baseURL - the domain-name/ip-address and inturn the port to send the request.
+  baseURL - the domain-name/ip-address and in turn the port to send the request.
 
   bStream - control between oneshot-at-end and live-stream-as-its-generated collating and showing
   of the generated response.
@@ -155,7 +155,7 @@ It is attached to the document object. Some of these can also be updated using t
     that text generated till then is not lost.
 
       if a very long text is being generated, which leads to no user interaction for sometime and
-      inturn the machine goes into power saving mode or so, the platform may stop network connection,
+      in turn the machine goes into power saving mode or so, the platform may stop network connection,
       leading to exception.
 
   apiEP - select between /completions and /chat/completions endpoint provided by the server/ai-model.
@@ -166,8 +166,8 @@ It is attached to the document object. Some of these can also be updated using t
   bCompletionInsertStandardRolePrefix - whether Completion mode inserts role related prefix wrt the
   messages that get inserted into prompt field wrt /Completion endpoint.
 
-  bTrimGarbage - whether garbage repeatation at the end of the generated ai response, should be
-  trimmed or left as is. If enabled, it will be trimmed so that it wont be sent back as part of
+  bTrimGarbage - whether garbage repetition at the end of the generated ai response, should be
+  trimmed or left as is. If enabled, it will be trimmed so that it won't be sent back as part of
   subsequent chat history. At the same time the actual trimmed text is shown to the user, once
   when it was generated, so user can check if any useful info/data was there in the response.
 
@@ -240,21 +240,21 @@ However a developer when testing the server of ai-model may want to change these
 
 Using iRecentUserMsgCnt reduce chat history context sent to the server/ai-model to be
 just the system-prompt, prev-user-request-and-ai-response and cur-user-request, instead of
-full chat history. This way if there is any response with garbage/repeatation, it doesnt
+full chat history. This way if there is any response with garbage/repetition, it doesn't
 mess with things beyond the next question/request/query, in some ways. The trim garbage
 option also tries to help avoid issues with garbage in the context to an extent.
 
-Set max_tokens to 1024, so that a relatively large previous reponse doesnt eat up the space
+Set max_tokens to 1024, so that a relatively large previous response doesn't eat up the space
 available wrt next query-response. However dont forget that the server when started should
 also be started with a model context size of 1k or more, to be on safe side.
 
-  The /completions endpoint of examples/server doesnt take max_tokens, instead it takes the
+  The /completions endpoint of examples/server doesn't take max_tokens, instead it takes the
   internal n_predict, for now add the same here on the client side, maybe later add max_tokens
   to /completions endpoint handling code on server side.
 
 NOTE: One may want to experiment with frequency/presence penalty fields in apiRequestOptions
 wrt the set of fields sent to server along with the user query, to check how the model behaves
-wrt repeatations in general in the generated text response.
+wrt repetitions in general in the generated text response.
 
 A end-user can change these behaviour by editing gMe from browser's devel-tool/console or by
 using the provided settings ui (for settings exposed through the ui).

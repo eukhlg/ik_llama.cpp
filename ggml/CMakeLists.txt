@@ -82,7 +82,7 @@ option(GGML_CPU_HBM     "ggml: use memkind for CPU HBM" OFF)
 
 option(GGML_AVX         "ggml: enable AVX"              ${INS_ENB})
 option(GGML_AVX2        "ggml: enable AVX2"             ${INS_ENB})
-option(GGML_AVXVNNI     "ggml: enable AVX-VNNI"         ${INS_ENB})
+option(GGML_AVXVNNI     "ggml: enable AVX-VNNI"         OFF)
 option(GGML_AVX512      "ggml: enable AVX512"           OFF)
 option(GGML_AVX512_VBMI "ggml: enable AVX512-VBMI"      OFF)
 option(GGML_AVX512_VNNI "ggml: enable AVX512-VNNI"      OFF)
@@ -95,6 +95,10 @@ option(GGML_LASX        "ggml: enable lasx"             ON)
 option(GGML_LSX         "ggml: enable lsx"              ON)
 option(GGML_SVE         "ggml: enable SVE"              OFF)
 option(GGML_NCCL        "ggml: enable NCCL"             ON)
+option(GGML_EXPERT_CHUNKING "ggml: enable expert chunking" ON)
+
+option(GGML_USE_I32GATHER    "ggml: prefer ZMM gather instructions" OFF)
+option(GGML_CPU_INTEL_CLIENT "ggml: build for Intel Client CPUs"    OFF)
 
 if (WIN32)
     # Default to Windows 10 (0x0A00). Windows 8 / 8.1 reached end of support in
@@ -107,7 +111,7 @@ endif()
 
 # ggml core
 set(GGML_SCHED_MAX_COPIES  "1" CACHE STRING "ggml: max input copies for pipeline parallelism")
-set(GGML_MAX_CONTEXTS       "" CACHE STRING "ggml: max model contexts (override only; defaults to 64 in the code)")
+set(GGML_MAX_CONTEXTS       "" CACHE STRING "legacy: no live ggml_context limit; on Windows values >512 raise model-loader stdio limit")
 
 # 3rd party libs / backends
 option(GGML_ACCELERATE                      "ggml: enable Accelerate framework"               ON)
@@ -116,11 +120,12 @@ option(GGML_IQK_MUL_MAT                     "ggml: use optimized iqk matrix mult
 option(GGML_CUDA                            "ggml: use CUDA"                                  OFF)
 option(GGML_MUSA                            "ggml: use MUSA"                                  OFF)
 option(GGML_CUDA_FORCE_DMMV                 "ggml: use dmmv instead of mmvq CUDA kernels"     OFF)
+option(GGML_CUDA_USE_DMMV                   "ggml: use dmmv instead of mmvq when appropriate" OFF)
 option(GGML_CUDA_FORCE_MMQ                  "ggml: use mmq kernels instead of cuBLAS"         OFF)
 option(GGML_CUDA_FORCE_CUBLAS               "ggml: always use cuBLAS instead of mmq kernels"  OFF)
 option(GGML_CUDA_IQK_FORCE_BF16             "ggml: use bf16 cuBLAS when no MMQ kernel is available"  OFF)
 set   (GGML_CUDA_DMMV_X   "32" CACHE STRING "ggml: x stride for dmmv CUDA kernels")
-set   (GGML_CUDA_MMV_Y     "1" CACHE STRING "ggml: y block size for mmv CUDA kernels")
+set   (GGML_CUDA_MMV_Y     "4" CACHE STRING "ggml: y block size for mmv CUDA kernels")
 option(GGML_CUDA_F16                        "ggml: use 16 bit floats for some calculations"   OFF)
 set   (GGML_CUDA_KQUANTS_ITER "2" CACHE STRING
                                             "ggml: iters./thread per block for Q2_K/Q6_K")
@@ -154,7 +159,6 @@ option(GGML_VULKAN_NO_COOPMAT               "ggml: don't use Vulkan coopmat even
 option(GGML_VULKAN_NO_COOPMAT2              "ggml: don't use Vulkan coopmat2 even if supported"      OFF)
 option(GGML_VULKAN_NO_BF16                  "ggml: don't use Vulkan bf16 even if supported"          OFF)
 option(GGML_VULKAN_NO_INT_DOT               "ggml: don't use Vulkan integer dot even if supported"   OFF)
-option(GGML_KOMPUTE                         "ggml: use Kompute"                               OFF)
 option(GGML_METAL                           "ggml: use Metal"                                 ${GGML_METAL_DEFAULT})
 option(GGML_METAL_NDEBUG                    "ggml: disable Metal debugging"                   OFF)
 option(GGML_METAL_SHADER_DEBUG              "ggml: compile Metal with -fno-fast-math"         OFF)
@@ -221,9 +225,9 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-cann.h
     include/ggml-cuda.h
     include/ggml.h
-    include/ggml-kompute.h
     include/ggml-metal.h
     include/ggml-rpc.h
+    src/ggml-rpc-transport.h
     include/ggml-sycl.h
     include/ggml-vulkan.h)
 

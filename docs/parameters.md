@@ -59,9 +59,9 @@ Some often used terms.
 | full gpu | All processes offloaded to the GPU. |
 | hybrid cpu/gpu | Partial offload to the GPU. |
 | RAG | Retrieval Augmented Generation. Provide external documents to the LLM for information lookup. |
-| MCP | Model Context Protocol ), an [open standard](https://en.wikipedia.org/wiki/Model_Context_Protocol) for the way artificial intelligence (AI) systems like large language models (LLMs) integrate and share data with external tools, systems, and data sources |
+| MCP | Model Context Protocol, an [open standard](https://en.wikipedia.org/wiki/Model_Context_Protocol) for the way artificial intelligence (AI) systems like large language models (LLMs) integrate and share data with external tools, systems, and data sources |
 | AI agent | Tool/program that uses LLM to achieve a goal/task via a series of planning/steps/actions/tool-calling/etc. `Coding agents` are specialized in software goals. |
-| Agent harness | The tools and the infrastructure around the LLM in an AI Agent. `AI Agent = LLM+ Agent harness` |
+| Agent harness | The tools and the infrastructure around the LLM in an AI Agent. `AI Agent = LLM + Agent harness` |
 
 ## General Parameters
 
@@ -74,6 +74,9 @@ Some often used terms.
 | `-wgt, --worst-graph-tokens N` | Number of tokens to use for worst-case graph | - | Control compute buffer sizes for large batches. Provided "as is" for users that understand the limitations, please don't open issues when using this. [PR 1560](https://github.com/ikawrakow/ik_llama.cpp/pull/1560) |
 | `-t, --threads N` | Number of threads to use during generation | 4 | Try to match the number of physical CPU cores. Avoid odd numbers (e.g. 1,3,...). |
 | `-tb, --threads-batch N` | Number of threads to use during batch and prompt processing | Same as `--threads` | Same as `--threads` When doing full GPU offload, use a lower number (e.g. 2) |
+| `--cpu-affinity` | Pin CPU worker threads to the physical P-cores (hybrid CPUs) | off | Opt-in, Linux only. One thread per physical P-core (primaries first, then SMT siblings), resolved via `thread_siblings_list`; respects an external taskset/cpuset. [PR 2565](https://github.com/ikawrakow/ik_llama.cpp/pull/2565) For sustained laptop inference see [CPU thermal throttling](development/token_generation_performance_tips.md#thermal-throttling-on-laptops-external-tools). |
+| `-cm, --cpu-mask MASK` | Pin CPU worker threads to an explicit bitmask of logical CPUs | - | Opt-in, Linux only. Intersected with the process affinity (taskset); dropped CPUs are warned about. [PR 2565](https://github.com/ikawrakow/ik_llama.cpp/pull/2565) |                                                       
+| `-cr, --cpu-range LIST` | Pin CPU worker threads to an explicit core range (e.g. `4-7`) | - | Opt-in, Linux only. Intersected with the process affinity (taskset). [PR 2565](https://github.com/ikawrakow/ik_llama.cpp/pull/2565) |
 | `-tm,   --threads-mtmd N` | Number of threads to use during multimodal image processing | Same as `--threads-batch` | Control CPU thread count used during multimodal image/audio processing (mmproj encoding), separate from the main LLM thread count. |
 | `-c, --ctx-size N` | Size of the prompt context | 0 (loaded from model) | Influences the size of KV size (memory) therefore look for a value that fits your system then increase as needed (2048, 4096,…). If you use parallel slots, this context size will be split across the slots. |
 | `-n, --predict N` | Number of tokens to predict | -1 (infinity) | -1 (infinity), -2 (until context filled). Safe to leave default. |
@@ -81,19 +84,26 @@ Some often used terms.
 | `-ub, --ubatch-size N` | Physical maximum batch size | 512 | Safe to leave default. Similar to `--batch-size N` |
 | `--keep N` | Number of tokens to keep from the initial prompt | 0 | -1 = all |
 | `--chunks N` | Max number of chunks to process | -1 (all) |  |
-| `-dr, --dry-run` | Skip loading tensors in the files | - | Skips loading files, yet still report OOM error and print memory usage correctly, which is helpful for manually tuning of very large models. |
+| `-dr, --dry-run` | Skip loading tensors in the files | - | Skips loading files, yet still reports OOM error and print memory usage correctly, which is helpful for manually tuning of very large models. |
 | `--minilog` | Print important information | - | For `llama-server`, log request message for completions/response/anthropic and response. The prompt in the json format and the text response are saved in the log file and printed to the console. [PR 1477](https://github.com/ikawrakow/ik_llama.cpp/pull/1477) |
 | `-fa, --flash-attn` | Enables Flash Attention | on | auto / on / off Improves t/s and reduces memory usage. |
-| `--no-fa, --no-flash-attn` | Disable Flash Attention |  | Alternative parameter to turn of FA. See `--flash-attn` |
+| `--no-fa, --no-flash-attn` | Disable Flash Attention |  | Alternative parameter to turn off FA. See `--flash-attn` |
 | `-mla, --mla-use` | Enable MLA | 3 | 0 / 1 / 2 / 3 For DeepSeek models, and other recent models that are using MLA. [PR 188](https://github.com/ikawrakow/ik_llama.cpp/pull/188) [PR 205](https://github.com/ikawrakow/ik_llama.cpp/pull/205) [PR 235](https://github.com/ikawrakow/ik_llama.cpp/pull/235) [PR 243](https://github.com/ikawrakow/ik_llama.cpp/pull/243) [PR 252](https://github.com/ikawrakow/ik_llama.cpp/pull/252) [PR 253](https://github.com/ikawrakow/ik_llama.cpp/pull/253) [PR 273](https://github.com/ikawrakow/ik_llama.cpp/pull/273) [PR 386](https://github.com/ikawrakow/ik_llama.cpp/pull/386) [PR 497](https://github.com/ikawrakow/ik_llama.cpp/pull/497) [PR 943](https://github.com/ikawrakow/ik_llama.cpp/pull/943) [PR 1821](https://github.com/ikawrakow/ik_llama.cpp/pull/1821) |
-| `-amb, --attention-max-batch` | Max batch size for attention computations | 0 | Specifies the maximum K*Q size in MB we want to tolerate. [PR 237](https://github.com/ikawrakow/ik_llama.cpp/pull/237) |
+| `--dsa, -dsa` |  | off | Enable sparse attention: GLM DSA [PR 2045](https://github.com/ikawrakow/ik_llama.cpp/pull/2045), and MiniMax-M3/M3.1 block-sparse attention (MSA) on the CPU [PR 2790](https://github.com/ikawrakow/ik_llama.cpp/pull/2790). The M3 sparse path requires CPU-only inference (no GPU offload), flash attention and a single sequence; otherwise the context warns and runs dense attention, and the indexer is not loaded when GPUs are in use. The M3 indexer cache is always F16, so `-ictk` has no effect there. |
+| `--dsa-top-k, -dsatk` | DSA top-k override | -1 | `<0` uses the model's configured `indexer_top_k` [PR 2045](https://github.com/ikawrakow/ik_llama.cpp/pull/2045) |
+| `--indexer-cache-type-k type, -ictk` | Indexer K-cache data type | off | Use quantized indexer cache [PR 2075](https://github.com/ikawrakow/ik_llama.cpp/pull/2075) |
+| `--fused-indexer-topk, -fidx` | Enable the fused indexer topk op | enabled | Use a dedicated op for computing the DSA indexer top_k KV cache entries [PR 2098](https://github.com/ikawrakow/ik_llama.cpp/pull/2098) |
+| `--no-fused-indexer-topk, -no-fidx` | Disable the fused indexer topk op | enabled | See `--fused-indexer-topk` |
+| `--swa-compress` | Allocate sliding-window layers at window size instead of `n_ctx` | disabled | [PR 2266](https://github.com/ikawrakow/ik_llama.cpp/pull/2266) |
+| `--dsv41-replay-keep N` | DeepSeek-V4.1 prefill: run the decoder layers on the last N prompt tokens only | 256 | DeepSeek-V4.1 only; requires `--swa-compress`, which is also needed to get the much improved PP of the default separate-arch graph builder. `N` is floored at `n_swa + 6` (134). With `V41_SEPARATE=0` (original V4.1 builder) the flag is ignored with a one-time note. [PR 2743](https://github.com/ikawrakow/ik_llama.cpp/pull/2743) [PR 2878](https://github.com/ikawrakow/ik_llama.cpp/pull/2878) |
+| `-amb, --attention-max-batch` | Max batch size for attention computations | 256 | Specifies the maximum K*Q size in MB we want to tolerate. Default changed from 0 to 256 in [PR 2312](https://github.com/ikawrakow/ik_llama.cpp/pull/2312) to avoid very large temporary compute buffers on MLA models. [PR 237](https://github.com/ikawrakow/ik_llama.cpp/pull/237) |
 | `-fmoe or --fused-moe` | Fused MoE ffn_up and ffn_gate | - | Speedup for MoE models. [PR 229](https://github.com/ikawrakow/ik_llama.cpp/pull/229) |
-| `--no-fmoe, --no-fused-moe` | Disable fused MoE | Enabled | See `--fused-moe` |
-| `-ger, --grouped-expert-routing` | Enable grouped expert routing | Disabled | For BailingMoeV2 architecture (Ling/Ring models). [PR 836](https://github.com/ikawrakow/ik_llama.cpp/pull/836) [PR 838](https://github.com/ikawrakow/ik_llama.cpp/pull/838) |
-| `--no-fug, --no-fused-up-gate` | Disable fused up-gate | Enabled | Turn off the speedup for dense models. [PR 741](https://github.com/ikawrakow/ik_llama.cpp/pull/741) |
-| `--no-mmad, --no-fused-mul-multiadd` | Disable fused mul-multi_add | Enabled | [PR 858](https://github.com/ikawrakow/ik_llama.cpp/pull/858) |
-| `-gr, --graph-reuse` | Enable graph reuse | Enabled | For models with fast TG inference (100+ t/s). [PR 947](https://github.com/ikawrakow/ik_llama.cpp/pull/947) |
-| `--no-gr, --no-graph-reuse` | Disable graph reuse | Disabled | Option to turn off graph reuse. [PR 1094](https://github.com/ikawrakow/ik_llama.cpp/pull/1094) |
+| `--no-fmoe, --no-fused-moe` | Disable fused MoE | enabled | See `--fused-moe` |
+| `-ger, --grouped-expert-routing` | Enable grouped expert routing | disabled | For BailingMoeV2 architecture (Ling/Ring models). [PR 836](https://github.com/ikawrakow/ik_llama.cpp/pull/836) [PR 838](https://github.com/ikawrakow/ik_llama.cpp/pull/838) |
+| `--no-fug, --no-fused-up-gate` | Disable fused up-gate | enabled | Turn off the speedup for dense models. [PR 741](https://github.com/ikawrakow/ik_llama.cpp/pull/741) |
+| `--no-mmad, --no-fused-mul-multiadd` | Disable fused mul-multi_add | enabled | [PR 858](https://github.com/ikawrakow/ik_llama.cpp/pull/858) |
+| `-gr, --graph-reuse` | Enable graph reuse | enabled | For models with fast TG inference (100+ t/s). [PR 947](https://github.com/ikawrakow/ik_llama.cpp/pull/947) |
+| `--no-gr, --no-graph-reuse` | Disable graph reuse | disabled | Option to turn off graph reuse. [PR 1094](https://github.com/ikawrakow/ik_llama.cpp/pull/1094) |
 | `-ser, --smart-expert-reduction` | Experts reduction Kmin,t | -1, 0 | Use a custom number of active experts. Powerful, basically REAP from just command line. If we set t = 1, we use a fixed number of experts  K_min (`-ser 1,6` will use 6 experts instead of the model default). [PR 239](https://github.com/ikawrakow/ik_llama.cpp/pull/239) |
 | `-mqkv, --merge-qkv` | Merge Q,K,V | 0 | Downside: mmap cannot be used. [PR 878](https://github.com/ikawrakow/ik_llama.cpp/pull/878) [PR 892](https://github.com/ikawrakow/ik_llama.cpp/pull/892) |
 | `-muge, --merge-up-gate-experts` | Merge ffn_up/gate_exps | 0 | Speed up on some models. [PR 1137](https://github.com/ikawrakow/ik_llama.cpp/pull/1137) [PR 1139](https://github.com/ikawrakow/ik_llama.cpp/pull/1139) [PR 1403](https://github.com/ikawrakow/ik_llama.cpp/pull/1403) [PR 1413](https://github.com/ikawrakow/ik_llama.cpp/pull/1413)|
@@ -104,12 +114,21 @@ Some often used terms.
 | `-sp, --special` | Special tokens output enabled | false |  |
 | `--no-warmup` | Skip warming up the model with an empty run | - |  |
 | `--mlock` | Force system to keep model in RAM rather than swapping or compressing | - |  |
-| `--no-mmap` | Do not memory-map model (slower load but may reduce pageouts) | - |  |
+| `-nmm, --no-mmap` | Do not memory-map model (slower load but may reduce pageouts) | - |  |
 | `--ui-mcp-proxy, --webui-mcp-proxy` | Experimental: whether to enable MCP CORS proxy - do not enable in untrusted environments | disabled | Support CORS Proxy on llama-server backend side. It is required to make external mcp server work on llamacpp webui. [PR 1904](https://github.com/ikawrakow/ik_llama.cpp/pull/1904) |
-| `--defer-experts` | Defer expert mmap residency on Linux to reduce model load time | false | Using this flag, expert tensor pages are faulted in on demand rather than being eagerly loaded during initialization. This allows us to reduce cold-start latency, thus improving the load time of MoE models, particularly on systems where users are running models off of storage. [PR 1634](https://github.com/ikawrakow/ik_llama.cpp/pull/1634) |
+| `-dexp, --defer-experts` | Defer expert mmap residency on Linux to reduce model load time | false | Using this flag, expert tensor pages are faulted in on demand rather than being eagerly loaded during initialization. This allows us to reduce cold-start latency, thus improving the load time of MoE models, particularly on systems where users are running models off of storage. [PR 1634](https://github.com/ikawrakow/ik_llama.cpp/pull/1634) |
+| `-dple, --defer-ple` | Defer per-layer token embedding (PLE) residency to keep it out of resident memory | false | For models with per-layer token embeddings (e.g. Qwen3.8-Flash-Next), PLE tensors are not kept resident, reducing memory usage. [PR 2389](https://github.com/ikawrakow/ik_llama.cpp/pull/2389) Also covers DeepSeek-V4.1 engram tables (`blk.*.engram_embd`), same sparse lookup profile. Files holding them skip bulk prefetch. Coexists with `-rtr` and `--no-mmap`: mappings are kept for the deferred tables with a warning (mmap only partly disabled); with explicit `--no-mmap` dense weights are copied while deferred tables stay file-backed, and tensors with a repacked form are copied to owned buffers so repack keeps working. |
+| `--ngram-file FNAME` | Load the n-gram tables (per-layer token embedding, Engram) from a separate GGUF | - | For models whose n-gram tables ship as their own GGUF (e.g. the ISTA-DASLab GSQ-RCO quantizations of Qwen3.8-Flash-Next). If the file is a shard of the model's split (same `split.count`), it is loaded as shard `split.no` in place of the file next to the first shard, so no link under the shard's name is needed; a file without split metadata is added to the model as one more file. A tensor present in both the model and the file is an error. Combines with `--defer-ple`. Alias: `--ple-file`. |
+| `-prexp, --prefetch-experts` | Stream mmap'd MoE expert weights into the page cache on Linux | false | Since [PR 2667](https://github.com/ikawrakow/ik_llama.cpp/pull/2667) the flag also works for CPU-only graphs, roughly 2x TG for models run off storage with `--defer-experts`. |
+| `-prexp-t, --prefetch-experts-threads N` | Number of expert prefetch workers | 0 (auto) | Tune to drive speed/type. |
 | `-rtr, --run-time-repack` | Repack tensors if interleaved variant is available | - | May improve performance on some systems. [PR 147](https://github.com/ikawrakow/ik_llama.cpp/pull/147) |
-| `--ctx-checkpoints` | set the number of checkpoints per slot | - | enable checkpoint for recurrent models Qwen3-Next and Qwen3.5-MoE. [PR 1310](https://github.com/ikawrakow/ik_llama.cpp/pull/1310) |
-| `--ctx-checkpoints-interval` |  minimum number of tokens between each context checkpoint. | - |  If you want to create the checkpoint more frequently, set it to a small value. If it's set to positive number, it saves checkpoints during TG at this interval. During PP, it can only save checkpoint every batch size, so it becomes minimum number of tokens between each context checkpoint. [PR 1310](https://github.com/ikawrakow/ik_llama.cpp/pull/1310) |
+| `--ctx-checkpoints N` | Set the number of checkpoints per slot | 32 | Enable checkpoint for recurrent models Qwen3-Next and Qwen3.5-MoE. [PR 1310](https://github.com/ikawrakow/ik_llama.cpp/pull/1310) |
+| `--ctx-checkpoints-interval N` | Minimum number of tokens between each context checkpoint. | 512 |  If you want to create the checkpoint more frequently, set it to a small value. If it's set to positive number, it saves checkpoints during TG at this interval. During PP, it can only save checkpoint every batch size, so it becomes minimum number of tokens between each context checkpoint. [PR 1310](https://github.com/ikawrakow/ik_llama.cpp/pull/1310) |
+| `--ctx-checkpoints-tolerance N` | The number of tokens before the full prompt to create the checkpoint | 5 | Creates the checkpoint N tokens before the prompt is fully processed to reduce prompt process for Qwen 3.5 thinking models. [PR 1346](https://github.com/ikawrakow/ik_llama.cpp/pull/1346) |
+| `--ctx-checkpoints-eviction NAME` | Eviction strategy for checkpoint. | `variance` | Accepts `fifo`, `variance` and `auto`. `Variance` preserves coverage and maintains uniform interval. [PR 2020](https://github.com/ikawrakow/ik_llama.cpp/pull/2020) |
+| `--ctx-ckpt-spill-dir DIR, --ctx-checkpoints-spill-dir DIR` | Spill evicted checkpoints to DIR (NVMe) instead of dropping them | - | Checkpoints beyond the RAM-retained cap are written to `DIR` instead of being discarded, so long conversations keep their checkpoints under tight RAM. [PR 2446](https://github.com/ikawrakow/ik_llama.cpp/pull/2446) |
+| `--ctx-ckpt-live-n N, --ctx-checkpoints-live-n N` | Max checkpoints with resident data when spill is on | 2 | [PR 2446](https://github.com/ikawrakow/ik_llama.cpp/pull/2446) |
+| `-dsv4ls, --dsv4-legacy-state` | Write DeepSeek-V4 state in the legacy full-slice layout, byte-identical to main | off | Since [PR 2538](https://github.com/ikawrakow/ik_llama.cpp/pull/2538) DSv4 checkpoints store only the used K rows (smaller and faster). Pass this flag to keep the previous full-state checkpoint behavior. |
 
 ## Speculative Decoding
 
@@ -122,13 +141,13 @@ Check the details [here](./speculative.md).
 | `-td, --threads-draft N` | Number of threads to use during generation | Same as `--threads` |  |
 | `-tbd, --threads-batch-draft N` | Number of threads to use during batch and prompt processing | Same as `--threads-draft` |  |
 | `-ps, --p-split N` | Speculative decoding split probability | 0.1 |  |
-| `-cd, --ctx-size-draft N` | Size of the prompt context for the draft model | 0 (loaded from model) | Similar to `--ctx-size` but applied to the draft model, if used. |
+| `-cd, --ctx-size-draft N` | Size of the prompt context for the draft model | 0 (inherits target context for DFlash/DSpark, otherwise loaded from model) | Similar to `--ctx-size` but applied to the draft model, if used. For DFlash/DSpark, the retained history is this value minus the query block. |
 | `-ctkd, --cache-type-k-draft TYPE` | KV cache data type for K for the draft model | - | For draft model, see: `-ctk` |
 | `-ctvd, --cache-type-v-draft TYPE` | KV cache data type for V for the draft model | - | For draft model, see: `-ctk` |
-| `-draft, --draft-params` | Comma-separated list of draft model parameters | - |  |
-| `--spec-type SPEC[:k=v,...]` | Canonical speculative stage entry; repeat to configure the supported two-stage chain | - | Types: `none`, `draft`, `mtp`, `ngram-cache`, `ngram-simple`, `ngram-map-k`, `ngram-map-k4v`, `ngram-mod`, `suffix`. Canonical keys: `n_max`, `n_min`, `p_min`, `ngram_size_n`, `ngram_size_m`, `ngram_min_hits`, `suffix_min_match_len`, `suffix_max_depth`, `suffix_corpus`. String values may escape commas as `\,` or quote the value inside the stage payload. Example: `--spec-type ngram-mod:n_max=64,n_min=2,ngram_size_n=8 --spec-type mtp:n_max=1,p_min=0.0` |
+| `-draft, --draft-params` | Comma-separated list of draft model parameters | - | May also carry CPU affinity options for the draft/speculative model; by default the draft inherits the target model's affinity. [PR 2588](https://github.com/ikawrakow/ik_llama.cpp/pull/2588). Since [PR 2838](https://github.com/ikawrakow/ik_llama.cpp/pull/2838) MoE draft weights are kept on the GPU instead of being split between GPU and host, previously done only for MTP, now for every speculative type; pass draft offload parameters here to override. |
+| `--spec-type SPEC[:k=v,...]` | Canonical speculative stage entry; repeat to configure the supported two-stage chain | - | Types: `none`, `draft`, `dflash`, `dspark`, `mtp`, `ngram-cache`, `ngram-simple`, `ngram-map-k`, `ngram-map-k4v`, `ngram-mod`, `suffix`. Canonical keys include `n_max`, `n_min`, `p_min`, `heads`, `ngram_size_n`, `ngram_size_m`, `ngram_min_hits`, `suffix_min_match_len`, `suffix_max_depth`, `suffix_corpus`. For MTP, `heads=1` is the default; values above `1` and `heads=0` (all model heads) are experimental. String values may escape commas as `\,` or quote the value inside the stage payload. Examples: `--spec-type ngram-mod:n_max=64,n_min=2,ngram_size_n=8 --spec-type mtp:n_max=1,p_min=0.0`, `--model-draft draft.gguf --spec-type dflash:n_max=4` |
 | `--spec-autotune` | Automatically tune speculative params to maximize tokens/sec | - | Automatically determines the near-optimal arguments for the type of speculation being performed [PR 1595](https://github.com/ikawrakow/ik_llama.cpp/pull/1595) |
-| `--recurrent-ckpt-mode MODE` | Checkpoint strategy for recurrent/hybrid speculative decoding | auto | One of: - `auto` auto-select: per-step if CUDA full-GPU, gpu-fallback otherwise - `per-step` save SSM state per draft step in VRAM; no re-decode on rejection - `gpu-fallback` copy state to GPU buffer; re-decode on rejection - `cpu` serialise state via llama_state_seq; re-decode on rejection [PR 1669](https://github.com/ikawrakow/ik_llama.cpp/pull/1669) [PR 1774](https://github.com/ikawrakow/ik_llama.cpp/pull/1774) |
+| `--spec-ckpt-mode MODE` (deprecated alias: `--recurrent-ckpt-mode MODE`) | Checkpoint strategy for speculative decoding | auto | One of: - `auto` choose direct per-step, then device fallback, then host fallback - `per-step` save architecture state per draft step; no re-decode on rejection - `gpu-fallback` copy architecture state to a device buffer; re-decode on rejection - `cpu` serialize architecture state in host storage; re-decode on rejection [PR 1669](https://github.com/ikawrakow/ik_llama.cpp/pull/1669) [PR 1774](https://github.com/ikawrakow/ik_llama.cpp/pull/1774) |
 
 Notes:
 
@@ -139,14 +158,14 @@ Notes:
 
 ## Cache Prompt to Host Memory
 
-When user starts a new conversation, the old conversation's kv cache will be saved in ram and can be retrieved later. This greatly reduces prompt processing time when switching between conversations and can have as many conversation as your ram is allowed.
+When the user starts a new conversation, the old conversation's KV cache will be saved in RAM and can be retrieved later. This greatly reduces prompt processing time when switching between conversations and can have as many conversations as your RAM allows.
 
-Note: When the available memory is very limited, turn this option off (`-cram 0`) to avoid memory swaping.
+Note: When the available memory is very limited, turn this option off (`-cram 0`) to avoid memory swapping.
 
 | Parameter | Description | Default | Notes/Examples |
 | - | - | - | - |
-| `-cram, --cache-ram N` | Set the maximum cache size in MiB | 8192 | -1 = no limit, 0 = disable Very useful when the variations of the same prompt are re-sent to the model (coding agents, etc.). [PR 954](https://github.com/ikawrakow/ik_llama.cpp/pull/954) |
-| `-crs, --cache-ram-similarity N` | Max similarity of prompt tokens to cache tokens that triggers prompt cache | 0.50 |  |
+| `-cram, --cache-ram N` | Set the maximum cache size in MiB | 8192 | -1 = no limit, 0 = disable. Very useful when the variations of the same prompt are re-sent to the model (coding agents, etc.). [PR 954](https://github.com/ikawrakow/ik_llama.cpp/pull/954) The limit is now enforced for checkpoints as well: after whole-state eviction, checkpoints are dropped oldest-first until the cache is back under the cap, keeping the prompt-end checkpoint whenever another entry can be evicted; the spill file of a dropped checkpoint is removed. [PR 2641](https://github.com/ikawrakow/ik_llama.cpp/pull/2641) |
+| `-crs, --cache-ram-similarity N` | Minimum fraction of a cached entry that must match the new prompt for that entry to be reusable. Candidates below this are skipped | 0.50 |  |
 | `-cram-n-min, --cache-ram-n-min N` | Minimum number of cached tokens that triggers prompt cache | 0 |  |
 
 ## Sampling
@@ -159,9 +178,12 @@ Good overview on [kalomaze/llm_samplers_explained.md](https://gist.github.com/ka
 | - | - | - | - |
 | `--samplers SAMPLERS` | Samplers used for generation in order, separated by `;` | dry;top_k;tfs_z;typical_p;top_p;min_p;xtc;top_n_sigma;temperature;adaptive_p | Powerful option to customize samplers. Try to keep the default order otherwise effects will be minimized. Example to use only min_p and temperature: `--samplers min_p;temperature` |
 | `--sampling-seq SEQUENCE` | Simplified sequence for samplers | dkfypmxntw | Same as `--samplers`, just shorter format. |
-| `--banned-string-file` | File path of the list of banned strings on each line |  |  |
+| `--banned-string-file` | File path of the list of banned strings on each line |  | Also works with speculative decoding and MTP for recurrent models, where the ban is applied positionally during the speculative sampling stage [PR 2677](https://github.com/ikawrakow/ik_llama.cpp/pull/2677) [PR 2772](https://github.com/ikawrakow/ik_llama.cpp/pull/2772) |
 | `--banned-n` | Number of tokens banned in the phrase during rewind. | -1 | -1 means all tokens [PR 1185](https://github.com/ikawrakow/ik_llama.cpp/pull/1185) |
 | `--expiring-logit-bias-file FILENAME` | Load bias states from a custom file format | - | [PR 1731](https://github.com/ikawrakow/ik_llama.cpp/pull/1731) [PR 1770](https://github.com/ikawrakow/ik_llama.cpp/pull/1770) |
+
+Notes:
+- GGUFs can embed publisher-recommended sampling defaults under `general.sampling.*` metadata (e.g. `general.sampling.top_p`, `general.sampling.temp`, `general.sampling.sequence`). They are applied to any sampler value not explicitly set. [PR 2625](https://github.com/ikawrakow/ik_llama.cpp/pull/2625)
 
 ## Prompt Template
 
@@ -169,17 +191,16 @@ Incorrect prompt template or it's format may break the model output.
 
 | Parameter | Description | Default | Notes/Examples |
 | - | - | - | - |
-| `--jinja` | Set custom jinja chat template | Template taken from model's metadata | Mandatory for Tool Calling. |
-| `--chat-template JINJA_TEMPLATE` | Use jinja template for chat | Disabled | If there is no official `tool_use` Jinja template, you may want to set `--chat-template chatml` to use a default that works with many models |
-| `--chat-template-file file_with_JINJA_TEMPLATE` | Load jinja template for chat from the file | - | Sometimes the model producer or community fixes the template after the GGUF files are released, therefore it’ metadata contains buggy version. To avoid re-downloading the entire model file, download only the .jinja file the use it (`--chat-template-file /models/Qwen_Qwen3-Coder-30B-A3B-Instruct-fixed.jinja`). |
+| `--jinja` | Set custom jinja chat template | Template taken from model's metadata | Mandatory for Tool Calling (LFM2/LFM2.5/LFM2-MoE server sessions enable it automatically). |
+| `--chat-template JINJA_TEMPLATE` | Use jinja template for chat | disabled | If there is no official `tool_use` Jinja template, you may want to set `--chat-template chatml` to use a default that works with many models |
+| `--chat-template-file file_with_JINJA_TEMPLATE` | Load jinja template for chat from the file | - | Sometimes the model producer or community fixes the template after the GGUF files are released, therefore its metadata contains buggy version. To avoid re-downloading the entire model file, download only the .jinja file then use it (`--chat-template-file /models/Qwen_Qwen3-Coder-30B-A3B-Instruct-fixed.jinja`). |
 | `--reasoning-format FORMAT` | Controls whether thought tags are allowed and/or extracted from the response | none | One of:  - `none` leaves thoughts unparsed in `message.content`  - `deepseek` puts thoughts in `message.reasoning_content` (except in streaming mode, which behaves as `none`)  - `deepseek-legacy` keeps `<think>` tags in `message.content` while also populating `message.reasoning_content`. This is useful when the frontend (including agents) is hardcoded to use just a specific format. |
 | `--chat-template-kwargs JSON` | Sets additional params for the json template parser | - | Example for gpt-oss: `--chat-template-kwargs '{"reasoning_effort": "medium"}'` |
-| `--reasoning-budget N` | Controls the amount of thinking allowed | -1 (unrestricted) | 0 (disable thinking) |
 | `--reasoning-tokens FORMAT` | Exclude reasoning tokens to select the slot more accurately | auto |  |
-| `--reasoning` | Control reasoning on and off | - | on / off / auto [PR 1376](https://github.com/ikawrakow/ik_llama.cpp/pull/1376) |
-| `--reasoning-budget` | Token budget for thinking | -1 | -1 for unrestricted, 0 for immediate end, N>0 for token budget [PR 1376](https://github.com/ikawrakow/ik_llama.cpp/pull/1376) |
+| `-rea, --reasoning` | Use reasoning/thinking in the chat | 'auto' (detect from template) | on / off / auto [PR 1376](https://github.com/ikawrakow/ik_llama.cpp/pull/1376) |
+| `--reasoning-budget N` | Token budget for thinking | -1 | -1 for unrestricted, 0 for immediate end, N>0 for token budget [PR 1376](https://github.com/ikawrakow/ik_llama.cpp/pull/1376) |
 | `--reasoning-budget-message` | Message injected before the end-of-thinking tag when reasoning budget is exhausted  | none | [PR 1376](https://github.com/ikawrakow/ik_llama.cpp/pull/1376) |
-| `--parallel-tool-calls` | enable parallel tool calls | - | [PR 1376](https://github.com/ikawrakow/ik_llama.cpp/pull/1376) |
+| `-ptcall, --parallel-tool-calls` | Enable parallel tool calls | - | [PR 1376](https://github.com/ikawrakow/ik_llama.cpp/pull/1376) |
 | `--skip-chat-parsing` | force a pure content parser, even if a Jinja template is specified; model will output everything | - | [PR 1376](https://github.com/ikawrakow/ik_llama.cpp/pull/1376) |
 | `--peg` | Use peg parser for qwen3.5 models. | - | Force Qwen3.5 model to use peg parser to process tool calls, which fixes the crash when the model calls the non existing function. [PR 1490](https://github.com/ikawrakow/ik_llama.cpp/pull/1490) |
 
@@ -187,17 +208,18 @@ Incorrect prompt template or it's format may break the model output.
 
 KV cache improves speed and efficiency especially at long context by reusing [past calculations](https://huggingface.co/blog/not-lain/kv-caching).
 
-SWA keeps a sliding window of the prompt when prompt is longer than the context size and shift the kv cache accordingly to avoid reprocessing the whole prompt.
+SWA keeps a sliding window of the prompt when prompt is longer than the context size and shifts the KV cache accordingly to avoid reprocessing the whole prompt.
 
 The context (a.k.a. KV cache) is stored on the device where the associated attention tensors are.
 
-MLA models already have the cache compressed, it doesn't really makes sense to compress it with the available parameters.
+MLA models already have the cache compressed, it doesn't really make sense to compress it with the available parameters.
 
 | Parameter | Description | Default | Notes/Examples |
 | - | - | - | - |
 | `-dkvc, --dump-kv-cache` | Verbose print of the KV cache | - |  |
 | `-nkvo, --no-kv-offload` | Disable KV offload | - | Keep KV on CPU. |
 | `-ctk, --cache-type-k TYPE` | KV cache data type for K | f16 | Reduces K size in KV which improves speed and reduces memory requirements, but may reduce output quality. |
+| `-ictk, --indexer-cache-type-k TYPE` | Indexer K-cache data type | f16 | [PR 2075](https://github.com/ikawrakow/ik_llama.cpp/pull/2075) |
 | `-ctv, --cache-type-v TYPE` | KV cache data type for V | f16 | See: `-ctk` |
 | `-mtprot, --mtp-requantize-output-tensor type` | Use output requantized to type for MTP | - |  Improves TG performance for when using MTP. It requantize the tensor on-the-fly while loading the model, see [PR 1809](https://github.com/ikawrakow/ik_llama.cpp/pull/1809) for details and [PR 1810](https://github.com/ikawrakow/ik_llama.cpp/pull/1810) `--extra-output-tensor` as offline requantize alternative. |
 | `--mtmd-kq-type type` | Define the type used for the `K*Q` matrix multiplication | - | Use one of `f16`/`bf16` instead of `f32` to improve speed up multimodal |
@@ -220,7 +242,7 @@ Use multimodal models.
 
 | Parameter | Description | Default | Notes/Examples |
 | - | - | - | - |
-| `--mmproj FILE` | path to a multimodal projector file | - | Usually separate `.gguf` files are available for download, e.g. [mmproj-Qwen_Qwen3.6-35B-A3B-f16.gguf](https://huggingface.co/bartowski/Qwen_Qwen3.6-35B-A3B-GGUF/blob/main/mmproj-Qwen_Qwen3.6-35B-A3B-f16.gguf) for Qwen3.6-35B-A3B |
+| `--mmproj FILE` | path to a multimodal projector file | - | Usually separate `.gguf` files are available for download, e.g. [mmproj-Qwen_Qwen3.6-35B-A3B-f16.gguf](https://huggingface.co/bartowski/Qwen_Qwen3.6-35B-A3B-GGUF/blob/main/mmproj-Qwen_Qwen3.6-35B-A3B-f16.gguf) for Qwen3.6-35B-A3B. Sharded `mmproj` GGUFs are supported, specify only the first part [PR 2421](https://github.com/ikawrakow/ik_llama.cpp/pull/2421) |
 | `--image-min-tokens N` | Minimum number of tokens each image can take, only used by vision models with dynamic resolution | read from model | - |
 | `--image-max-tokens N` | Maximum number of tokens each image can take, only used by vision models with dynamic resolution | read from model | - |
 | `--no-mmproj-offload` | Disable GPU offloading for multimodal projector | enabled | See `--threads-mtmd` |
@@ -233,7 +255,7 @@ Therefore, the "offloading" term is used when sending some processing to another
 
 As the GPUs (including their VRAM) are more powerful for LLM specific processing than CPU+RAM, the aim is to offload as much as possible to the GPU.
 
-Beside the improved quants (better quality and performance at the same size; usable low BPW), superior performance (faster PP ang TG), ik_llama.cpp really shines at providing:
+Besides the improved quants (better quality and performance at the same size; usable low BPW), superior performance (faster PP and TG), ik_llama.cpp really shines at providing:
 - Detailed output log which e.g. includes layers and buffers sizes to support offload calculations.
 - A big collection of parameters to tweak offloading (what/where runs: processing, tensors, KV cache, operations, etc.).
 - Split mode `graph` when multiple GPUs are available, including mixes of different GPU types, various VRAM sizes.
@@ -300,11 +322,11 @@ llama_new_context_with_model: KV self size  =   59.50 MiB, K (q8_0):   29.75 MiB
 - Using `--k-cache-hadamard` on quants lower than `Q6_0` may give better results. Additionally, `ik_llama.cpp` provides `--v-cache-hadamard` for the V-cache. Example: `--cache-type-k q6_0 --k-cache-hadamard --cache-type-v q6_0 --v-cache-hadamard`
 - `Q4_0` achieves low perplexity even without Hadamard.
 
-3. Offload less to the GPU. Try to find a mix of parameters that better suits your system that default.
+3. Offload less to the GPU. Try to find a mix of parameters that better suits your system than default.
 
-- Try `--fit`. `ik_llama.cpp` automatically determine which tensors to offload to the GPUs based on the available VRAM.
+- Try `--fit`. `ik_llama.cpp` automatically determines which tensors to offload to the GPUs based on the available VRAM.
 
-- Use `--no-kv-offload` to keep KV cache on CPU. This is provided for flexibility, and practically not desired as reduces the prompt processing speed.
+- Use `--no-kv-offload` to keep KV cache on CPU. This is provided for flexibility, and practically not desired as it reduces the prompt processing speed.
 
 - Identify tensors, how many layers (also shape and more metadata) by opening the GGUF model file on the Web browser [bartowski/Qwen_Qwen3-0.6B-IQ4_NL.gguf](https://huggingface.co/bartowski/Qwen_Qwen3-0.6B-GGUF/blob/main/Qwen_Qwen3-0.6B-IQ4_NL.gguf) then scroll down to the Tensors table. For the split models, look to each file part.
 
@@ -328,8 +350,8 @@ python3 gguf-py/scripts/gguf_dump.py /models/Qwen_Qwen3-0.6B-IQ4_NL.gguf
 
    `-ngl 999` To put all layers in VRAM by default
 
-   `-ot "blk.(?:[0-9]|[1-7][0-9]|[8][0-7]).ffn._exps.=CPU"` To create exceptions and put back in ram anything that has "ffn" and "_exps" in its name, and that sits in layers called "blk.n", where "n" (the lawyer number) is any match between 0 and 9, or between 1 to 7 + 0 to 9 (aka a number between 10 and 79), or 8 + 0 to 7 (aka a number between 80 and 87).
-   Basically a complicated way of saying put all experts from layer 0 to 87 in ram. Experts from layer 88 to 93 (there's 93 layers in qwen3vl 235b) can sit in VRAM still. (Thats all I can load on a 5090).
+   `-ot "blk.(?:[0-9]|[1-7][0-9]|[8][0-7]).ffn._exps.=CPU"` To create exceptions and put back in ram anything that has "ffn" and "_exps" in its name, and that sits in layers called "blk.n", where "n" (the layer number) is any match between 0 and 9, or between 1 to 7 + 0 to 9 (aka a number between 10 and 79), or 8 + 0 to 7 (aka a number between 80 and 87).
+   Basically a complicated way of saying put all experts from layer 0 to 87 in ram. Experts from layer 88 to 93 (there's 93 layers in qwen3vl 235b) can sit in VRAM still. (That's all I can load on a 5090).
 
 C. Other tips
 
@@ -348,23 +370,29 @@ WIP
 
 | Parameter | Description | Default | Notes/Examples |
 | - | - | - | - |
-| `-ngl, --gpu-layers N` | Number of layers to store in VRAM | - | For better speed you aim to offload the entire model in GPU memory. To identify how many layers (also shape and more metadata) open the GGUF model file on the Web browser [bartowski/Qwen_Qwen3-0.6B-IQ4_NL.gguf](https://huggingface.co/bartowski/Qwen_Qwen3-0.6B-GGUF/blob/main/Qwen_Qwen3-0.6B-IQ4_NL.gguf) then scroll down to the Tensors table. Use a number higher than the numbers of model layers to fully offload (`--gpu-layers` 99, for a model with less than 99 layers). See `--ctx-size` and reduce it to the minimum needed. If model fails to load due to the insufficient GPU memory, reduce the number of layers (`--gpu-layers 20`, for a model with 40 layers will offload only the first 20 layers). |
+| `-ngl, --gpu-layers N` | Number of layers to store in VRAM | `999` | For better speed you aim to offload the entire model in GPU memory. To identify how many layers (also shape and more metadata) open the GGUF model file on the Web browser [bartowski/Qwen_Qwen3-0.6B-IQ4_NL.gguf](https://huggingface.co/bartowski/Qwen_Qwen3-0.6B-GGUF/blob/main/Qwen_Qwen3-0.6B-IQ4_NL.gguf) then scroll down to the Tensors table. Use a number higher than the numbers of model layers to fully offload (`--gpu-layers` 999, for a model with less than 999 layers). See `--ctx-size` and reduce it to the minimum needed. If model fails to load due to the insufficient GPU memory, reduce the number of layers (`--gpu-layers 20`, for a model with 40 layers will offload only the first 20 layers). |
 | `-ngld, --gpu-layers-draft N` | Number of layers to store in VRAM for the draft model | - | For draft model, see `--gpu-layers` |
 | `--cpu-moe` | Keep all MoE weights in CPU memory | - | Simple offload mode for MoE. [PR 841](https://github.com/ikawrakow/ik_llama.cpp/pull/841) |
 | `--n-cpu-moe N` | Keep MoE weights of the first N layers in CPU memory | - | Similar to `--cpu-moe` but when some GPU memory is available to store some layers. |
+| `--moe-cache-mib N` | Total GPU cache budget in MiB for CPU-resident MoE experts, split across GPUs | 0 (disabled) | Dynamic allocation: experts are transferred between CPU and GPU so that the most frequently used experts stay in VRAM. Use with `--cpu-moe`/`-ot` hybrid inference; combine with `-ts` when the GPUs are unequal. Gains are model and workload-dependent. [PR 2644](https://github.com/ikawrakow/ik_llama.cpp/pull/2644). Not applied to the draft model, whose MoE weights stay on the GPU. [PR 2838](https://github.com/ikawrakow/ik_llama.cpp/pull/2838) |
+| `--moe-cache-policy lru / classlru` | Replacement policy for the dynamic MoE expert cache | `lru` / `classlru` tracks class usage. Needs `--moe-cache-mib`. [PR 2861](https://github.com/ikawrakow/ik_llama.cpp/pull/2861) |
+| `--moe-cache-cpu-share N` | Fixed fraction of unique MoE cache misses assigned to CPU | 0 (disabled) | Value in [0,1]; 0 or an omitted value reproduces the normal MoE cache flow. [PR 2883](https://github.com/ikawrakow/ik_llama.cpp/pull/2883) |
 | `-sm, --split-mode SPLIT_MODE` | How to split the model across multiple GPUs | none | When you have more than one GPU, how to split the model across multiple GPUs, one of: - `none` use one GPU only. - `graph` split model tensors and computation graph across GPUs. `graph` is exclusive here and extremely effective for dense and MoE [PR 1080](https://github.com/ikawrakow/ik_llama.cpp/pull/1080). - `layer` split layers and KV across GPUs Example: `-sm graph ` |
 | `-ts, --tensor-split SPLIT` | Fraction of the model to offload to each GPU (comma-separated) | - | Powerful for tweaking. Example: `-ts 3,1` |
 | `-dev, --device dev1,dev2` | Comma-separated list of devices to use for offloading | none | If there are many GPUs available on the system and only selected ones need to be used. Example: `-dev  CUDA0,CUDA1` |
 | `-devd, --device-draft dev1,dev2` | Comma-separated list of devices for draft model | none | For draft model, see `--device` |
 | `-mg, --main-gpu i` | The GPU to use for the model (with split-mode = none) | - |  |
 | `-cuda fa-offset=value` | FP16 precision offset for FA calculation | 0 | Rarely, fp16 precision is inadequate, at least for some models, when computing FA for very long contexts. Value must be a valid floating point number in the interval [0...3] (this is checked and if the supplied value is outside this interval it is ignored). By the default the offset is zero. If you find that a model works up to a given context length but then starts producing gibberish/incoherent output/endless repetitions, it is very likely it is due to f16 overflow in the FA calculation, and using this command line option is likely to solve it. [PR 1198](https://github.com/ikawrakow/ik_llama.cpp/pull/1198) |
+| `-cuda fa-fabsum=1` | Bound the fp16 accumulation error of the tile FA kernel | 0 (off) | Only affects Pascal cards with fast fp16, i.e. compute capability 6.0 and 6.2, where flash attention with head size 64 or 128 uses the f16 tile kernel. The P40 (6.1) takes the f32 tile kernel instead. The f16 tile kernel sums the softmax denominator and the `P*V` product in fp16 over every key, so the error grows with context. With `fa-fabsum=1` these sums go through fp32 accumulators at a fixed block size, which bounds the error independently of the context length. It costs some prefill speed, so it is off by default. [PR 2510](https://github.com/ikawrakow/ik_llama.cpp/pull/2510) |
+| `-cuda max-graphs=N` | Cap on the number of cached CUDA graphs | 0 | The cache holds at most N graphs, and the least recently used graph is evicted only when a new capture takes the cache past the limit. Default `0` keeps the cache unlimited as before. Useful to bound VRAM growth in `llama-server` runs with many different prompt lengths (e.g. `-cuda max-graphs=1024`). Also fixes the draft (MTP/external) context ignoring `-cuda graphs=0` and the offload policy. [PR 2715](https://github.com/ikawrakow/ik_llama.cpp/pull/2715) |
+| `--nvfp4-precision MODE` | NVFP4 matmul precision on Blackwell (sm_120/sm_121) | auto | One of `auto`, `w4a4`, `int8`. `w4a4` 4-bit activations, fastest, lower accuracy; `int8` 8-bit activations, more accurate; `auto` uses `w4a4` when the model has input scales, unless it is marked W4A16 or has imatrix data; older ggml-org/llama.cpp W4A16 conversions may need int8. [PR 2868](https://github.com/ikawrakow/ik_llama.cpp/pull/2868) |
 | `-ot or --override-tensor` | Override where model weights are stored | - | Override where model weights are stored using regular expressions. This allows for example to keep the MoE experts on the CPU and to offload only the attention and not repeating layers to the GPU. Example: `\.ffn_.*_exps\.=CPU` [PR 232](https://github.com/ikawrakow/ik_llama.cpp/pull/232) |
 | `-op or --offload-policy a,b` | Manually define the offload policy | - | a and b are integers. One can have multiple pairs following the -op or --offload-policy argument (i.e., -op a1,b1,a2,b2,a3,b3...). The first integer defines the op (see below). The second integer is 0 or 1 and defines if the op should be offloaded (1) or not offloaded (0) to the GPU. The first integer is simply the `enum` value in the `ggml_op enum`. If the op is set to -1, then all op offloads are set to enabled or disabled.  Examples: `-op -1,0`: disable all offload to the GPU `-op 26,0`: disable offload of matrix multiplications to the GPU `-op 27,0`: disable offload of indirect matrix multiplications to the GPU (used for the experts in a MoE model) `-op 29,0`: disable fused up-gate-unary op offload to the GPU (applied to MoE models with `-fmoe`) [PR 405](https://github.com/ikawrakow/ik_llama.cpp/pull/405) |
 | `--offload-only-active-experts or -ooae` | On MOE offload only active experts | ON | `-ooae` is not related to where the model weights get stored. Instead, once we have some MoE tensors (ffn_(up|gate|down)_exps.weight) on the CPU, and during batch processing the scheduler decides to copy them to a GPU to perform the corresponding matrix multiplications, `-ooae` tells the scheduler to offload only the activated experts. Offloading only the activated experts is useful for some models, where often the number of activated experts is much smaller than the total number of experts, so `-ooae` reduces the amount of `RAM -> VRAM` data transfer. A model where this makes a significant difference for hybrid CPU/GPU inference is GPT-OSS-120B. For many MoE models and large batches basically all experts are activated, so this option makes no difference (or can even slightly lower performance because it costs some time to determine which experts are active, but if all experts turn out to be active, this time was spent for nothing). [PR 698](https://github.com/ikawrakow/ik_llama.cpp/pull/698) |
 | `-no-ooae` | Disable offload only active experts | - | See `-ooae` |
 | `-smf16, --split-mode-f16` | Use f16 for data exchange between GPUs | 1 | [PR 1087](https://github.com/ikawrakow/ik_llama.cpp/pull/1087) |
 | `-smf32, --split-mode-f32` | Use f32 for data exchange between GPUs | 0 | [PR 1087](https://github.com/ikawrakow/ik_llama.cpp/pull/1087) |
-| `-grt, --graph-reduce-type` | Type for data exchange between GPUs | f32 | q8_0 / bf16 / f16 / f32 Reduce the data transferred between GPUs [PR 1154](https://github.com/ikawrakow/ik_llama.cpp/pull/1154) |
+| `-grt, --graph-reduce-type` | Type for data exchange between GPUs | f16 | q8_0 / bf16 / f16 / f32 Reduce the data transferred between GPUs [PR 1154](https://github.com/ikawrakow/ik_llama.cpp/pull/1154) |
 | `-smgs, --split-mode-graph-scheduling` | Force Split Mode Graph Scheduling | 0 | [PR 1068](https://github.com/ikawrakow/ik_llama.cpp/pull/1068) |
 | `--max-gpu N` | Define (and use) a maximum number of GPUs per layer with split mode "graph" |  | This is of interest when there are more than 2 GPUs available, but using all of them leads to a lower performance than using just 2 (or using the default split mode "layer") [PR 1051](https://github.com/ikawrakow/ik_llama.cpp/pull/1051) |
 | `-cuda, --cuda-params` | Comma-separated list of cuda parameters | - | Powerful way to tweak Fusion, GPU offload threshold, and MMQ-ID threshold. [PR 910](https://github.com/ikawrakow/ik_llama.cpp/pull/910) [PR 1813](https://github.com/ikawrakow/ik_llama.cpp/pull/1813) |
@@ -377,7 +405,7 @@ WIP
 | `--override-kv KEY=TYPE:VALUE` | Override model metadata by key | - | Advanced option to override model metadata by key. May be specified multiple times. types: int, float, bool, str. Example: `--override-kv tokenizer.ggml.add_bos_token=bool:false` |
 | `-m, --model FNAME` | Model path | models/$filename | Mandatory, the GGUF model file to be served. |
 | `-md, --model-draft FNAME` | Draft model for speculative decoding | unused | Required when an explicit `draft` stage is used. |
-| `--spec-type SPEC[:k=v,...]` | Canonical speculative stage entry; repeat for the supported two-stage chain | none | Use stage-local keys like `n_max`, `n_min`, `p_min`, `ngram_size_n`, `ngram_size_m`, `ngram_min_hits`, `suffix_min_match_len`, `suffix_max_depth`, and `suffix_corpus`. |
+| `--spec-type SPEC[:k=v,...]` | Canonical speculative stage entry; repeat for the supported two-stage chain | none | Use stage-local keys like `n_max`, `n_min`, `p_min`, `heads`, `ngram_size_n`, `ngram_size_m`, `ngram_min_hits`, `suffix_min_match_len`, `suffix_max_depth`, and `suffix_corpus`. For MTP, `heads=1` is the default; values above `1` and `heads=0` (all model heads) are experimental. |
 
 ### Request-Level Speculative Overrides
 
@@ -404,6 +432,7 @@ Request-level `speculative.stages` is constrained:
 | `--webui NAME` | Controls which webui to server | auto | Flexibility in choosing the integrated powerful WebUIs:  - `none`: disable webui  - `auto`: default webui   - `llamacpp`: llamacpp webui |
 | `--api-key KEY` | API key to use for authentication | none | Add a custom API KEY. Clients will need to specify it when connecting. |
 | `-a, --alias` | set alias for model name (to be used by REST API) | none | Configure the server to serve and reply with specific model name. |
+| `--memory` | Enable the `GET /memory` endpoint | off | One row per device plus one for the host: bytes used by weights, KV cache, compute buffers and the multimodal projector, plus total/free memory. Counts the draft model, speculative checkpoints, the MoE expert cache and the DSV4/DFlash caches. The same figures appear as `memory_*` gauges with a `device` label on `/metrics`, which needs only `--metrics`. [PR 2776](https://github.com/ikawrakow/ik_llama.cpp/pull/2776) |
 
 ## Other Tools
 
@@ -423,6 +452,10 @@ llama-sweep-bench -m /models/model.gguf -c 12288 -ub 512 -rtr -fa -ctk q8_0 -ctv
 | `-nrep N, --n-repetitions N` | Define the number of repetitions used at zero context | - | [PR 1176](https://github.com/ikawrakow/ik_llama.cpp/pull/1176) |
 | `-n` | Specifies he number of TG tokens  | - | If not specified, it is set to u-batch/4 [PR 897](https://github.com/ikawrakow/ik_llama.cpp/pull/897) |
 | `--minilog` | Reduce the verbosity | - | [PR 1468](https://github.com/ikawrakow/ik_llama.cpp/pull/1468) |
+| `-wb, --warmup-batch` | Run a warmup batch before measurement | - | [PR 375](https://github.com/ikawrakow/ik_llama.cpp/pull/375) |
+| `--sweep-memory` | Report RSS high-water and sampled VRAM delta | - | [PR 2273](https://github.com/ikawrakow/ik_llama.cpp/pull/2273) |
+| `--sweep-stride N` | measure every Nth sweep row | 1 | [PR 2273](https://github.com/ikawrakow/ik_llama.cpp/pull/2273) |
+| `-f FILE` | Feed real text from FILE in place of random token ids | random tokens | Text is tokenized once and reused from the start if shorter than the sweep (the repetition start position is printed). Preferable for MoE models, where expert selection depends on the actual tokens. [PR 2754](https://github.com/ikawrakow/ik_llama.cpp/pull/2754) |
 
 ### llama-bench
 
@@ -432,11 +465,17 @@ Benchmark utility.
 llama-bench -tgb 4,16 -p 512 -n 128 other_arguments
 ```
 
+`llama-bench` accepts the common `llama-server` / `llama-sweep-bench` spellings (`-nmm`, `-no-fa`, `-no-fmoe`, `-no-gr`, `--no-warmup`, `-tb`, `-dexp`, `-nrep`, ...); a `<0|1>` option given without a value means 1, and `-fa` also takes `on`/`off`/`auto`. Options that do not affect a test (e.g. sampling) are accepted and ignored; `--spec-type`/MTP and `--dry-run` are refused. Other options are recorded in a new `extra_args` field of the CSV, JSON and SQL output (not in the markdown table), with `--api-key` and `--hf-token` values written as `***`. [PR 2841](https://github.com/ikawrakow/ik_llama.cpp/pull/2841)
+
 | Parameter | Description | Default | Notes/Examples |
 | - | - | - | - |
 | `-tgb (or --threads-gen-batch)` | Enable having different number of threads for generation and batch processing | - | [PR 284](https://github.com/ikawrakow/ik_llama.cpp/pull/284) |
 | `--fit` | Automatically fit to available VRAM | 0 | 0 / 1 [PR 1542](https://github.com/ikawrakow/ik_llama.cpp/pull/1542) |
 | `--fit-margin N` | Safety VRAM margin in MiB when using `--fit` | 1024 |  |
+| `-ncmoe N`, `--n-cpu-moe N` | Keep MoE weights of the first N layers in CPU memory | - | Uses the loader placement, as `llama-server` does. Accepts a list (`-ncmoe 20,24`), reported as an `ncmoe` column; `-cmoe` works too; `-ot` patterns take precedence regardless of order. Ignored with `-sm none` on more than one GPU. [PR 2841](https://github.com/ikawrakow/ik_llama.cpp/pull/2841) |
+| `-f FILE` | Use the text of FILE instead of random tokens | random tokens | [PR 2841](https://github.com/ikawrakow/ik_llama.cpp/pull/2841) |
+| `-wb, --warmup-batch` | Warm up with a batch of up to `-ub` tokens | - | [PR 2841](https://github.com/ikawrakow/ik_llama.cpp/pull/2841) |
+| `--sweep-memory` | Add the RSS high-water mark and VRAM delta to each test | - | SQL output gains `n_cpu_moe`, `extra_args`, `rss_hwm_mib`, `vram_delta_mib` columns; older databases need `ALTER TABLE test ADD COLUMN ...` before new rows. [PR 2841](https://github.com/ikawrakow/ik_llama.cpp/pull/2841) |
 
 ### Imatrix
 
@@ -478,6 +517,16 @@ llama-gguf-split --split --split-max-size 1G --no-tensor-first-split /models/mod
 | `--symmetric-q40` | Use [-7:7] range for Q4_0 quantization (turns off imatrix) | - | This is useful for some models that have been trained to int4 using this specific quantization range (e.g., Kimi-2.6) [PR 1677](https://github.com/ikawrakow/ik_llama.cpp/pull/1677) |
 | `--slow-iq2ks` | Use the original very slow IQ2_KS quantization method | - | Alternative to the compile-time option [PR 1677](https://github.com/ikawrakow/ik_llama.cpp/pull/1677) |
 | `--extra-output-tensor ggml_type` | Requantize and add output tensor of that type. | - | [PR 1810](https://github.com/ikawrakow/ik_llama.cpp/pull/1810) see `--mtp-requantize-output-tensor type` as on-the-fly alternative. |
+| `--fudge-factor` | Value to undo the built-in fudge factors of certain quant types | - | Some quant types now carry built-in fudge factors; supply the matching value from the PR's type/factor table to undo them. [PR 2361](https://github.com/ikawrakow/ik_llama.cpp/pull/2361) |
+| `--slab-size N` | Process tensors larger than N MiB in slabs to limit peak memory | 1024 | `--slab-size 0` disables slab processing (previous behavior). [PR 2537](https://github.com/ikawrakow/ik_llama.cpp/pull/2537) |
+| `--cuda-quantize` | Encode quantization on the CUDA GPU | - | Currently supports `IQ4_KT` and `IQ3_KT` [PR 2572](https://github.com/ikawrakow/ik_llama.cpp/pull/2572), plus `IQ3_KS`, `IQ4_KS`, `IQ5_KS`, `IQ4_KS_R4`, `IQ4_KS_R16`, `IQ5_KS_R4` [PR 2671](https://github.com/ikawrakow/ik_llama.cpp/pull/2671) |
+| `-dev, --device DEVICES` | Devices for `--cuda-quantize`: one device = mono (default CUDA0), two or more = multi-GPU row-split; types without a CUDA kernel fall back to CPU | CUDA0 | Example: `llama-quantize --pure --imatrix im.dat --cuda-quantize -dev CUDA0,CUDA1 in.gguf out.gguf IQ4_KT` [PR 2674](https://github.com/ikawrakow/ik_llama.cpp/pull/2674) |
+| `-ts, --tensor-split SPLIT` | Per-device row shares for multi-GPU `--cuda-quantize` (comma-separated) | equal split | Largest-remainder apportionment, ties to lower index. Example: `-ts 3,3,2` [PR 2674](https://github.com/ikawrakow/ik_llama.cpp/pull/2674) |
+| `--estimate-imatrix` | Use an estimated imatrix for quantization, possibly combining with the input imatrix (if specified) | - | No `llama-imatrix` run or calibration data needed; turns off the low-bpw "imatrix missing" checks. With `--imatrix` as well, the estimate is combined with the computed imatrix. [PR 2862](https://github.com/ikawrakow/ik_llama.cpp/pull/2862) |
+| `--analytical-imatrix output_file` | Compute an estimate of the imatrix and store it in `output_file`. If an input imatrix is provided, it will be combined with the estimate. Nothing else happens when this option is specified (write the estimated imatrix to `output_file` and exit without quantizing | - | The file is a regular imatrix, usable later via `--imatrix` [PR 2862](https://github.com/ikawrakow/ik_llama.cpp/pull/2862) |
+
+Notes:
+- Trellis quants (`IQ1_KT`, `IQ2_KT`, `IQ3_KT`, `IQ4_KT`) can only be quantized on AVX2 CPUs; `llama-quantize` aborts with an error on other CPUs. [PR 2613](https://github.com/ikawrakow/ik_llama.cpp/pull/2613)
 
 ### Build Arguments
 
@@ -505,7 +554,11 @@ cmake --build build --config Release -j$(nproc)
 | `-DCMAKE_TOOLCHAIN_FILE=[...]` | Example: on Windows tells `cmake` where is `sqlite3`. |
 | `-DGGML_NATIVE=ON` | Turn it off when cross-compiling. |
 | `-DGGML_NCCL=OFF` | To disable usage of NCCL. |
-| `-DGGML_MAX_CONTEXTS=2048` | Only need this if you are planning to use quants generated with the Thireus quantization suite |
+| `-DGGML_MAX_CONTEXTS=2048` | Does not limit live GGML contexts. On Windows, values above 512 still raise the model loader's stdio limit for models with many shards (capped at 8192). |
+| `-DGGML_MAX_SRC=N` | The maximum number of GPUs. |
+| `-DGGML_CUDA_USE_DMMV=ON` | Use the DMMV (dequantize + fp16 dot product) kernels where they beat MMVQ. Requires `-DGGML_CUDA_F16=ON` and a GPU with fast fp16. [PR 2781](https://github.com/ikawrakow/ik_llama.cpp/pull/2781) |
+| `-DGGML_CPU_INTEL_CLIENT=ON` | Build for non-Xeon Intel AVX-512 CPUs (Ice Lake, Rocket Lake, Tiger Lake): `VPDPBUSD` runs only on port 0 there, so the dual-tile `q8_k_r16` kernel from [PR 2813](https://github.com/ikawrakow/ik_llama.cpp/pull/2813) is slower; Zen4/Zen5/Sapphire Rapids should keep it off. [PR 2818](https://github.com/ikawrakow/ik_llama.cpp/pull/2818) |
+| `-DGGML_USE_I32GATHER=ON` | Prefer ZMM gather instructions in the AVX-512 IQK kernels. Requires `GGML_NATIVE=ON` or an explicit `-march` so the macro reaches `ggml/src`. [PR 2818](https://github.com/ikawrakow/ik_llama.cpp/pull/2818) |
 
 ### Environment variables
 
@@ -519,6 +572,11 @@ CUDA_VISIBLE_DEVICES=0,2 llama-server -m /models/model-bf16.gguf
 | - | - |
 | CUDA_VISIBLE_DEVICES | Use only specified GPUs. Example: Use first and 3rd `CUDA_VISIBLE_DEVICES=0,2` |
 | GGML_CUDA_NO_PINNED | Do not use pinned memory |
+| GGML_CUDA_NO_PINNED_WEIGHTS | Keep CPU-resident (CPU-overridden) model weights mmapped instead of pinned, while staging buffers stay pinned. Reduces RAM usage for hybrid CPU/GPU inference, e.g. MoE experts left on the CPU (`-ot`, `--cpu-moe`). [PR 2444](https://github.com/ikawrakow/ik_llama.cpp/pull/2444) |
+| GGML_CUDA_HOST_MALLOC_THP | Use THP for host allocations with GGML_CUDA_HOST_MALLOC_THP [PR 2010](https://github.com/ikawrakow/ik_llama.cpp/pull/2010) |
+| GGML_CUDA_HOST_CHUNK_GIB | Report a max size of N GiB for the CUDA host (CPU-resident weight) buffer type so the weight buffer is allocated as a multi-buffer of whole-tensor pieces, each pinned separately. Windows and Linux. [PR 2604](https://github.com/ikawrakow/ik_llama.cpp/pull/2604) |
+| GGML_CUDA_PINNED_CAP_GIB | Windows only: cap total pinned memory at M GiB (keep below the WDDM process limit, leaving headroom for compute buffers). Pieces that exceed the cap fall back to pageable memory; pageable pieces of a chunked buffer are not `--mlock`-ed. [PR 2604](https://github.com/ikawrakow/ik_llama.cpp/pull/2604) |
+| V41_SEPARATE | DeepSeek-V4.1 graph builder. Default `1` (since [PR 2878](https://github.com/ikawrakow/ik_llama.cpp/pull/2878)) uses the separate builder; `V41_SEPARATE=0 llama-server ...` reverts to the original V4.1 builder |
 
 ## Unique parameters
 
@@ -539,6 +597,7 @@ LLM_ARCH_GLM4_MOE,
 LLM_ARCH_MISTRAL3,
 LLM_ARCH_COMMAND_R,
 LLM_ARCH_COHERE2,
+LLM_ARCH_COHERE2_MOE,
 LLM_ARCH_MIMO2,
 LLM_ARCH_QWEN3,
 LLM_ARCH_QWEN3VL,

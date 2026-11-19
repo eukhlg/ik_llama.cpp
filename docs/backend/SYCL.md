@@ -28,7 +28,7 @@
 
 The llama.cpp SYCL backend is designed to support **Intel GPU** firstly. Based on the cross-platform feature of SYCL, it could support other vendor GPUs: Nvidia GPU (*AMD GPU coming*).
 
-When targeting **Intel CPU**, it is recommended to use llama.cpp for [Intel oneMKL](README.md#intel-onemkl) backend.
+When targeting **Intel CPU**, it is recommended to use llama.cpp for [Intel oneMKL](../build.md#intel-onemkl) backend.
 
 It has the similar design of other llama.cpp BLAS-based paths such as *OpenBLAS, cuBLAS, etc..*. In beginning work, the oneAPI's [SYCLomatic](https://github.com/oneapi-src/SYCLomatic) open-source migration tool (Commercial release [Intel® DPC++ Compatibility Tool](https://www.intel.com/content/www/us/en/developer/tools/oneapi/dpc-compatibility-tool.html)) was used for this purpose.
 
@@ -184,7 +184,7 @@ Platform #0: Intel(R) OpenCL HD Graphics
 
 - **Nvidia GPU**
 
-In order to target Nvidia GPUs through SYCL, please make sure the CUDA/CUBLAS native requirements *-found [here](README.md#cuda)-* are installed.
+In order to target Nvidia GPUs through SYCL, please make sure the CUDA/CUBLAS native requirements *-found [here](../build.md#cuda)-* are installed.
 
 2. **Install Intel® oneAPI Base toolkit**
 
@@ -234,7 +234,7 @@ When targeting an intel GPU, the user should expect one or more level-zero devic
 
 - **Nvidia GPU**
 
-Similarly, user targeting Nvidia GPUs should expect at least one SYCL-CUDA device [`ext_oneapi_cuda:gpu`] as bellow:
+Similarly, user targeting Nvidia GPUs should expect at least one SYCL-CUDA device [`ext_oneapi_cuda:gpu`] as below:
 ```
 [opencl:acc:0] Intel(R) FPGA Emulation Platform for OpenCL(TM), Intel(R) FPGA Emulation Device OpenCL 1.2  [2023.16.12.0.12_195853.xmain-hotfix]
 [opencl:cpu:1] Intel(R) OpenCL, Intel(R) Xeon(R) Gold 6326 CPU @ 2.90GHz OpenCL 3.0 (Build 0) [2023.16.12.0.12_195853.xmain-hotfix]
@@ -304,7 +304,7 @@ source /opt/intel/oneapi/setvars.sh
 
 2. List devices information
 
-Similar to the native `sycl-ls`, available SYCL devices can be queried as follow:
+Similar to the native `sycl-ls`, available SYCL devices can be queried as follows:
 
 ```sh
 ./build/bin/llama-ls-sycl-device
@@ -377,7 +377,7 @@ ZES_ENABLE_SYSMAN=1 ./build/bin/llama-cli -m models/llama-2-7b.Q4_0.gguf -p "Bui
 
 *Notes:*
 
-- Upon execution, verify the selected device(s) ID(s) in the output log, which can for instance be displayed as follow:
+- Upon execution, verify the selected device(s) ID(s) in the output log, which can for instance be displayed as follows:
 
 ```sh
 detect 1 SYCL GPUs: [0] with top Max compute units:512
@@ -506,7 +506,7 @@ On the oneAPI command line window, run the following and step into the llama.cpp
 
 2. List devices information
 
-Similar to the native `sycl-ls`, available SYCL devices can be queried as follow:
+Similar to the native `sycl-ls`, available SYCL devices can be queried as follows:
 
 ```
 build\bin\llama-ls-sycl-device.exe
@@ -573,7 +573,7 @@ build\bin\llama-cli.exe -m models\llama-2-7b.Q4_0.gguf -p "Building a website ca
 
 Note:
 
-- Upon execution, verify the selected device(s) ID(s) in the output log, which can for instance be displayed as follow:
+- Upon execution, verify the selected device(s) ID(s) in the output log, which can for instance be displayed as follows:
 
 ```sh
 detect 1 SYCL GPUs: [0] with top Max compute units:512
@@ -618,7 +618,7 @@ use 1 SYCL GPUs: [0] with Max compute units:512
 
   - Remove **build** folder or try a clean-build.
 
-- I can **not** see `[ext_oneapi_level_zero:gpu]` afer installing the GPU driver on Linux.
+- I can **not** see `[ext_oneapi_level_zero:gpu]` after installing the GPU driver on Linux.
 
   Please double-check with `sudo sycl-ls`.
 
@@ -634,7 +634,7 @@ use 1 SYCL GPUs: [0] with Max compute units:512
 
   No. We can't support Ollama issue directly, because we aren't familiar with Ollama.
 
-  Sugguest reproducing on llama.cpp and report similar issue to llama.cpp. We will surpport it.
+  Suggest reproducing on llama.cpp and report similar issue to llama.cpp. We will support it.
 
   It's same for other projects including llama.cpp SYCL backend.
 

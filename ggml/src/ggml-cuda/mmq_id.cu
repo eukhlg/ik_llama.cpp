@@ -2,6 +2,7 @@
 #include "mmq_id.cuh"
 #include "quantize_id.cuh"
 #include "quantize.cuh"
+#include "nvfp4.cuh"
 
 #include <vector>
 #include <climits>
@@ -66,8 +67,8 @@ static __global__ void mmq_ids_helper(
         }
     } else {
         // Implementation optimized for specific numbers of experts used:
-        static_assert(n_expert_used == 6 || warp_size % n_expert_used == 0, "bad n_expert_used");
-        const int neu_padded = n_expert_used == 6 ? 8 : n_expert_used; // Padded to next higher power of 2.
+        constexpr int neu_padded = n_expert_used_template == 6 ? 8 : n_expert_used_template == 10 ? 16 : n_expert_used_template;
+        static_assert(neu_padded <= warp_size && warp_size % neu_padded == 0, "bad n_expert_used");
         for (int it0 = 0; it0 < n_tokens; it0 += warp_size/neu_padded) {
             const int it = it0 + threadIdx.x / neu_padded;
 
@@ -99,6 +100,7 @@ static __global__ void mmq_ids_helper(
         }
     }
     nex_prev = warp_reduce_sum<warp_size>(nex_prev);
+    ggml_cuda_syncwarp(); // the loop above writes store[], the loop below reads it back
 
     for (int itc = threadIdx.x; itc < it_compact; itc += warp_size) {
         const mmq_ids_helper_store store_it = store[itc];
@@ -121,6 +123,14 @@ static __global__ void mmq_ids_helper(
     expert_bounds[gridDim.x] = nex_prev + it_compact;
 }
 
+static size_t mmq_ids_helper_nbytes_shared(int n_tokens) {
+    return n_tokens*sizeof(mmq_ids_helper_store);
+}
+
+bool ggml_cuda_can_compute_row_ids(int device, int n_tokens) {
+    return mmq_ids_helper_nbytes_shared(n_tokens) <= ggml_cuda_info().devices[device].smpbo;
+}
+
 template <int n_expert_used_template>
 static void launch_mmq_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
@@ -135,7 +145,7 @@ static void launch_mmq_ids_helper(
 
     const dim3 num_blocks(n_experts, 1, 1);
     const dim3 block_size(warp_size, 1, 1);
-    const size_t nbytes_shared = n_tokens*sizeof(mmq_ids_helper_store);
+    const size_t nbytes_shared = mmq_ids_helper_nbytes_shared(n_tokens);
     mmq_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1);
 }
@@ -162,6 +172,9 @@ static void ggml_cuda_mul_mat_q_switch_type_id(ggml_backend_cuda_context & ctx, 
             break;
         case GGML_TYPE_MXFP4:
             mul_mat_q_case_id<GGML_TYPE_MXFP4>(ctx, args, stream);
+            break;
+        case GGML_TYPE_NVFP4_KS:
+            mul_mat_q_case_id<GGML_TYPE_NVFP4_KS>(ctx, args, stream);
             break;
         case GGML_TYPE_Q2_K:
             mul_mat_q_case_id<GGML_TYPE_Q2_K>(ctx, args, stream);
@@ -205,6 +218,12 @@ static void ggml_cuda_mul_mat_q_switch_type_id(ggml_backend_cuda_context & ctx, 
         case GGML_TYPE_IQ4_NL:
             mul_mat_q_case_id<GGML_TYPE_IQ4_NL>(ctx, args, stream);
             break;
+        case GGML_TYPE_Q2_0:
+            mul_mat_q_case_id<GGML_TYPE_Q2_0>(ctx, args, stream);
+            break;
+        case GGML_TYPE_PQ2_0:
+            mul_mat_q_case_id<GGML_TYPE_PQ2_0>(ctx, args, stream);
+            break;
         case GGML_TYPE_IQ2_KS:
             mul_mat_q_case_id<GGML_TYPE_IQ2_KS>(ctx, args, stream);
             break;
@@ -235,6 +254,9 @@ static void ggml_cuda_mul_mat_q_switch_type_id(ggml_backend_cuda_context & ctx, 
         case GGML_TYPE_IQ4_KS_R4:
             mul_mat_q_case_id<GGML_TYPE_IQ4_KS_R4>(ctx, args, stream);
             break;
+        case GGML_TYPE_IQ4_KS_R16:
+            mul_mat_q_case_id<GGML_TYPE_IQ4_KS_R16>(ctx, args, stream);
+            break;
         case GGML_TYPE_IQ4_K:
             mul_mat_q_case_id<GGML_TYPE_IQ4_K>(ctx, args, stream);
             break;
@@ -253,6 +275,9 @@ static void ggml_cuda_mul_mat_q_switch_type_id(ggml_backend_cuda_context & ctx, 
         case GGML_TYPE_IQ5_K_R4:
             mul_mat_q_case_id<GGML_TYPE_IQ5_K_R4>(ctx, args, stream);
             break;
+        case GGML_TYPE_IQ5_KS_R16:
+            mul_mat_q_case_id<GGML_TYPE_IQ5_KS_R16>(ctx, args, stream);
+            break;
         case GGML_TYPE_IQ6_K:
             mul_mat_q_case_id<GGML_TYPE_IQ6_K>(ctx, args, stream);
             break;
@@ -267,6 +292,24 @@ static void ggml_cuda_mul_mat_q_switch_type_id(ggml_backend_cuda_context & ctx, 
             break;
         case GGML_TYPE_IQ4_KT:
             mul_mat_q_case_id<GGML_TYPE_IQ4_KT>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQ2_T:
+            mul_mat_q_case_id<GGML_TYPE_TQ2_T>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQK6:
+            mul_mat_q_case_id<GGML_TYPE_TQK6>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQK7:
+            mul_mat_q_case_id<GGML_TYPE_TQK7>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQP5:
+            mul_mat_q_case_id<GGML_TYPE_TQP5>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQP6:
+            mul_mat_q_case_id<GGML_TYPE_TQP6>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQP7:
+            mul_mat_q_case_id<GGML_TYPE_TQP7>(ctx, args, stream);
             break;
         default:
             GGML_ABORT("fatal error");
@@ -296,6 +339,10 @@ void compute_row_ids(const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst,
             break;
         case  8:
             launch_mmq_ids_helper< 8> (ids, ids_src1, ids_dst, expert_bounds,
+                    ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+            break;
+        case 10:
+            launch_mmq_ids_helper<10> (ids, ids_src1, ids_dst, expert_bounds,
                     ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
             break;
         case 16:
@@ -343,13 +390,14 @@ void ggml_cuda_mul_mat_q_id(ggml_backend_cuda_context & ctx, const ggml_tensor *
     float       *  dst_d = (float       *)  dst->data;
 
     // If src0 is a temporary compute buffer, clear any potential padding.
+    // If src0 is a view (one expert), the padding is at the end of the tensor it views.
     if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
-        const size_t size_data  = ggml_nbytes(src0);
-        const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
+        const ggml_tensor * src0_full = src0->view_src ? src0->view_src : src0;
+        const size_t size_data  = ggml_nbytes(src0_full);
+        const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0_full->buffer, src0_full);
         if (size_alloc > size_data) {
-            GGML_ASSERT(ggml_is_contiguously_allocated(src0));
-            GGML_ASSERT(!src0->view_src);
-            CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
+            GGML_ASSERT(ggml_is_contiguously_allocated(src0_full));
+            CUDA_CHECK(cudaMemsetAsync((char *) src0_full->data + size_data, 0, size_alloc - size_data, stream));
         }
     }
 
@@ -436,6 +484,10 @@ void ggml_cuda_mul_mat_q_id(ggml_backend_cuda_context & ctx, const ggml_tensor *
                 launch_mmq_ids_helper< 8> ((const int32_t *) ids_tensor->data, ids_src1, ids_dst, expert_bounds,
                     ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
                 break;
+            case 10:
+                launch_mmq_ids_helper<10> ((const int32_t *) ids_tensor->data, ids_src1, ids_dst, expert_bounds,
+                    ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+                break;
             case 16:
                 launch_mmq_ids_helper<16> ((const int32_t *) ids_tensor->data, ids_src1, ids_dst, expert_bounds,
                     ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
@@ -453,6 +505,11 @@ void ggml_cuda_mul_mat_q_id(ggml_backend_cuda_context & ctx, const ggml_tensor *
     }
 
     const int64_t ne11_flat = ne12*n_expert_used;
+    if (ggml_cuda_can_mul_mat_nvfp4_id(src0, src1, cc)) {
+        nvfp4_input input(ctx, src1, ggml_get_input_scale(src0));
+        ggml_cuda_gemm_nvfp4_id(ctx, src0, src1, dst, ids_src1, ids_dst, expert_bounds, input);
+        return;
+    }
     const int64_t ne12_flat = 1;
     const int64_t ne13_flat = 1;
 
@@ -507,6 +564,7 @@ bool ggml_cuda_can_use_mmq_id(enum ggml_type type, int cc, int64_t ne11) {
         case GGML_TYPE_Q6_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4_KS:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:
@@ -521,6 +579,8 @@ bool ggml_cuda_can_use_mmq_id(enum ggml_type type, int cc, int64_t ne11) {
         case GGML_TYPE_IQ1_S_R4:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_PQ2_0:
         case GGML_TYPE_IQ2_KS:
         case GGML_TYPE_IQ2_KL:
         case GGML_TYPE_IQ2_K:
@@ -531,10 +591,12 @@ bool ggml_cuda_can_use_mmq_id(enum ggml_type type, int cc, int64_t ne11) {
         case GGML_TYPE_IQ4_KSS:
         case GGML_TYPE_IQ4_KS:
         case GGML_TYPE_IQ4_KS_R4:
+        case GGML_TYPE_IQ4_KS_R16:
         case GGML_TYPE_IQ4_K:
         case GGML_TYPE_IQ4_K_R4:
         case GGML_TYPE_IQ5_KS:
         case GGML_TYPE_IQ5_KS_R4:
+        case GGML_TYPE_IQ5_KS_R16:
         case GGML_TYPE_IQ5_K:
         case GGML_TYPE_IQ5_K_R4:
         case GGML_TYPE_IQ6_K:
@@ -542,6 +604,12 @@ bool ggml_cuda_can_use_mmq_id(enum ggml_type type, int cc, int64_t ne11) {
         case GGML_TYPE_IQ2_KT:
         case GGML_TYPE_IQ3_KT:
         case GGML_TYPE_IQ4_KT:
+        case GGML_TYPE_TQ2_T:
+        case GGML_TYPE_TQK6:
+        case GGML_TYPE_TQK7:
+        case GGML_TYPE_TQP5:
+        case GGML_TYPE_TQP6:
+        case GGML_TYPE_TQP7:
             mmq_supported = true;
             break;
         default:
@@ -555,6 +623,10 @@ bool ggml_cuda_can_use_mmq_id(enum ggml_type type, int cc, int64_t ne11) {
 
     if (turing_mma_available(cc)) {
         return true;
+    }
+
+    if (type == GGML_TYPE_IQ1_S_R4) {
+        return false;
     }
 
     if (ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A) {

@@ -527,6 +527,36 @@ void iqk_hadamard(struct ggml_tensor * dst, int ith, int nth) {
     GGML_ASSERT(nh > 1 && popcount(uint32_t(nh)) == 1);
     GGML_ASSERT(dst->ne[0] % nh == 0);
 
+    if (auto signs = dst->src[1]; signs != nullptr) {
+        GGML_ASSERT(signs->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst) && ggml_is_contiguous(signs));
+        GGML_ASSERT(ggml_nrows(signs) == 1);
+        GGML_ASSERT(src->ne[0] == signs->ne[0]);
+        bool before = dst->op_params[1];
+        int64_t nelem = ggml_nelements(src);
+        int nblock = nelem / nh;
+        int npt = (nblock + nth - 1)/nth;
+        int first = npt * ith;
+        int last  = std::min(first + npt, nblock);
+        for (int ib = first; ib < last; ++ib) {
+            int64_t i0 = int64_t(ib) * nh;
+            int64_t j0 = i0 % src->ne[0];
+            auto x = (const float *)src->data + i0;
+            auto y = (      float *)dst->data + i0;
+            auto s = (const float *)signs->data + j0;
+            if (before) {
+                for (int j = 0; j < nh; ++j) y[j] = x[j] * s[j];
+            } else {
+                std::memcpy(y, x, nh*sizeof(float));
+            }
+            fast_ht(nh, y);
+            if (!before) {
+                for (int j = 0; j < nh; ++j) y[j] *= s[j];
+            }
+        }
+        return;
+    }
+
     int nc = dst->ne[0]/nh;
     int nr = ggml_nrows(dst) * nc;
     int npt = (nr + nth - 1)/nth;
@@ -664,12 +694,21 @@ bool iqk_ssm_conv4(int nr, int nc, int nt,
                 sum1 = _mm256_fmadd_ps(vs[ii+0], vc[k+0], sum1);
                 sum2 = _mm256_fmadd_ps(vs[ii+4], vc[k+4], sum2);
             }
+#if defined __AVX512F__ && defined __AVX512DQ__
+            if (dst_silu) {
+                _mm512_storeu_ps(x, v_silu(_mm512_insertf32x8(_mm512_castps256_ps512(sum1), sum2, 1)));
+            } else {
+                _mm256_storeu_ps(x+0, sum1);
+                _mm256_storeu_ps(x+8, sum2);
+            }
+#else
             if (dst_silu) {
                 sum1 = v_silu(sum1);
                 sum2 = v_silu(sum2);
             }
             _mm256_storeu_ps(x+0, sum1);
             _mm256_storeu_ps(x+8, sum2);
+#endif
             x0 += nb11/sizeof(float);
             x  += nr;
         }
@@ -1043,4 +1082,152 @@ void iqk_blend(struct ggml_tensor * dst, int ith, int nth) {
             }
         }
     }
+}
+
+namespace {
+inline void iqk_add_f16(int n, const ggml_half * x, ggml_half * y) {
+    int i = 0;
+#if defined __AVX2__ && defined __F16C__
+    for ( ; i + 7 < n; i += 8) {
+        auto vx32 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(x + i)));
+        auto vy32 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(y + i)));
+        vy32 = _mm256_add_ps(vy32, vx32);
+        _mm_storeu_si128((__m128i *)(y + i), _mm256_cvtps_ph(vy32, _MM_FROUND_TO_NEAREST_INT));
+    }
+#endif
+    for (; i < n; ++i) {
+        float y32 = GGML_FP16_TO_FP32(y[i]) + GGML_FP16_TO_FP32(x[i]);
+        y[i] = GGML_FP32_TO_FP16(y32);
+    }
+}
+}
+
+void iqk_mask_topk(struct ggml_tensor * dst, int ith, int nth) {
+    auto mask = dst->src[0];
+    auto topk = dst->src[1];
+    GGML_ASSERT(mask->ne[0] >= topk->ne[0]);
+    GGML_ASSERT(mask->ne[1] >= topk->ne[1] && mask->ne[2] == topk->ne[2] && mask->ne[3] == topk->ne[3]);
+    GGML_ASSERT(ggml_are_same_shape(mask, dst));
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(topk->type == GGML_TYPE_I32);
+    GGML_ASSERT(mask->type == dst->type);
+
+    int nrows = ggml_nrows(dst);
+    int npt = (nrows + nth - 1)/nth;
+    int first = ith*npt;
+    int last  = std::min(first + npt, nrows);
+
+    auto hinf  = GGML_FP32_TO_FP16(-INFINITY);
+    auto hzero = GGML_FP32_TO_FP16(0.0f);
+
+    int n = dst->ne[0];
+    int nidx = topk->ne[0];
+
+    for (int ir = first; ir < last; ++ir) {
+        int i3 = ir/(dst->ne[1]*dst->ne[2]);
+        int i2 = (ir - i3*dst->ne[1]*dst->ne[2])/dst->ne[1];
+        int i1 = ir - i3*dst->ne[1]*dst->ne[2] - i2*dst->ne[1];
+        auto idx = (const int *)((const char *)topk->data + topk->nb[1]*i1 + topk->nb[2]*i2 + topk->nb[3]*i3);
+        if (dst->type == GGML_TYPE_F16) {
+            auto x = (const ggml_half *)((const char *)mask->data + mask->nb[1]*i1 + mask->nb[2]*i2 + mask->nb[3]*i3);
+            auto y = (ggml_half *)((char *)dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+            if (i1 < topk->ne[1]) {
+                for (int j = 0; j < n; ++j) y[j] = hinf;
+                for (int j = 0; j < nidx; ++j) y[idx[j]] = hzero;
+                iqk_add_f16(n, x, y);
+            } else {
+                for (int j = 0; j < n; ++j) y[j] = x[j];
+            }
+        } else {
+            auto x = (const float *)((const char *)mask->data + mask->nb[1]*i1 + mask->nb[2]*i2 + mask->nb[3]*i3);
+            auto y = (float *)((char *)dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+            if (i1 < topk->ne[1]) {
+                for (int j = 0; j < n; ++j) y[j] = -INFINITY;
+                for (int j = 0; j < nidx; ++j) y[idx[j]] = 0.0f;
+                for (int j = 0; j < n; ++j) y[j] += x[j];
+            } else {
+                for (int j = 0; j < n; ++j) y[j] = x[j];
+            }
+        }
+    }
+}
+
+namespace {
+inline void iqk_scaled_sigmoid(int n, const float * x, float * y, float s_before, float s_after) {
+    int i = 0;
+#ifdef __AVX512F__
+    {
+        auto vsb = _mm512_set1_ps(-s_before);
+        auto vsa = _mm512_set1_ps(s_after);
+        auto one = _mm512_set1_ps(1.0f);
+        for (; i + 15 < n; i += 16) {
+            auto vx = _mm512_mul_ps(vsb, _mm512_loadu_ps(x + i));
+            auto exp_vx = v_expf(vx);
+            auto vy = _mm512_div_ps(vsa, _mm512_add_ps(one, exp_vx));
+            _mm512_storeu_ps(y + i, vy);
+        }
+    }
+#endif
+#ifdef __AVX2__
+    {
+        auto vsb = _mm256_set1_ps(-s_before);
+        auto vsa = _mm256_set1_ps(s_after);
+        auto one = _mm256_set1_ps(1.0f);
+        for (; i + 7 < n; i += 8) {
+            auto vx = _mm256_mul_ps(vsb, _mm256_loadu_ps(x + i));
+            auto exp_vx = v_expf(vx);
+            auto vy = _mm256_div_ps(vsa, _mm256_add_ps(one, exp_vx));
+            _mm256_storeu_ps(y + i, vy);
+        }
+    }
+#endif
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    {
+        auto vsb = vdupq_n_f32(-s_before);
+        auto vsa = vdupq_n_f32(s_after);
+        auto one = vdupq_n_f32(1.0f);
+        for (; i + 3 < n; i += 4) {
+            auto vx = vmulq_f32(vsb, vld1q_f32(x + i));
+            auto exp_vx = v_expf(vx);
+            auto vy = vdivq_f32(vsa, vaddq_f32(one, exp_vx));
+            vst1q_f32(y + i, vy);
+        }
+    }
+#endif
+    for (; i < n; ++i) {
+        y[i] = s_after / (1.0f + expf(-s_before * x[i]));
+    }
+}
+}
+
+bool iqk_op_scale_unary_scale(struct ggml_tensor * dst, int ith, int nth) {
+    constexpr int k_block_size = 1024;
+    if (dst->op != GGML_OP_SCALE) return false;
+    auto unary = dst->src[0];
+    if (unary->op != GGML_OP_UNARY) return false;
+    auto unary_op = (ggml_unary_op)unary->op_params[0];
+    if (unary_op != GGML_UNARY_OP_SIGMOID) return false;
+    auto src = unary->src[0];
+    if (src->op != GGML_OP_SCALE) return false;
+    auto src0 = src->src[0];
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(dst)) return false;
+    if (src0->type != dst->type) return false;
+    if (src0->type != GGML_TYPE_F32) return false;
+
+    float s_before, s_after;
+    std::memcpy(&s_before, src->op_params, sizeof(float));
+    std::memcpy(&s_after, dst->op_params, sizeof(float));
+
+    int64_t nelem = ggml_nelements(src0);
+    int64_t nblocks = (nelem + k_block_size - 1)/k_block_size;
+
+    for (int64_t ib = ith; ib < nblocks; ib += nth) {
+        int64_t first = ib*k_block_size;
+        auto x = (const float *)src0->data + first;
+        auto y = (      float *) dst->data + first;
+        int  n = std::min<int>(k_block_size, nelem - first);
+        iqk_scaled_sigmoid(n, x, y, s_before, s_after);
+    }
+
+    return true;
 }

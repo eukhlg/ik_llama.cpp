@@ -7,6 +7,8 @@
 
 struct common_speculative;
 
+bool common_speculative_needs_checkpoint(const llama_model * model);
+
 enum common_speculative_init_status {
     COMMON_SPECULATIVE_INIT_SKIPPED,
     COMMON_SPECULATIVE_INIT_READY,
@@ -22,9 +24,14 @@ using common_speculative_feature_view = llama_spec_feature_view;
 static constexpr common_speculative_feature_kind COMMON_SPECULATIVE_FEATURE_NONE = LLAMA_SPEC_FEATURE_NONE;
 static constexpr common_speculative_feature_kind COMMON_SPECULATIVE_FEATURE_HIDDEN_STATE = LLAMA_SPEC_FEATURE_HIDDEN_STATE;
 
+struct common_speculative_token_dist {
+    llama_tokens ids;
+    std::vector<float> probs;
+};
+
 struct common_speculative_checkpoint {
     bool valid = false;
-    bool per_step_enabled = false;
+    int mode = LLAMA_SPEC_CKPT_NONE;
     llama_pos n_past = 0;
     llama_token sampled = LLAMA_TOKEN_NULL;
     common_sampler * sampler = nullptr;
@@ -34,7 +41,34 @@ struct common_speculative_checkpoint {
 
 struct common_speculative_draft_result {
     llama_tokens tokens;
+    std::vector<common_speculative_token_dist> proposal_dists; // Sparse proposal distributions populated by stochastic DFlash2
     common_speculative_type type = COMMON_SPECULATIVE_TYPE_NONE;
+    bool target_only = false;
+};
+
+struct common_speculative_metrics_stage_snapshot {
+    common_speculative_type type = COMMON_SPECULATIVE_TYPE_NONE;
+
+    uint64_t n_call_begin = 0;
+    uint64_t n_call_draft = 0;
+    uint64_t n_call_accept = 0;
+
+    uint64_t n_gen_drafts = 0;
+    uint64_t n_acc_drafts = 0;
+    uint64_t n_gen_tokens = 0;
+    uint64_t n_acc_tokens = 0;
+
+    // Position zero represents speculative position 1.
+    std::vector<uint64_t> drafted_by_position;
+    std::vector<uint64_t> accepted_by_position;
+
+    int64_t t_begin_us = 0;
+    int64_t t_draft_us = 0;
+    int64_t t_accept_us = 0;
+};
+
+struct common_speculative_metrics_snapshot {
+    std::vector<common_speculative_metrics_stage_snapshot> stages;
 };
 
 // comma separated list of all types
@@ -50,6 +84,9 @@ std::string common_speculative_type_to_str(enum common_speculative_type type);
 // note: clears the memory of the context
 bool common_speculative_is_compat(llama_context * ctx_tgt);
 
+// true if the target must keep the hidden state of every prompt token
+bool common_speculative_needs_all_target_hidden(const common_speculative * spec);
+
 common_speculative * common_speculative_init(
         common_params_speculative & params,
         llama_context             * ctx_tgt);
@@ -59,7 +96,7 @@ common_speculative_init_status common_speculative_try_init(
         llama_context             * ctx_tgt,
         common_speculative      ** out_spec);
 
-void common_speculative_prepare_startup(
+bool common_speculative_prepare_startup(
         gpt_params & params_base,
         bool         allow_parallel_mtp = true);
 
@@ -71,6 +108,8 @@ bool common_speculative_load_draft_model(
         common_params_speculative & params,
         const gpt_params         & params_base);
 
+void common_speculative_reset_draft_offload_defaults(gpt_params & params);
+
 bool common_speculative_prepare_mtp_runtime(
         common_params_speculative & params,
         const gpt_params         & params_base,
@@ -81,6 +120,13 @@ void common_speculative_free(common_speculative * spec);
 
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt);
+
+// apply per-request runtime parameters before prompt warmup can touch companion state
+void common_speculative_prepare_request(common_speculative * spec, common_params_speculative & params);
+
+// true when the active request drafts with more MTP heads than the cached prefix was
+// warmed with; the caller must then reprocess the prompt from position 0
+bool common_speculative_mtp_requires_fresh_warmup(const common_speculative * spec);
 
 // sample up to n_draft tokens and add them to the batch using the draft model
 // draft_base_pos/draft_seq_id override the MTP position for id_last
@@ -99,7 +145,13 @@ common_speculative_draft_result common_speculative_draft_ex(
                      const llama_tokens & prompt,
                             llama_token   id_last,
                             llama_pos     draft_base_pos = -1,
-                            llama_seq_id  draft_seq_id = 0);
+                            llama_seq_id  draft_seq_id = 0,
+                            const common_params_sampling * sampling = nullptr);
+
+int common_speculative_get_configured_n_max(const common_speculative * spec);
+
+// apply -td/--threads-draft to a draft params copy
+void common_speculative_apply_draft_threads(const common_params_speculative & spec, gpt_params & out);
 
 // informs the speculative decoder that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
@@ -160,7 +212,7 @@ void common_speculative_checkpoint_discard(
     common_speculative_checkpoint & ckpt,
     llama_context * ctx);
 
-void common_speculative_checkpoint_restore(
+bool common_speculative_checkpoint_restore(
     common_speculative_checkpoint & ckpt,
     common_speculative * spec,
     llama_context * ctx,
@@ -173,16 +225,16 @@ void common_speculative_checkpoint_restore(
     const std::vector<float> & mtp_hidden_state_pre,
     int32_t mtp_n_past_base);
 
-void common_speculative_commit(
-    common_speculative * spec,
-    llama_context * ctx,
-    common_sampler * sampler_dst,
-    llama_seq_id seq_id,
-    llama_token sampled_before,
-    const std::vector<llama_token> & ids,
-    int n_draft,
-    llama_pos pos_base,
-    const std::vector<int32_t> & accepted_output_indices);
+bool common_speculative_commit(
+        common_speculative * spec,
+        llama_context * ctx,
+        common_sampler * sampler_dst,
+        llama_seq_id seq_id,
+        llama_token sampled_before,
+        const std::vector<llama_token> & ids,
+        int n_draft,
+        llama_pos pos_base,
+        const std::vector<int32_t> & accepted_output_indices);
 
 bool common_speculative_has_sequence_hidden(const common_speculative * spec, llama_seq_id seq_id);
 
@@ -206,6 +258,9 @@ void common_speculative_clear_sequence_kv(
 
 llama_context * common_speculative_get_companion_ctx(common_speculative * spec);
 
+// the draft, MTP and DFlash contexts that the stages of spec own
+std::vector<const llama_context *> common_speculative_get_draft_contexts(const common_speculative * spec);
+
 int32_t common_speculative_on_target_seq_batch(
     common_speculative * spec,
     llama_context * ctx,
@@ -224,6 +279,8 @@ void common_speculative_print_stats(const common_speculative * spec, double slot
 
 common_speculative_type common_speculative_current_type(const common_speculative * spec);
 
+common_speculative_metrics_snapshot common_speculative_get_metrics_snapshot(const common_speculative * spec);
+
 // Context shift for MTP to match how server handle main model
 void common_speculative_context_shift(
         common_speculative * spec,
@@ -231,3 +288,29 @@ void common_speculative_context_shift(
         llama_pos            kv_keep,
         llama_pos            kv_discard,
         llama_pos            kv_past);
+
+struct common_speculative_round_result {
+    bool attempted = false;
+    bool sampled_before_ready = false;
+    bool sampled_before_from_carry = false;
+    bool used_speculative = false;
+    bool failed = false;
+    std::string error;
+    llama_token sampled_before = LLAMA_TOKEN_NULL;
+    llama_tokens ids;
+};
+
+common_speculative_round_result common_speculative_run_round(
+    common_speculative * spec,
+    llama_model * model,
+    llama_context * ctx,
+    common_sampler * sampler,
+    llama_context * ctx_guidance,
+    common_params_speculative params,
+    const common_params_sampling & sparams,
+    llama_seq_id seq_id,
+    llama_pos n_past,
+    int n_predict_budget,
+    bool have_carry,
+    const llama_tokens & draft_history,
+    llama_token carry_token);

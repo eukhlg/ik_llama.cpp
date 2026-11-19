@@ -1,4 +1,5 @@
 #include "server-task.h"
+#include "server-decision.h"
 #include "server-queue.h"
 #include "speculative.h"
 #include "json-schema-to-grammar.h"
@@ -6,6 +7,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <vector>
 
 
 
@@ -43,7 +45,6 @@ struct server_slot {
     int32_t n_ctx = 0;  // context size per slot
     int32_t n_past = 0;
     int32_t n_past_prompt = 0;
-    int32_t n_past_offset = 0;
     int32_t n_decoded = 0;
     int32_t n_remaining = -1;
     int32_t n_discarded_prompt = 0;
@@ -64,7 +65,7 @@ struct server_slot {
     server_tokens prompt_tokens;
     server_tokens cache_tokens;
 
-    int32_t last_gentxt_size = 0;
+    int32_t last_gentxt_len = 0;
     std::string generated_text;
 
     // idx of draft tokens in the main batch
@@ -87,7 +88,7 @@ struct server_slot {
 
     std::string oaicompat_model;
     std::string stopping_word;
-    stop_type stop;
+    stop_type stop = STOP_TYPE_NONE;
 
     // For context rewind/ token buffer
     size_t n_buffer = 0;
@@ -101,11 +102,11 @@ struct server_slot {
     completion_token_outputs token_buffer;
     float ban_phrases_bias = 0;
     int32_t banned_n = 1;
-	std::map<int32_t, std::set<llama_token>> positional_bans;
+    std::map<int32_t, std::set<llama_token>> positional_bans;
 
     // allowlist
-    std::vector<std::vector<std::tuple<uint32_t, uint32_t, std::string, float>>> allow_ruless_prev;
-    std::vector<std::vector<std::tuple<uint32_t, uint32_t, std::string, float>>> allow_ruless;
+    std::vector<std::vector<std::tuple<uint32_t, uint32_t, std::string, float>>> allow_rules_prev;
+    std::vector<std::vector<std::tuple<uint32_t, uint32_t, std::string, float>>> allow_rules;
     std::vector<std::string> allow_pieces;
     std::vector<std::string> allow_kws;
     size_t allow_kw_delay = 0;
@@ -116,15 +117,18 @@ struct server_slot {
 
     void prompt_save(server_prompt_cache& prompt_cache) const;
 
-    void prompt_load(server_prompt_cache& prompt_cache, const server_tokens& tokens);
+    void prompt_load(server_prompt_cache& prompt_cache, const server_tokens& tokens, float min_reusable_fraction);
 
-    size_t checkpoint_pos = 0;
+    llama_pos checkpoint_pos = -1;
     bool do_checkpoint = false;
+    bool do_rewind_chekpoint = false;
     bool image_just_processed = false;
 
     // sampling
     llama_token sampled; // in speculative mode, this is the last accepted token
     llama_tokens drafted;
+    std::vector<common_speculative_token_dist> draft_proposal_dists;
+    bool spec_target_only = false;
 
     json json_schema;
 
@@ -163,6 +167,8 @@ struct server_slot {
     // speculative decoding stats
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
+    std::vector<int32_t> n_draft_by_depth;
+    std::vector<int32_t> n_draft_accepted_by_depth;
 
     int32_t n_past_se = 0; // self-extend
 
@@ -195,7 +201,7 @@ struct server_slot {
 
     void release();
 
-    json get_formated_timings() const;
+    json get_formatted_timings() const;
 
     result_timings get_timings() const;
 
@@ -250,6 +256,8 @@ struct server_context {
 
     // multimodal
     mtmd_context* mctx = nullptr;
+
+    server_decision_context decision;
 
     int32_t n_ctx; // total context for all clients / slots
 
@@ -307,17 +315,18 @@ struct server_context {
 
     bool system_prompt_set(const std::string& sys_prompt);
 
-    bool process_token(completion_token_output& result, server_slot& slot);
+    bool process_token(completion_token_output& result, server_slot& slot, bool last = true);
 
     void populate_token_probs(const server_slot& slot, completion_token_output& result, bool post_sampling, bool special, int idx);
 
-    json get_formated_generation(const server_slot& slot) const;
+    json get_formatted_generation(const server_slot& slot) const;
+    json get_memory_data() const;
 
     void send_error(const server_task& task, const std::string& error, const enum error_type type = ERROR_TYPE_SERVER);
 
     void send_error(const server_slot& slot, const std::string& error, const enum error_type type = ERROR_TYPE_SERVER);
 
-    void send_error(const int id_task, const int id_multi, const std::string& error, const enum error_type type = ERROR_TYPE_SERVER);
+    void send_error(const int id_task, const int id_multi, const std::string& error, const enum error_type type = ERROR_TYPE_SERVER, const int32_t n_prompt_tokens = 0, const int32_t n_ctx = 0);
 
     // if multimodal is enabled, send an error and return false
     bool check_no_mtmd(const int id_task);
@@ -327,6 +336,8 @@ struct server_context {
     void send_final_response(server_slot& slot);
 
     void send_embedding(const server_slot& slot, const llama_batch& batch);
+
+    void send_decision(const server_slot& slot, int32_t i_batch);
 
     void apply_server_biases(server_slot& slot);
 
@@ -376,7 +387,9 @@ struct server_context {
 
     void send_token_results(completion_token_outputs& results, server_slot& slot, int32_t n = 0);
 
-    void buffer_and_check_string_ban(server_slot& slot, completion_token_output& result);
+    bool rewind_context(server_slot& slot, int32_t ban_pos);
+
+    bool buffer_and_check_string_ban(server_slot& slot, completion_token_output& result);
 
     void update_allowlist_state(server_slot& slot);
 
@@ -385,11 +398,11 @@ struct server_context {
     // Re-aggregates all active vectors and updates the model state
     bool apply_control_vectors_internal();
 
-    bool create_checkpoint(server_slot & slot);
+    bool create_checkpoint(server_slot & slot, bool prompt_end = false);
 
     void apply_checkpoint(server_slot & slot);
 
-    void create_checkpoint_at_interval(server_slot & slot, const gpt_params & params_base);
+    void create_checkpoint_at_interval(server_slot & slot);
 
     void release_slot_after_final_response(server_slot & slot);
 };

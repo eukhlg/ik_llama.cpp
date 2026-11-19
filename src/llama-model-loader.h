@@ -38,6 +38,8 @@ struct llama_model_loader {
     int n_kv      = 0;
     int n_tensors = 0;
     int n_created = 0;
+    int n_skipped = 0;
+    size_t size_skipped = 0;
 
     int64_t n_elements = 0;
     size_t  n_bytes    = 0;
@@ -47,10 +49,15 @@ struct llama_model_loader {
     bool use_mmap = false;
     bool check_tensors;
     bool repack_tensors = false;
+    bool fp8_w8a8 = false;
     bool use_thp = false;
     bool merge_qkv = false;
     bool merge_up_gate_exps = false;
     bool defer_experts = false;
+    bool defer_ple = false;
+    // Explicit --no-mmap with deferred tables: copy dense weights out, alias deferred only.
+    bool defer_copy_dense = false;
+    std::vector<ggml_backend_buffer_type_t> integrated_bufts;
 
     llama_files files;
     llama_ftype ftype;
@@ -64,10 +71,24 @@ struct llama_model_loader {
         size_t   offs; // tensor data offset in the original file
 
         ggml_tensor * tensor;
+        std::vector<float> nvfp4_scale;
+        std::vector<float> f8_scale;
+        bool mxfp4_repack = false;
 
-        llama_tensor_weight(const llama_file * file, uint16_t idx, const char * name, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
+        llama_tensor_weight(const llama_file * file, uint16_t idx, const char * name, const struct gguf_context * gguf_ctx, ggml_tensor * tensor, const std::vector<size_t> & tensor_ends) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx, name);
             offs = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, tensor_idx);
+
+            if (tensor->type == GGML_TYPE_F8_E4M3) {
+                const size_t end = tensor_ends[tensor_idx];
+                const size_t size = ggml_nbytes(tensor);
+                const size_t alignment = gguf_get_alignment(gguf_ctx);
+                const size_t padded = GGML_PAD(size, alignment);
+                if (end < offs || end - offs < size || end - offs > padded) {
+                    throw std::runtime_error(format("tensor '%s': type 43 is not one-byte F8_E4M3 (expected %zu bytes, at most %zu with padding, stored extent %zu); block-scaled MXFP8 is not supported",
+                                name, size, padded, end >= offs ? end - offs : 0));
+                }
+            }
 
             if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
                 auto data_offset = gguf_get_data_offset(gguf_ctx);
@@ -79,6 +100,7 @@ struct llama_model_loader {
         }
     };
     std::vector<llama_tensor_weight> weights;
+    std::vector<llama_tensor_weight> scale_weights; // the .scale and .input_scale tensors consumed at load
 
     std::unordered_map<std::string, struct llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
@@ -88,14 +110,24 @@ struct llama_model_loader {
 
     std::string arch_name;
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);
+    mutable bool arch_resolved = false;
+    mutable llm_arch resolved_arch = LLM_ARCH_UNKNOWN;
     llama_expert_tensor_index expert_tensor_index;
+    llama_expert_tensor_index ple_tensor_index;
 
     llama_model_loader(const std::string & fname, int ncmoe, bool use_mmap, bool check_tensors, bool repack_tensors, bool use_thp,
             bool merge_qkv, bool merge_up_gate_exps, bool defer_experts,
             const llama_model_kv_override * param_overrides_p,
-            const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+            const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+            const std::string & ngram_fname = std::string(),
+            llama_nvfp4_precision nvfp4_precision = LLAMA_NVFP4_PRECISION_AUTO,
+            llama_fp8_precision fp8_precision = LLAMA_FP8_PRECISION_AUTO);
 
     ~llama_model_loader();
+
+    void read_scale(const llama_tensor_weight & scale, float * dst);
+    bool import_nvfp4(llama_nvfp4_precision precision);
+    bool import_f8_e4m3();
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type
@@ -127,9 +159,24 @@ struct llama_model_loader {
     template<typename T>
     bool get_key_or_arr(const enum llm_kv kid, T & result, uint32_t n, const bool required = true);
 
+    bool get_key_or_arr(enum llm_kv kid, uint32_t & result, bool required = true);
+
     const std::string& get_arch_name() const { return arch_name; }
 
-    enum llm_arch get_arch() const { return llm_kv.arch; }
+    enum llm_arch get_arch() const {
+        if (!arch_resolved) {
+            resolved_arch = llm_kv.arch;
+            if (resolved_arch == LLM_ARCH_DFLASH &&
+                    get_tensor_meta("selector_hidden.weight") != nullptr) {
+                resolved_arch = LLM_ARCH_DFLASH2;
+            }
+            if (resolved_arch == LLM_ARCH_GLM5NEXT_DASHED) {
+                resolved_arch = LLM_ARCH_GLM5NEXT;
+            }
+            arch_resolved = true;
+        }
+        return resolved_arch;
+    }
 
     const char * get_tensor_name(int i) const;
 
@@ -170,7 +217,23 @@ struct llama_model_loader {
 
     bool should_defer_expert_mmaps() const;
 
+    bool has_anonymous_mapping() const;
+
     void drop_mmap_expert_pages() const;
+
+    void build_ple_tensor_index();
+
+    bool should_defer_ple_mmaps() const;
+
+    void apply_ple_mmap_policy() const;
+
+    // File holds deferred ranges (PLE, engram): skip prefetch and pinning for it.
+    bool file_has_deferred_ple(int idx) const;
+
+    bool ple_range_overlaps(int idx, size_t first, size_t last) const;
+
+    // deferred bytes of the index inside [first, last) of file idx
+    size_t ple_deferred_bytes_in(int idx, size_t first, size_t last) const;
 
     void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
 
@@ -181,7 +244,7 @@ struct llama_model_loader {
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
-    // Returns false if cancelled by progress_callback
+    // Returns false if canceled by progress_callback
     bool load_all_data(
             struct ggml_context * ctx,
             struct llama_model * model,
@@ -194,6 +257,9 @@ struct llama_model_loader {
 void llm_load_arch(llama_model_loader & ml, llama_model & model);
 
 void llm_load_hparams(llama_model_loader & ml, llama_model & model, bool ignore_vocab = false);
+
+// Prism ternary Hadamard rotations; no-op unless the GGUF declares them
+void llm_load_hadamard(llama_model_loader & ml, llama_model & model);
 
 struct create_tensors_helper_interface {
     virtual ~create_tensors_helper_interface() = default;
