@@ -19791,7 +19791,7 @@ static void ggml_compute_forward_mul_mat_id(
                 acc += chunks_per_expert;
             }
 
-            const char * src0_cur = (const char *) src0->data + cur_a*nb02;
+            const char * src0_cur = src0_data + cur_a*nb02;
 
             if (!iqk_mul_mat_moe(ne01, matrix_row_counts[cur_a], ne00, ne11,
                         src0->type, src0_cur, nb01,
@@ -20143,16 +20143,16 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
 
         const char *src0_1_cur, *src0_2_cur, *up_b_cur = NULL, *gate_b_cur = NULL;
         if (src0_2) {
-            src0_1_cur = (const char *) src0_1->data + cur_a*nb02;
-            src0_2_cur = (const char *) src0_2->data + cur_a*nb02;
-            up_b_cur   = up_b   ? (const char *)up_b->data + cur_a*nb41 : NULL;
-            gate_b_cur = gate_b ? (const char *)gate_b->data + cur_a*nb51 : NULL;
+            src0_1_cur = src0_1_data + cur_a*nb02;
+            src0_2_cur = src0_2_data + cur_a*nb02;
+            up_b_cur   = up_b   ? up_b_data + cur_a*nb41 : NULL;
+            gate_b_cur = gate_b ? gate_b_data + cur_a*nb51 : NULL;
         } else {
-            src0_2_cur = (const char *) src0_1->data + cur_a*nb02;
+            src0_2_cur = src0_1_data + cur_a*nb02;
             src0_1_cur = src0_2_cur + nb02/2;
             if (up_b) {
                 GGML_ASSERT(!gate_b);
-                gate_b_cur = (const char *)up_b->data + cur_a*nb41;
+                gate_b_cur = up_b_data + cur_a*nb41;
                 up_b_cur   = gate_b_cur + nb41/2;
             }
         }
