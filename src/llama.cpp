@@ -9760,6 +9760,38 @@ static void llama_mirror_kv_cache(struct llama_kv_cache & cache) {
         }
     }
     LLAMA_LOG_INFO("%s: NUMA mirror: mirrored %d KV tensors across %d nodes\n", __func__, n_mirrored, n_nodes);
+
+    // Recurrent (linear-attention) state: the fused delta-net op reads and writes the primary copy
+    // (tensor->data) in place, so the per-node copies are never read. The op splits the work into
+    // contiguous ranges of (sequence, head, row block) across threads, and threads are split into
+    // contiguous blocks per node, so node k processes roughly the k-th 1/n_nodes slice of each
+    // state tensor. Place those pages of the primary copy on node k: same data and layout, only
+    // the physical placement changes, so every other reader (checkpoints, save/restore) is unaffected.
+    int n_state_bound = 0;
+    for (auto * t : cache.s_l) {
+        if (!t || !t->data || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+            continue;
+        }
+        const size_t    nbytes = ggml_nbytes(t);
+        const uintptr_t pg     = 4096;
+        const uintptr_t base   = (uintptr_t) t->data;
+        for (int n = 1; n < n_nodes; ++n) {
+            // whole pages only, aligned on absolute addresses: never move a page whose start
+            // belongs to the previous node's slice
+            uintptr_t a0 = base + (nbytes * n) / n_nodes;
+            uintptr_t a1 = base + (nbytes * (n + 1)) / n_nodes;
+            a0 = (a0 + pg - 1) & ~(pg - 1);
+            a1 = n + 1 == n_nodes ? ((base + nbytes) & ~(pg - 1)) : (a1 & ~(pg - 1));
+            if (a1 > a0) {
+                ggml_numa_bind((void *) a0, (size_t) (a1 - a0), n);
+            }
+        }
+        ++n_state_bound;
+    }
+    if (n_state_bound > 0) {
+        LLAMA_LOG_INFO("%s: NUMA mirror: placed %d recurrent state tensors across %d nodes by head range\n",
+                __func__, n_state_bound, n_nodes);
+    }
 }
 
 static void llama_repack_up_gate_exps(llama_context & lctx) {
