@@ -343,6 +343,81 @@ static inline int num_rows([[maybe_unused]] ggml_type type) {
 
 }
 
+namespace {
+// Activation quantization for small batches: a decode graph quantizes only 1-3 rows (tokens),
+// and splitting by rows leaves all but 1-3 threads idle before the matmul's barrier.
+// Split each row into chunks instead, for types where quantizing chunk by chunk is
+// bit-identical to quantizing the whole row. That is checked once per type by a self-test,
+// so types with row-level scales, row headers or grouped blocks simply keep the row split.
+std::atomic<uint8_t> g_row_chunk_ok[GGML_TYPE_COUNT][2]; // 0 = untested, 1 = ok, 2 = not ok
+
+bool row_chunks_ok(ggml_type t, from_float_t from_float, int64_t G) {
+    if ((int)t < 0 || (int)t >= GGML_TYPE_COUNT || !from_float) return false;
+    const int gi = G == 256 ? 1 : 0;
+    const auto v = g_row_chunk_ok[t][gi].load(std::memory_order_relaxed);
+    if (v) return v == 1;
+    bool ok = false;
+    const int64_t bs = ggml_blck_size(t);
+    if (bs > 0 && G % bs == 0) {
+        const int64_t L   = 4*G;
+        const size_t  rsG = ggml_row_size(t, G);
+        if (rsG > 0 && ggml_row_size(t, 2*G) == 2*rsG && ggml_row_size(t, L) == 4*rsG) {
+            std::vector<float> x(L);
+            const float scale[4] = {1.0f, 37.0f, 0.013f, 5.5f};
+            for (int64_t i = 0; i < L; ++i) {
+                x[i] = scale[i/G] * std::sin(0.37f*(float)i + 0.1f) * (float)(1 + i%7);
+            }
+            std::vector<char> a(4*rsG + 64, 0), b(4*rsG + 64, 0);
+            from_float(x.data(), a.data(), L);
+            for (int c = 0; c < 4; ++c) from_float(x.data() + c*G, b.data() + c*rsG, G);
+            ok = std::memcmp(a.data(), b.data(), 4*rsG) == 0;
+        }
+    }
+    g_row_chunk_ok[t][gi].store(ok ? 1 : 2, std::memory_order_relaxed);
+    return ok;
+}
+
+void quantize_f32_rows_mt(ggml_type t, from_float_t from_float, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
+        uint64_t nb1, uint64_t nb2, uint64_t nb3, const void * x, void * y, int ith, int nth, bool allow_chunks) {
+    const size_t  row_size = ggml_row_size(t, ne0);
+    const int64_t nrows    = ne1*ne2*ne3;
+    auto src_row = [&](int64_t r) {
+        const int64_t i3 = r/(ne1*ne2);
+        const int64_t i2 = (r - i3*ne1*ne2)/ne1;
+        const int64_t i1 = r - i3*ne1*ne2 - i2*ne1;
+        return (const float *)((const char *)x + i1*nb1 + i2*nb2 + i3*nb3);
+    };
+    int64_t G = 0;
+    if (allow_chunks && nth > 1 && nrows < nth) {
+        if (ne0 % 256 == 0 && nrows*(ne0/256) >= nth && row_chunks_ok(t, from_float, 256)) G = 256;
+        else if (ne0 % 128 == 0 && row_chunks_ok(t, from_float, 128)) G = 128;
+        else if (ne0 % 256 == 0 && row_chunks_ok(t, from_float, 256)) G = 256;
+        if (G && ggml_row_size(t, G)*(size_t)(ne0/G) != row_size) G = 0;
+    }
+    if (!G) {
+        for (int64_t r = nrows*ith/nth; r < nrows*(ith + 1)/nth; ++r) {
+            from_float(src_row(r), (char *)y + r*row_size, ne0);
+        }
+        return;
+    }
+    const int64_t nc  = ne0/G;
+    const size_t  rsG = ggml_row_size(t, G);
+    const int64_t nu  = nrows*nc;
+    for (int64_t u = nu*ith/nth; u < nu*(ith + 1)/nth; ++u) {
+        const int64_t r = u/nc, c = u - r*nc;
+        from_float(src_row(r) + c*G, (char *)y + r*row_size + c*rsG, G);
+    }
+}
+}
+
+void iqk_quantize_f32_rows_mt(int to_type, from_float_t from_float,
+                      int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
+                      uint64_t nb1, uint64_t nb2, uint64_t nb3,
+                      const void * x, void * y, int ith, int nth) {
+    auto t = ggml_type(to_type);
+    quantize_f32_rows_mt(t, from_float, ne0, ne1, ne2, ne3, nb1, nb2, nb3, x, y, ith, nth, num_rows(t) == 1);
+}
+
 void iqk_quantize_any(int from_type, int to_type,
                       int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
                       uint64_t nb0, uint64_t nb1, uint64_t nb2, uint64_t nb3,
@@ -354,6 +429,10 @@ void iqk_quantize_any(int from_type, int to_type,
     auto row_size_y = ggml_row_size(type_y, ne0);
     auto n_interleaved = num_rows(type_y);
     GGML_ASSERT(ne1 % n_interleaved == 0);
+    if (type_x == GGML_TYPE_F32 && n_interleaved == 1) {
+        quantize_f32_rows_mt(type_y, from_float, ne0, ne1, ne2, ne3, nb1, nb2, nb3, x, y, ith, nth, true);
+        return;
+    }
     int64_t ne1i  = ne1/n_interleaved;
     int64_t nrows = ne1i*ne2*ne3;
     int64_t nrows_per_thread = (nrows + nth - 1)/nth;

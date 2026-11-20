@@ -395,6 +395,13 @@ void iqk_quantize_any(int from_type, int to_type,
                       const void * GGML_RESTRICT x, void * GGML_RESTRICT y, void * work_buffer,
                       to_float_t to_float, from_float_t from_float, int ith, int nth);
 
+// quantize f32 rows (activations) into to_type, splitting rows into chunks across threads when
+// there are fewer rows than threads and the type allows it; dst rows are contiguous
+void iqk_quantize_f32_rows_mt(int to_type, from_float_t from_float,
+                      int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
+                      uint64_t nb1, uint64_t nb2, uint64_t nb3,
+                      const void * GGML_RESTRICT x, void * GGML_RESTRICT y, int ith, int nth);
+
 bool iqk_validate_tensor(const struct ggml_tensor * src);
 
 int  iqk_kt_codebook(int type, int bank, const int ** offsets, const int ** points, const float ** values, const float ** mid);

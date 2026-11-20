@@ -1252,7 +1252,7 @@ static inline bool llama_kv_qnext_seq_id_in_range(const llama_kv_cache & cache, 
     return n_slots > 0 && seq_id >= 0 && (uint32_t) seq_id < n_slots;
 }
 
-static void llama_mirror_kv_cache(struct llama_kv_cache & cache); // defined below, near llama_mirror_model_weights
+static void llama_mirror_kv_cache(struct llama_kv_cache & cache, const llama_hparams & hparams); // defined below, near llama_mirror_model_weights
 
 static bool llama_mtp_tail_uses_layer_cache(const llama_model & model) {
     return model.hparams.nextn_predict_layers > 0 &&
@@ -1839,7 +1839,7 @@ static bool llama_kv_cache_init(
 
     // NUMA mirror: duplicate the KV cache per node (writes are replicated in the graph; reads
     // are redirected per thread). Runs once the KV buffers exist and have been cleared.
-    llama_mirror_kv_cache(cache);
+    llama_mirror_kv_cache(cache, hparams);
 
     return true;
 }
@@ -9667,7 +9667,7 @@ static void llama_mirror_model_weights(const llama_model & model) {
 // Duplicate the KV cache buffers once per NUMA node and point each k_l/v_l tensor at its per-node
 // copies. The copies start zeroed (matching the just-cleared cache); subsequent writes are fanned
 // out to every node by ggml_numa_replicate_kv_write, and reads are redirected per thread.
-static void llama_mirror_kv_cache(struct llama_kv_cache & cache) {
+static void llama_mirror_kv_cache(struct llama_kv_cache & cache, const llama_hparams & hparams) {
     if (!ggml_numa_mirror_active() || !(ggml_numa_get_mirror() & GGML_NUMA_MIRROR_KV)) {
         return;
     }
@@ -9762,35 +9762,53 @@ static void llama_mirror_kv_cache(struct llama_kv_cache & cache) {
     LLAMA_LOG_INFO("%s: NUMA mirror: mirrored %d KV tensors across %d nodes\n", __func__, n_mirrored, n_nodes);
 
     // Recurrent (linear-attention) state: the fused delta-net op reads and writes the primary copy
-    // (tensor->data) in place, so the per-node copies are never read. The op splits the work into
-    // contiguous ranges of (sequence, head, row block) across threads, and threads are split into
-    // contiguous blocks per node, so node k processes roughly the k-th 1/n_nodes slice of each
-    // state tensor. Place those pages of the primary copy on node k: same data and layout, only
-    // the physical placement changes, so every other reader (checkpoints, save/restore) is unaffected.
+    // (tensor->data) in place, so per-node copies would never be read. Each row of a state tensor
+    // is one slot: [conv state | delta-net state, head-major (+ optional tail)]. The op splits
+    // (head, row block) work units over threads in contiguous ranges and threads are split into
+    // contiguous blocks per node, so node k processes the k-th 1/n_nodes range of heads of the
+    // active slot. Place those pages of every slot on node k: same data and layout, only the
+    // physical placement changes, so other readers (checkpoints, save/restore) are unaffected.
+    // The conv state stays where it is.
     int n_state_bound = 0;
-    for (auto * t : cache.s_l) {
-        if (!t || !t->data || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
-            continue;
-        }
-        const size_t    nbytes = ggml_nbytes(t);
-        const uintptr_t pg     = 4096;
-        const uintptr_t base   = (uintptr_t) t->data;
-        for (int n = 1; n < n_nodes; ++n) {
-            // whole pages only, aligned on absolute addresses: never move a page whose start
-            // belongs to the previous node's slice
-            uintptr_t a0 = base + (nbytes * n) / n_nodes;
-            uintptr_t a1 = base + (nbytes * (n + 1)) / n_nodes;
-            a0 = (a0 + pg - 1) & ~(pg - 1);
-            a1 = n + 1 == n_nodes ? ((base + nbytes) & ~(pg - 1)) : (a1 & ~(pg - 1));
-            if (a1 > a0) {
-                ggml_numa_bind((void *) a0, (size_t) (a1 - a0), n);
+    int n_state_rows  = 0;
+    if (hparams.use_qnext_state_layout && hparams.ssm_dt_rank > 0 && hparams.ssm_d_inner > 0) {
+        const size_t key_dim        = (size_t) hparams.ssm_d_state * hparams.ssm_n_group;
+        const size_t conv_dim       = 2*key_dim + hparams.ssm_d_inner;
+        const size_t conv_state_dim = (hparams.ssm_d_conv > 0 ? hparams.ssm_d_conv - 1 : 0) * conv_dim;
+        const size_t n_heads        = hparams.ssm_dt_rank;
+        const size_t head_v_dim     = hparams.ssm_d_inner / hparams.ssm_dt_rank;
+        const size_t head_bytes     = head_v_dim*head_v_dim*sizeof(float);
+        const uintptr_t pg = 4096;
+        auto rd = [pg](uintptr_t a) { return a & ~(pg - 1); };
+        auto ru = [pg](uintptr_t a) { return (a + pg - 1) & ~(pg - 1); };
+        for (auto * t : cache.s_l) {
+            if (!t || !t->data || !t->buffer || !ggml_backend_buffer_is_host(t->buffer) || t->type != GGML_TYPE_F32) {
+                continue;
             }
+            if ((size_t) t->ne[0] < conv_state_dim + n_heads*head_v_dim*head_v_dim) {
+                continue;
+            }
+            for (int64_t r = 0; r < t->ne[1]; ++r) {
+                const uintptr_t ssm = (uintptr_t) t->data + r*t->nb[1] + conv_state_dim*sizeof(float);
+                for (int n = 0; n < n_nodes; ++n) {
+                    const uintptr_t s0 = ssm + (n_heads*n/n_nodes)*head_bytes;
+                    const uintptr_t s1 = ssm + (n_heads*(n + 1)/n_nodes)*head_bytes;
+                    // a page shared by two nodes' ranges goes to the later node; never touch
+                    // pages before the delta-net state or past its end
+                    const uintptr_t a0 = ru(s0);
+                    const uintptr_t a1 = n + 1 == n_nodes ? rd(s1) : ru(s1);
+                    if (a1 > a0) {
+                        ggml_numa_bind((void *) a0, (size_t) (a1 - a0), n);
+                    }
+                }
+                ++n_state_rows;
+            }
+            ++n_state_bound;
         }
-        ++n_state_bound;
     }
     if (n_state_bound > 0) {
-        LLAMA_LOG_INFO("%s: NUMA mirror: placed %d recurrent state tensors across %d nodes by head range\n",
-                __func__, n_state_bound, n_nodes);
+        LLAMA_LOG_INFO("%s: NUMA mirror: placed delta-net state of %d tensors (%d slots) across %d nodes by head range\n",
+                __func__, n_state_bound, n_state_rows, n_nodes);
     }
 }
 

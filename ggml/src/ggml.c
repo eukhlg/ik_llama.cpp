@@ -19913,6 +19913,11 @@ static void ggml_compute_forward_mul_mat_id(
         assert(params->wsize >= ne13*nbw3);
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
+#if GGML_USE_IQK_MULMAT
+        // small batches: split rows into chunks so all threads share the quantization
+        iqk_quantize_f32_rows_mt(vec_dot_type, from_float, ne10, ne11, ne12, ne13, nb11, nb12, nb13,
+                src1->data, wdata, ith, nth);
+#else
         const int64_t nr1  = ne11*ne12*ne13;
         const int64_t dr1  = (nr1 + nth - 1)/nth;
         const int64_t ir10 = dr1*ith;
@@ -19926,6 +19931,7 @@ static void ggml_compute_forward_mul_mat_id(
                        (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
                        ne10);
         }
+#endif
     }
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ne12 + (i1)]
@@ -20253,6 +20259,11 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
         assert(params->wsize >= ne13*nbw3);
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
+#if GGML_USE_IQK_MULMAT
+        // small batches: split rows into chunks so all threads share the quantization
+        iqk_quantize_f32_rows_mt(vec_dot_type, from_float, ne10, ne11, ne12, ne13, nb11, nb12, nb13,
+                src1->data, wdata, ith, nth);
+#else
         const int64_t nr1  = ne11*ne12*ne13;
         const int64_t dr1  = (nr1 + nth - 1)/nth;
         const int64_t ir10 = dr1*ith;
@@ -20266,6 +20277,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
                        (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
                        ne10);
         }
+#endif
     }
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ne12 + (i1)]
@@ -20472,6 +20484,11 @@ static void ggml_compute_forward_mul_mat_up_gate(
     assert(params->wsize >= ne13*nbw3);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
+#if GGML_USE_IQK_MULMAT
+    // small batches: split rows into chunks so all threads share the quantization
+    iqk_quantize_f32_rows_mt(vec_dot_type, from_float, ne10, ne11, ne12, ne13, nb11, nb12, nb13,
+            src1->data, wdata, ith, nth);
+#else
     const int64_t nr1  = ne11*ne12*ne13;
     const int64_t dr1  = (nr1 + nth - 1)/nth;
     const int64_t ir10 = dr1*ith;
@@ -20485,6 +20502,7 @@ static void ggml_compute_forward_mul_mat_up_gate(
                    (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
                    ne10);
     }
+#endif
 
     ggml_barrier(params->shared);
 
