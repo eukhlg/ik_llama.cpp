@@ -5187,6 +5187,8 @@ struct ggml_numa_barrier_node {
     char pad0[GGML_NUMA_BARRIER_LINE - sizeof(atomic_int)];
     atomic_int release;
     char pad1[GGML_NUMA_BARRIER_LINE - sizeof(atomic_int)];
+    uint64_t   t_last; // barrier stats only: global last-arrival time, copied here by the node leader
+    char pad2[GGML_NUMA_BARRIER_LINE - sizeof(uint64_t)];
 };
 
 static struct {
@@ -5197,7 +5199,122 @@ static struct {
     int node_nth[GGML_NUMA_MAX_NODES];
     int n_leaders;
     int active;
+    char pad2[GGML_NUMA_BARRIER_LINE];
+    uint64_t t_last;    // barrier stats only: arrival time of the globally last thread
+    int      last_node; // barrier stats only: node of the globally last thread
 } g_numa_barrier;
+
+// ---------------------------------------------------------------------------
+// NUMA barrier statistics (opt-in): GGML_NUMA_BARRIER_STATS=<N> prints a per-op summary every
+// N graph computes. For every hierarchical barrier each thread records
+//   compute   = arrival - previous release           (its share of the op)
+//   imbalance = global last arrival - own arrival    (waiting for slower threads)
+//   handoff   = own release - global last arrival    (cost of the barrier mechanism)
+// and the node of the globally last thread. Accumulated thread-locally, merged per graph.
+// Off by default: one predictable branch per barrier.
+// ---------------------------------------------------------------------------
+#if defined(__x86_64__) || defined(_M_X64)
+#include <x86intrin.h>
+static inline uint64_t ggml_nbs_now(void) { return __rdtsc(); }
+#else
+static inline uint64_t ggml_nbs_now(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
+}
+#endif
+
+struct ggml_nbs_acc {
+    uint64_t n;
+    uint64_t compute;
+    uint64_t imbalance;
+    uint64_t handoff;
+    uint64_t last_node[GGML_NUMA_MAX_NODES];
+};
+
+static int      g_nbs_every = -1;   // -1: env not read yet, 0: off
+static double   g_nbs_tick_per_us = 1.0;
+static int64_t  g_nbs_graphs = 0;
+static int64_t  g_nbs_t0_us  = 0;
+static struct ggml_nbs_acc g_nbs[GGML_OP_COUNT];
+static atomic_flag g_nbs_lock = ATOMIC_FLAG_INIT;
+
+static GGML_THREAD_LOCAL struct ggml_nbs_acc tl_nbs[GGML_OP_COUNT];
+static GGML_THREAD_LOCAL uint64_t tl_nbs_prev  = 0; // release time of this thread's previous barrier
+static GGML_THREAD_LOCAL int      tl_nbs_op    = 0; // op of the node being computed
+static GGML_THREAD_LOCAL int      tl_nbs_dirty = 0;
+
+static void ggml_nbs_init(void) {
+    if (g_nbs_every >= 0) return;
+    const char * e = getenv("GGML_NUMA_BARRIER_STATS");
+    int every = e ? atoi(e) : 0;
+    if (every > 0) {
+        // calibrate ticks per microsecond against the monotonic clock (~20 ms)
+        struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
+        const uint64_t c0 = ggml_nbs_now();
+        do { clock_gettime(CLOCK_MONOTONIC, &b); }
+        while ((b.tv_sec - a.tv_sec)*1000000000ll + (b.tv_nsec - a.tv_nsec) < 20000000ll);
+        const uint64_t c1 = ggml_nbs_now();
+        const double us = ((b.tv_sec - a.tv_sec)*1000000000.0 + (b.tv_nsec - a.tv_nsec)) / 1000.0;
+        g_nbs_tick_per_us = (double)(c1 - c0) / us;
+        g_nbs_t0_us = ggml_time_us();
+        fprintf(stderr, "ggml: NUMA barrier stats enabled, report every %d graphs (%.1f ticks/us)\n",
+                every, g_nbs_tick_per_us);
+    }
+    g_nbs_every = every;
+}
+
+// called by every worker thread at the end of ggml_graph_compute_thread
+static void ggml_nbs_flush_thread(void) {
+    if (g_nbs_every <= 0 || !tl_nbs_dirty) return;
+    while (atomic_flag_test_and_set(&g_nbs_lock)) { sched_yield(); }
+    for (int op = 0; op < GGML_OP_COUNT; ++op) {
+        const struct ggml_nbs_acc * a = &tl_nbs[op];
+        if (!a->n) continue;
+        struct ggml_nbs_acc * g = &g_nbs[op];
+        g->n += a->n; g->compute += a->compute; g->imbalance += a->imbalance; g->handoff += a->handoff;
+        for (int k = 0; k < GGML_NUMA_MAX_NODES; ++k) g->last_node[k] += a->last_node[k];
+    }
+    atomic_flag_clear(&g_nbs_lock);
+    memset(tl_nbs, 0, sizeof(tl_nbs));
+    tl_nbs_dirty = 0;
+    tl_nbs_prev  = 0;
+}
+
+// called single-threaded at the end of ggml_graph_compute
+static void ggml_nbs_graph_done(int n_threads) {
+    if (g_nbs_every <= 0 || !g_numa_barrier.active) return;
+    if (++g_nbs_graphs % g_nbs_every != 0) return;
+    uint64_t tot_c = 0, tot_i = 0, tot_h = 0;
+    for (int op = 0; op < GGML_OP_COUNT; ++op) { tot_c += g_nbs[op].compute; tot_i += g_nbs[op].imbalance; tot_h += g_nbs[op].handoff; }
+    const double tot = (double)(tot_c + tot_i + tot_h);
+    if (tot <= 0) return;
+    const double tpu = g_nbs_tick_per_us;
+    const int    nn  = (int) g_state.numa.n_nodes;
+    fprintf(stderr, "\n=== NUMA barrier stats: %lld graphs, %d threads, %.1f s ===\n",
+            (long long) g_nbs_graphs, n_threads, (ggml_time_us() - g_nbs_t0_us) / 1e6);
+    fprintf(stderr, "thread time: compute %.1f%%  imbalance %.1f%%  handoff %.1f%%\n",
+            100.0*tot_c/tot, 100.0*tot_i/tot, 100.0*tot_h/tot);
+    fprintf(stderr, "%-24s %9s %10s %10s %10s %8s %8s", "op", "barriers", "compute_us", "imbal_us", "handoff_us", "imbal%", "hand%");
+    for (int k = 0; k < nn && k < GGML_NUMA_MAX_NODES; ++k) fprintf(stderr, "  last_n%d", k);
+    fprintf(stderr, "\n");
+    for (int op = 0; op < GGML_OP_COUNT; ++op) {
+        const struct ggml_nbs_acc * g = &g_nbs[op];
+        if (!g->n) continue;
+        const double n = (double) g->n;            // per-thread barrier passes
+        uint64_t nlast = 0;
+        for (int k = 0; k < GGML_NUMA_MAX_NODES; ++k) nlast += g->last_node[k];
+        fprintf(stderr, "%-24s %9llu %10.2f %10.2f %10.2f %7.1f%% %7.1f%%",
+                ggml_op_name((enum ggml_op) op), (unsigned long long) nlast,
+                g->compute/n/tpu, g->imbalance/n/tpu, g->handoff/n/tpu,
+                100.0*g->imbalance/tot, 100.0*g->handoff/tot);
+        for (int k = 0; k < nn && k < GGML_NUMA_MAX_NODES; ++k)
+            fprintf(stderr, "  %6.1f%%", nlast ? 100.0*g->last_node[k]/nlast : 0.0);
+        fprintf(stderr, "\n");
+    }
+    memset(g_nbs, 0, sizeof(g_nbs));
+    g_nbs_graphs = 0;
+    g_nbs_t0_us = ggml_time_us();
+}
 
 static GGML_THREAD_LOCAL int tl_numa_node = 0; // this thread's NUMA node (set in set_numa_thread_affinity)
 
@@ -5212,6 +5329,9 @@ static inline void ggml_numa_spin_pause(void) {
 static void ggml_numa_hier_barrier(void) {
     const int node    = tl_numa_node;
     const int node_nth = g_numa_barrier.node_nth[node];
+    const int stats   = g_nbs_every > 0;
+    const uint64_t t_arrive = stats ? ggml_nbs_now() : 0;
+    int last_global = 0;
 
     // ---- intra-node level (node-local cache line) ----
     if (node_nth > 1) {
@@ -5221,6 +5341,17 @@ static void ggml_numa_hier_barrier(void) {
             // follower: wait for this node's leader to release us
             while (atomic_load(&nb->release) == rel_old) {
                 ggml_numa_spin_pause();
+            }
+            if (stats) {
+                const uint64_t t_leave = ggml_nbs_now();
+                const uint64_t t_last  = nb->t_last;
+                struct ggml_nbs_acc * a = &tl_nbs[tl_nbs_op];
+                a->n++;
+                if (tl_nbs_prev && t_arrive > tl_nbs_prev) a->compute += t_arrive - tl_nbs_prev;
+                if (t_last > t_arrive) a->imbalance += t_last - t_arrive;
+                if (t_leave > t_last && t_last >= t_arrive) a->handoff += t_leave - t_last;
+                tl_nbs_prev  = t_leave;
+                tl_nbs_dirty = 1;
             }
             return;
         }
@@ -5233,6 +5364,11 @@ static void ggml_numa_hier_barrier(void) {
     if (n_leaders > 1) {
         const int g_old = atomic_load(&g_numa_barrier.global_release);
         if (atomic_fetch_add(&g_numa_barrier.global_arrive, 1) == n_leaders - 1) {
+            if (stats) {
+                g_numa_barrier.t_last    = t_arrive;
+                g_numa_barrier.last_node = node;
+                last_global = 1;
+            }
             atomic_store(&g_numa_barrier.global_arrive, 0);
             atomic_fetch_add(&g_numa_barrier.global_release, 1); // release all leaders
         } else {
@@ -5240,9 +5376,26 @@ static void ggml_numa_hier_barrier(void) {
                 ggml_numa_spin_pause();
             }
         }
+    } else if (stats) {
+        g_numa_barrier.t_last    = t_arrive;
+        g_numa_barrier.last_node = node;
+        last_global = 1;
     }
 
     // release this node's followers
+    if (stats) {
+        const uint64_t t_last = g_numa_barrier.t_last;
+        if (node_nth > 1) g_numa_barrier.node[node]->t_last = t_last; // published by the release below
+        const uint64_t t_leave = ggml_nbs_now();
+        struct ggml_nbs_acc * a = &tl_nbs[tl_nbs_op];
+        a->n++;
+        if (tl_nbs_prev && t_arrive > tl_nbs_prev) a->compute += t_arrive - tl_nbs_prev;
+        if (t_last > t_arrive) a->imbalance += t_last - t_arrive;
+        if (t_leave > t_last && t_last >= t_arrive) a->handoff += t_leave - t_last;
+        if (last_global && node < GGML_NUMA_MAX_NODES) a->last_node[node]++;
+        tl_nbs_prev  = t_leave;
+        tl_nbs_dirty = 1;
+    }
     if (node_nth > 1) {
         atomic_fetch_add(&g_numa_barrier.node[node]->release, 1);
     }
@@ -5570,6 +5723,7 @@ void ggml_numa_bind(void * ptr, size_t size, int node) {
 // Activates only when NUMA mirroring is on (threads are pinned per node, matching the block split
 // used by ggml_numa_node_for_thread); otherwise leaves the flat barrier in place.
 static void ggml_numa_barrier_setup(int n_threads) {
+    ggml_nbs_init();
     if (g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_MIRROR || g_state.numa.n_nodes < 2 || n_threads <= 1) {
         g_numa_barrier.active = 0;
         return;
@@ -31119,6 +31273,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #if IK_PRINT_TIMING
         int64_t tim1 = ggml_time_us();
 #endif
+        tl_nbs_op = node->op;
         node_n = ggml_compute_forward(&params, node, cgraph, node_n);
 #if IK_PRINT_TIMING
         int64_t tim2 = ggml_time_us();
@@ -31139,6 +31294,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     int64_t t_end = ggml_time_us();
     if (state->ith == 0) printf("ggml_barrier(...): %d us\n", (int)(t_end - t_start - t_eval));
 #endif
+
+    ggml_nbs_flush_thread();
 
     return 0;
 }
@@ -31239,6 +31396,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         }
     }
 #endif
+
+    ggml_nbs_graph_done(n_threads);
 
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
