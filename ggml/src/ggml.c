@@ -5242,6 +5242,15 @@ static GGML_THREAD_LOCAL struct ggml_nbs_acc tl_nbs[GGML_OP_COUNT];
 static GGML_THREAD_LOCAL uint64_t tl_nbs_prev  = 0; // release time of this thread's previous barrier
 static GGML_THREAD_LOCAL int      tl_nbs_op    = 0; // op of the node being computed
 static GGML_THREAD_LOCAL int      tl_nbs_dirty = 0;
+static GGML_THREAD_LOCAL int      tl_nbs_ith   = 0; // worker index, for the per-thread summary
+static GGML_THREAD_LOCAL uint64_t tl_nbs_last  = 0; // barriers where this thread arrived last overall
+static GGML_THREAD_LOCAL uint64_t tl_nbs_wait  = 0; // imbalance wait of this thread (ticks)
+static GGML_THREAD_LOCAL uint64_t tl_nbs_work  = 0; // compute time of this thread (ticks)
+
+#define GGML_NBS_MAX_THREADS 512
+static uint64_t g_nbs_thr_last[GGML_NBS_MAX_THREADS];
+static uint64_t g_nbs_thr_wait[GGML_NBS_MAX_THREADS];
+static uint64_t g_nbs_thr_work[GGML_NBS_MAX_THREADS];
 
 static void ggml_nbs_init(void) {
     if (g_nbs_every >= 0) return;
@@ -5274,7 +5283,13 @@ static void ggml_nbs_flush_thread(void) {
         g->n += a->n; g->compute += a->compute; g->imbalance += a->imbalance; g->handoff += a->handoff;
         for (int k = 0; k < GGML_NUMA_MAX_NODES; ++k) g->last_node[k] += a->last_node[k];
     }
+    if (tl_nbs_ith >= 0 && tl_nbs_ith < GGML_NBS_MAX_THREADS) {
+        g_nbs_thr_last[tl_nbs_ith] += tl_nbs_last;
+        g_nbs_thr_wait[tl_nbs_ith] += tl_nbs_wait;
+        g_nbs_thr_work[tl_nbs_ith] += tl_nbs_work;
+    }
     atomic_flag_clear(&g_nbs_lock);
+    tl_nbs_last = tl_nbs_wait = tl_nbs_work = 0;
     memset(tl_nbs, 0, sizeof(tl_nbs));
     tl_nbs_dirty = 0;
     tl_nbs_prev  = 0;
@@ -5310,6 +5325,22 @@ static void ggml_nbs_graph_done(int n_threads) {
         for (int k = 0; k < nn && k < GGML_NUMA_MAX_NODES; ++k)
             fprintf(stderr, "  %6.1f%%", nlast ? 100.0*g->last_node[k]/nlast : 0.0);
         fprintf(stderr, "\n");
+    }
+    {
+        uint64_t tot_last = 0;
+        for (int t = 0; t < n_threads && t < GGML_NBS_MAX_THREADS; ++t) tot_last += g_nbs_thr_last[t];
+        fprintf(stderr, "per thread: last = share of barriers where it arrived last; work/wait = avg us per barrier\n");
+        for (int t = 0; t < n_threads && t < GGML_NBS_MAX_THREADS; ++t) {
+            const double nbar = tot_last ? (double) tot_last : 1.0;
+            fprintf(stderr, "  t%-3d node %d  last %5.1f%%  work %7.2f  wait %7.2f%s",
+                    t, ggml_numa_node_for_thread(t, n_threads),
+                    tot_last ? 100.0*g_nbs_thr_last[t]/tot_last : 0.0,
+                    g_nbs_thr_work[t]/nbar/tpu, g_nbs_thr_wait[t]/nbar/tpu,
+                    (t % 3 == 2 || t == n_threads - 1) ? "\n" : "  |");
+        }
+        memset(g_nbs_thr_last, 0, sizeof(g_nbs_thr_last));
+        memset(g_nbs_thr_wait, 0, sizeof(g_nbs_thr_wait));
+        memset(g_nbs_thr_work, 0, sizeof(g_nbs_thr_work));
     }
     memset(g_nbs, 0, sizeof(g_nbs));
     g_nbs_graphs = 0;
@@ -5350,6 +5381,8 @@ static void ggml_numa_hier_barrier(void) {
                 if (tl_nbs_prev && t_arrive > tl_nbs_prev) a->compute += t_arrive - tl_nbs_prev;
                 if (t_last > t_arrive) a->imbalance += t_last - t_arrive;
                 if (t_leave > t_last && t_last >= t_arrive) a->handoff += t_leave - t_last;
+                if (tl_nbs_prev && t_arrive > tl_nbs_prev) tl_nbs_work += t_arrive - tl_nbs_prev;
+                if (t_last > t_arrive) tl_nbs_wait += t_last - t_arrive;
                 tl_nbs_prev  = t_leave;
                 tl_nbs_dirty = 1;
             }
@@ -5393,6 +5426,9 @@ static void ggml_numa_hier_barrier(void) {
         if (t_last > t_arrive) a->imbalance += t_last - t_arrive;
         if (t_leave > t_last && t_last >= t_arrive) a->handoff += t_leave - t_last;
         if (last_global && node < GGML_NUMA_MAX_NODES) a->last_node[node]++;
+        if (last_global) tl_nbs_last++;
+        if (tl_nbs_prev && t_arrive > tl_nbs_prev) tl_nbs_work += t_arrive - tl_nbs_prev;
+        if (t_last > t_arrive) tl_nbs_wait += t_last - t_arrive;
         tl_nbs_prev  = t_leave;
         tl_nbs_dirty = 1;
     }
@@ -31251,6 +31287,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
     set_numa_thread_affinity(state->ith, state->shared->n_threads);
     set_cpu_thread_affinity(cplan, state->ith); // explicit affinity takes precedence over NUMA
+    tl_nbs_ith = state->ith;
 
     struct ggml_compute_params params = {
         /*.ith   =*/ state->ith,
