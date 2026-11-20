@@ -5674,15 +5674,27 @@ static void ggml_numa_replicate_kv_write(const struct ggml_compute_params * para
     const int64_t n1    = dst->ne[1], n2 = dst->ne[2], n3 = dst->ne[3];
     const int64_t nrows = n1*n2*n3;
     const char *  base0 = (const char *) m->data[0]; // node 0 aliases the root tensor's data
-    for (int64_t r = ith; r < nrows; r += nth) {
-        const int64_t i1 = r % n1;
-        const int64_t i2 = (r / n1) % n2;
-        const int64_t i3 = r / (n1*n2);
+    // Split the copy by bytes, not by rows: a recurrent-state write is often a single large row,
+    // and striding by rows would leave thread 0 copying all of it while the others wait at the
+    // next barrier. Each thread copies one contiguous slice of the (nrows x run) byte range.
+    const size_t total = (size_t) nrows * run;
+    const size_t chunk = 64; // keep slice boundaries cache-line aligned
+    const size_t per   = ((total + nth - 1) / nth + chunk - 1) / chunk * chunk;
+    size_t       b     = MIN(total, (size_t) ith * per);
+    const size_t b_end = MIN(total, b + per);
+    while (b < b_end) {
+        const int64_t r   = (int64_t) (b / run);
+        const size_t  in  = b % run;
+        const size_t  len = MIN(run - in, b_end - b);
+        const int64_t i1  = r % n1;
+        const int64_t i2  = (r / n1) % n2;
+        const int64_t i3  = r / (n1*n2);
         char * row0 = (char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3];
-        const size_t off = (size_t) (row0 - base0);
+        const size_t off = (size_t) (row0 - base0) + in;
         for (int n = 1; n < nodes; ++n) {
-            memcpy((char *) m->data[n] + off, row0, run);
+            memcpy((char *) m->data[n] + off, row0 + in, len);
         }
+        b += len;
     }
 }
 
