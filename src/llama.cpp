@@ -3397,6 +3397,15 @@ static void llm_requantize_output_tensor(llama_model & model, ggml_type new_type
     model.output_mtp_ptr = std::move(new_output);
     model.output_mtp     = model.output_mtp_ptr.get();
 
+    // Opt-in: use the requantized head for the main pass as well. The head is read in full on
+    // every graph, so a smaller type saves memory bandwidth on each token; it changes the main
+    // logits slightly. The original tensor stays loaded (unused by the graph).
+    if (const char * e = getenv("LLAMA_OUTPUT_REQUANT_MAIN"); e && atoi(e) != 0) {
+        LLAMA_LOG_INFO("====== LLAMA_OUTPUT_REQUANT_MAIN: main pass uses %s output head (was %s)\n",
+                ggml_type_name(model.output_mtp->type), ggml_type_name(model.output->type));
+        model.output = model.output_mtp;
+    }
+
 }
 
 // Compute the combined wkv_b tensor of one layer from the current wk_b/wv_b
@@ -9660,6 +9669,44 @@ static void llama_mirror_model_weights(const llama_model & model) {
             ++n_mirrored;
         }
     }
+    // The requantized output head (-mtprot) lives in its own buffer created after loading, so it
+    // is not in model.bufs/ctxs. Mirror it too: it is read in full on every MTP draft step (and on
+    // every main pass with LLAMA_OUTPUT_REQUANT_MAIN=1).
+    ggml_tensor * extra_out = model.output_mtp_ptr.get();
+    if (extra_out && extra_out->data && extra_out->buffer && ggml_backend_buffer_is_host(extra_out->buffer)) {
+        llama_model::numa_mirror_buffer mb;
+        mb.buf  = extra_out->buffer;
+        mb.size = ggml_backend_buffer_get_size(extra_out->buffer);
+        void * base = ggml_backend_buffer_get_base(extra_out->buffer);
+        for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
+            mb.node_base[n] = NULL;
+        }
+        mb.node_base[0] = base;
+        ggml_numa_bind(base, mb.size, 0);
+        bool ok = true;
+        for (int n = 1; n < n_nodes; ++n) {
+            void * p = ggml_numa_alloc(mb.size, n);
+            if (!p) { ok = false; break; }
+            memcpy(p, base, mb.size);
+            mb.node_base[n] = p;
+        }
+        if (ok) {
+            const size_t offset = (const char *) extra_out->data - (const char *) base;
+            void * node_data[GGML_NUMA_MAX_NODES];
+            for (int n = 0; n < n_nodes; ++n) {
+                node_data[n] = (char *) mb.node_base[n] + offset;
+            }
+            ggml_numa_tensor_set_mirror(extra_out, node_data);
+            model.numa_mirror_bufs.push_back(mb);
+            ++n_mirrored;
+        } else {
+            for (int n = 1; n < n_nodes; ++n) {
+                ggml_numa_free(mb.node_base[n], mb.size);
+            }
+            LLAMA_LOG_WARN("%s: NUMA mirror: could not mirror %s\n", __func__, extra_out->name);
+        }
+    }
+
     LLAMA_LOG_INFO("%s: NUMA mirror: duplicated %d weight tensors across %d nodes\n",
             __func__, n_mirrored, n_nodes);
 }
