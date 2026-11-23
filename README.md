@@ -90,7 +90,7 @@ temperature 0.7) per MTP draft length; draft acceptance 84–88% throughout.
 | `--numa isolate`, 1 node, 12 threads | 33.07 | 34.34 | 34.93 |
 | `--numa distribute`, 24 threads | 32.10 | 32.51 | 36.19 |
 | mikechambers84 `numa-mirror` (July base), 24 threads | 46.00 | 46.10 | 48.14 |
-| this fork, `--numa mirror`, 24 threads | 51.40 | 51.48 | 53.62 |
+| this fork, `--numa mirror`, 24 threads | 52.22 | 52.26 | 52.55 |
 | this fork, `--numa mirror -mtprot iq4_xs -cr 0-23`, 24 threads | **55.35** | **54.58** | **55.65** |
 
 Mirror gives 1.59–1.67× over a single node; `distribute` without mirroring gives no gain.
