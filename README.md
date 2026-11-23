@@ -21,6 +21,9 @@ keeps it up to date, and adds:
 - **Shared small-batch activation quantization:** with 1–3 tokens per graph (token
   generation, MTP), quantizing the activations is split into row chunks across all threads
   instead of one row per thread.
+- **Split-K attention for multi-token decode:** with MTP, decode graphs verify 2–3 tokens; the
+  KV cache is now split across all threads for 2–7 query tokens too (previously only for one),
+  so generation speed holds up at long context.
 - **Barrier diagnostics:** `GGML_NUMA_BARRIER_STATS=<N>` prints, every N graphs, how thread
   time splits into compute, imbalance and barrier handoff, per op and per thread.
 
@@ -91,9 +94,19 @@ temperature 0.7) per MTP draft length; draft acceptance 84–88% throughout.
 | `--numa distribute`, 24 threads | 32.10 | 32.51 | 36.19 |
 | mikechambers84 `numa-mirror` (July base), 24 threads | 46.00 | 46.10 | 48.14 |
 | this fork, `--numa mirror`, 24 threads | 52.22 | 52.26 | 52.55 |
-| this fork, `--numa mirror -mtprot iq4_xs -cr 0-23`, 24 threads | **55.35** | **54.58** | **55.65** |
+| this fork, `--numa mirror -mtprot iq4_xs -cr 0-23`, 24 threads | **53.16** | **56.02** | **57.20** |
 
-Mirror gives 1.59–1.67× over a single node; `distribute` without mirroring gives no gain.
+Mirror gives 1.52–1.64× over a single node; `distribute` without mirroring gives no gain.
+
+**Long context** (`--numa mirror -mtprot iq4_xs -cr 0-23`, MTP draft 2, `-c 65536`, 256 tokens
+generated, median of 3):
+
+| Prompt tokens | Gen tok/s, split-K attention | Gen tok/s, previous path | Prompt tok/s |
+|---|---|---|---|
+| ~500 | 51.40 | 45.90 | 477 |
+| ~3,000 | 49.59 | 45.29 | 479 |
+| ~7,000 | 45.70 | 38.67 | 441 |
+| ~14,000 | 44.79 | 26.70 | 377 |
 
 ---
 
