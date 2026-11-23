@@ -31300,6 +31300,117 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
     return cplan;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Barrier-free op chains (roadmap 3.2). Both reuse the existing kernels unchanged, so results are
+// bit-identical; they only drop barriers between ops that do not need them.
+//
+// 1) Row-local chains: these ops split their output rows over threads the same way (ceil rows per
+//    thread, thread t owns rows [t*dr, (t+1)*dr)), and the follower reads its producer only row by
+//    row. So a thread can go on to the follower's rows right away: they are rows it wrote itself.
+
+static int ggml_next_compute_node(const struct ggml_cgraph * cgraph, int i) {
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        if (!ggml_is_noop(cgraph->nodes[j])) return j;
+    }
+    return -1;
+}
+
+// true if `t` writes its rows with the ceil row split over ggml_nrows(t) (dst rows)
+static bool ggml_rowchain_producer(const struct ggml_tensor * t) {
+    if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous_1(t)) return false;
+    switch (t->op) {
+        case GGML_OP_ADD:
+            return t->src[0]->type == GGML_TYPE_F32 && t->src[1]->type == GGML_TYPE_F32 &&
+                   ggml_are_same_shape(t->src[0], t->src[1]) && t->src[1]->nb[0] == sizeof(float);
+        case GGML_OP_FUSED_RMS_NORM:
+            return t->src[1] != NULL && t->op_params[1] <= 1 && t->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_MUL_MULTI_ADD:
+            return ggml_nrows(t) == t->ne[1];
+        case GGML_OP_FUSED_MUL_UNARY:
+            // only the broadcast-gate branch splits by rows; the same-shape branch may split by blocks
+            return t->src[1] != NULL && !ggml_are_same_shape(t->src[0], t->src[1]);
+        default:
+            return false;
+    }
+}
+
+// true if `y` can run right after `x` on the same thread without a barrier
+static bool ggml_rowchain_follower(const struct ggml_tensor * x, const struct ggml_tensor * y) {
+    if (y->type != GGML_TYPE_F32 || !ggml_is_contiguous_1(y)) return false;
+    if (ggml_nrows(y) != ggml_nrows(x) || y->ne[0] != x->ne[0]) return false;
+    // y must not overwrite an input that other threads may still be reading for x
+    for (int k = 0; k < GGML_MAX_SRC && x->src[k]; ++k) {
+        if (x->src[k]->data == y->data) return false;
+    }
+    switch (y->op) {
+        case GGML_OP_ADD:
+            return (y->src[0] == x || y->src[1] == x) && ggml_rowchain_producer(y);
+        case GGML_OP_FUSED_RMS_NORM:
+            return y->src[0] == x && ggml_rowchain_producer(y);
+        default:
+            return false;
+    }
+}
+
+static int ggml_rowchain_continue(struct ggml_compute_params * params, const struct ggml_cgraph * cgraph, int i) {
+    for (;;) {
+        const struct ggml_tensor * x = cgraph->nodes[i];
+        if (!ggml_rowchain_producer(x)) return i;
+        const int j = ggml_next_compute_node(cgraph, i);
+        if (j < 0) return i;
+        struct ggml_tensor * y = cgraph->nodes[j];
+        if (!ggml_rowchain_follower(x, y)) return i;
+        if (y->op == GGML_OP_ADD) {
+            ggml_compute_forward_add(params, y);
+        } else {
+            ggml_compute_forward_fused_rms_norm(params, y);
+        }
+        i = j;
+    }
+}
+
+// 2) Tiny elementwise chains, e.g. the delta-net gate: ADD (bias) -> UNARY (softplus) -> MUL, on
+//    n_heads x n_tokens values. Thread 0 runs all three with nth = 1; one barrier instead of three.
+#define GGML_TINY_CHAIN_MAX 4096
+
+static bool ggml_tiny_f32(const struct ggml_tensor * t) {
+    return t->type == GGML_TYPE_F32 && ggml_nelements(t) <= GGML_TINY_CHAIN_MAX;
+}
+
+static int ggml_tiny_chain(struct ggml_compute_params * params, const struct ggml_cgraph * cgraph, int i) {
+    struct ggml_tensor * a = cgraph->nodes[i];
+    if (a->op != GGML_OP_ADD || !ggml_tiny_f32(a) ||
+        a->src[0]->type != GGML_TYPE_F32 || a->src[1]->type != GGML_TYPE_F32) return -1;
+    const int j = ggml_next_compute_node(cgraph, i);
+    if (j < 0) return -1;
+    struct ggml_tensor * u = cgraph->nodes[j];
+    if (u->op != GGML_OP_UNARY || u->src[0] != a || !ggml_tiny_f32(u)) return -1;
+    const int k = ggml_next_compute_node(cgraph, j);
+    if (k < 0) return -1;
+    struct ggml_tensor * m = cgraph->nodes[k];
+    if (m->op != GGML_OP_MUL || (m->src[0] != u && m->src[1] != u) || !ggml_tiny_f32(m) ||
+        m->src[0]->type != GGML_TYPE_F32 || m->src[1]->type != GGML_TYPE_F32) return -1;
+    if (params->ith == 0) {
+        struct ggml_compute_params p1 = *params;
+        p1.ith = 0;
+        p1.nth = 1;
+        ggml_compute_forward_add(&p1, a);
+        ggml_compute_forward_unary(&p1, u);
+        ggml_compute_forward_mul(&p1, m);
+    }
+    return k;
+}
+
+// GGML_NO_CHAIN_FUSION=1 disables both (A/B testing)
+static bool ggml_chain_fusion_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * e = getenv("GGML_NO_CHAIN_FUSION");
+        enabled = !(e && atoi(e) != 0);
+    }
+    return enabled;
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
 
@@ -31323,6 +31434,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     int64_t t_eval  = 0;
 #endif
 
+    const bool chain_fusion = ggml_chain_fusion_enabled();
+
     for (int node_n = 0; node_n < cgraph->n_nodes; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -31332,7 +31445,17 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         int64_t tim1 = ggml_time_us();
 #endif
         tl_nbs_op = node->op;
-        node_n = ggml_compute_forward(&params, node, cgraph, node_n);
+        if (chain_fusion) {
+            const int k = ggml_tiny_chain(&params, cgraph, node_n);
+            if (k >= 0) {
+                node_n = k;
+            } else {
+                node_n = ggml_compute_forward(&params, node, cgraph, node_n);
+                node_n = ggml_rowchain_continue(&params, cgraph, node_n);
+            }
+        } else {
+            node_n = ggml_compute_forward(&params, node, cgraph, node_n);
+        }
 #if IK_PRINT_TIMING
         int64_t tim2 = ggml_time_us();
         t_eval += tim2 - tim1;
