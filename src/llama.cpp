@@ -125,6 +125,10 @@ void llama_set_mtp_n_heads(struct llama_context * ctx, int32_t mtp_n_heads);
 #include <unordered_set>
 #include <sstream>
 #include <thread>
+#if defined(__linux__)
+#include <sched.h>
+#include <pthread.h>
+#endif
 #include <type_traits>
 #include <unordered_map>
 #include <regex>
@@ -1252,7 +1256,7 @@ static inline bool llama_kv_qnext_seq_id_in_range(const llama_kv_cache & cache, 
     return n_slots > 0 && seq_id >= 0 && (uint32_t) seq_id < n_slots;
 }
 
-static void llama_mirror_kv_cache(struct llama_kv_cache & cache, const llama_hparams & hparams); // defined below, near llama_mirror_model_weights
+static bool llama_mirror_kv_cache(struct llama_kv_cache & cache, const llama_hparams & hparams); // defined below, near llama_mirror_model_weights
 
 static bool llama_mtp_tail_uses_layer_cache(const llama_model & model) {
     return model.hparams.nextn_predict_layers > 0 &&
@@ -1839,7 +1843,9 @@ static bool llama_kv_cache_init(
 
     // NUMA mirror: duplicate the KV cache per node (writes are replicated in the graph; reads
     // are redirected per thread). Runs once the KV buffers exist and have been cleared.
-    llama_mirror_kv_cache(cache, hparams);
+    if (!llama_mirror_kv_cache(cache, hparams)) {
+        return false;
+    }
 
     return true;
 }
@@ -9574,19 +9580,119 @@ static size_t llama_get_available_ram_bytes() {
 static size_t llama_get_available_ram_bytes() { return 0; }
 #endif
 
+// NUMA mirror: by default a mirror that cannot be built (not enough RAM, allocation failure)
+// fails context creation, so a server never comes up silently at single-node speed.
+// LLAMA_NUMA_MIRROR_FALLBACK=1 restores the old behaviour: warn and continue without it.
+static bool llama_numa_mirror_fallback() {
+    const char * e = getenv("LLAMA_NUMA_MIRROR_FALLBACK");
+    return e && atoi(e) != 0;
+}
+
+// CPUs of a NUMA node that this process may run on (empty if unknown)
+static std::vector<int> llama_numa_node_cpus(int node) {
+    std::vector<int> cpus;
+#if defined(__linux__)
+    std::ifstream f("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist");
+    std::string line;
+    if (!std::getline(f, line)) {
+        return cpus;
+    }
+    size_t pos = 0;
+    while (pos < line.size()) {
+        size_t comma = line.find(',', pos);
+        std::string part = line.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        int a = 0, b = 0;
+        if (sscanf(part.c_str(), "%d-%d", &a, &b) == 2) {
+            for (int c = a; c <= b; ++c) cpus.push_back(c);
+        } else if (sscanf(part.c_str(), "%d", &a) == 1) {
+            cpus.push_back(a);
+        }
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
+        std::vector<int> ok;
+        for (int c : cpus) {
+            if (c >= 0 && c < CPU_SETSIZE && CPU_ISSET(c, &allowed)) ok.push_back(c);
+        }
+        cpus.swap(ok);
+    }
+#else
+    GGML_UNUSED(node);
+#endif
+    return cpus;
+}
+
+// Run fn(begin, end) over [0, size) split into 2 MiB-aligned chunks, on threads pinned to the
+// CPUs of `node` (one per CPU, at most 16). Copying / zeroing / migrating 20+ GB on one thread
+// is page-fault and zeroing bound (~1 GB/s); the node's own threads do it in parallel and
+// write node-locally.
+static void llama_numa_parallel_range(int node, size_t size, const std::function<void(size_t, size_t)> & fn) {
+    const size_t align = 2u << 20;
+    std::vector<int> cpus = llama_numa_node_cpus(node);
+    size_t nt = cpus.empty() ? 8 : cpus.size();
+    nt = std::min<size_t>(nt, 16);
+    nt = std::max<size_t>(1, std::min<size_t>(nt, size / align));
+    if (nt == 1) {
+        fn(0, size);
+        return;
+    }
+    std::vector<std::thread> workers;
+    workers.reserve(nt);
+    for (size_t t = 0; t < nt; ++t) {
+        const size_t b = t == 0      ? 0    : ((size * t) / nt) & ~(align - 1);
+        const size_t e = t + 1 == nt ? size : ((size * (t + 1)) / nt) & ~(align - 1);
+        if (e <= b) continue;
+        const int cpu = cpus.empty() ? -1 : cpus[t % cpus.size()];
+        workers.emplace_back([&fn, b, e, cpu]() {
+#if defined(__linux__)
+            if (cpu >= 0) {
+                cpu_set_t m;
+                CPU_ZERO(&m);
+                CPU_SET(cpu, &m);
+                pthread_setaffinity_np(pthread_self(), sizeof(m), &m);
+            }
+#else
+            GGML_UNUSED(cpu);
+#endif
+            fn(b, e);
+        });
+    }
+    for (auto & w : workers) w.join();
+}
+
+// Allocate a node-bound copy of [src, src + size) on `node`, filled in parallel by that node's threads
+static void * llama_numa_copy_to_node(const void * src, size_t size, int node) {
+    void * p = ggml_numa_alloc(size, node);
+    if (!p) return nullptr;
+    llama_numa_parallel_range(node, size, [p, src](size_t b, size_t e) {
+        memcpy((char *) p + b, (const char *) src + b, e - b);
+    });
+    return p;
+}
+
+// Migrate [ptr, ptr + size) onto `node` in parallel (best effort)
+static void llama_numa_bind_parallel(void * ptr, size_t size, int node) {
+    llama_numa_parallel_range(node, size, [ptr, node](size_t b, size_t e) {
+        ggml_numa_bind((char *) ptr + b, e - b, node);
+    });
+}
+
 // Duplicate the model's host weight buffers once per NUMA node and point each weight tensor at its
 // per-node copies (see ggml_numa_tensor_data). Must run AFTER all weight repacking (load-time and
 // the context-time up/gate merge) so the mirrored bytes are final. Idempotent per model.
-static void llama_mirror_model_weights(const llama_model & model) {
+static bool llama_mirror_model_weights(const llama_model & model) {
     if (!ggml_numa_mirror_active() || !(ggml_numa_get_mirror() & GGML_NUMA_MIRROR_WEIGHTS)) {
-        return;
+        return true;
     }
     if (!model.numa_mirror_bufs.empty()) {
-        return; // already mirrored (e.g. a second context created on the same model)
+        return true; // already mirrored (e.g. a second context created on the same model)
     }
     const int n_nodes = ggml_numa_node_count();
     if (n_nodes < 2) {
-        return;
+        return true;
     }
 
     size_t total_host = 0;
@@ -9596,7 +9702,7 @@ static void llama_mirror_model_weights(const llama_model & model) {
         }
     }
     if (total_host == 0) {
-        return;
+        return true;
     }
 
     const size_t extra_needed = total_host * (size_t) (n_nodes - 1); // node 0 reuses the original
@@ -9604,11 +9710,18 @@ static void llama_mirror_model_weights(const llama_model & model) {
     LLAMA_LOG_INFO("%s: NUMA mirror: %d nodes, host weights %.2f GiB; need +%.2f GiB for mirrors (%.2f GiB available)\n",
             __func__, n_nodes, total_host/1073741824.0, extra_needed/1073741824.0, avail/1073741824.0);
     if (avail > 0 && extra_needed + (2ull << 30) > avail) {
-        LLAMA_LOG_WARN("%s: NUMA mirror: insufficient free RAM to duplicate weights across %d nodes; "
-                "continuing WITHOUT weight mirroring\n", __func__, n_nodes);
-        return;
+        if (llama_numa_mirror_fallback()) {
+            LLAMA_LOG_WARN("%s: NUMA mirror: insufficient free RAM to duplicate weights across %d nodes; "
+                    "continuing WITHOUT weight mirroring (LLAMA_NUMA_MIRROR_FALLBACK)\n", __func__, n_nodes);
+            return true;
+        }
+        LLAMA_LOG_ERROR("%s: NUMA mirror: insufficient free RAM to duplicate weights across %d nodes "
+                "(need +%.2f GiB, %.2f GiB available). Free RAM, or set LLAMA_NUMA_MIRROR_FALLBACK=1 "
+                "to run without mirroring.\n", __func__, n_nodes, extra_needed/1073741824.0, avail/1073741824.0);
+        return false;
     }
 
+    const int64_t t_mirror_start = ggml_time_us();
     // allocate per-node copies of each host weight buffer
     for (auto buf : model.bufs) {
         if (!buf || !ggml_backend_buffer_is_host(buf)) {
@@ -9621,13 +9734,12 @@ static void llama_mirror_model_weights(const llama_model & model) {
         for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
             mb.node_base[n] = NULL;
         }
-        mb.node_base[0] = base;                 // node 0 aliases the original buffer ...
-        ggml_numa_bind(base, mb.size, 0);       // ... migrated onto node 0 (best effort)
+        mb.node_base[0] = base;                       // node 0 aliases the original buffer ...
+        llama_numa_bind_parallel(base, mb.size, 0);   // ... migrated onto node 0 (best effort)
         bool ok = true;
         for (int n = 1; n < n_nodes; ++n) {
-            void * p = ggml_numa_alloc(mb.size, n);
+            void * p = llama_numa_copy_to_node(base, mb.size, n); // MPOL_BIND: pages land on node n
             if (!p) { ok = false; break; }
-            memcpy(p, base, mb.size);           // MPOL_BIND places these faulted pages on node n
             mb.node_base[n] = p;
         }
         if (!ok) {
@@ -9640,8 +9752,14 @@ static void llama_mirror_model_weights(const llama_model & model) {
                 }
             }
             model.numa_mirror_bufs.clear();
-            LLAMA_LOG_WARN("%s: NUMA mirror: allocation failed; continuing WITHOUT weight mirroring\n", __func__);
-            return;
+            if (llama_numa_mirror_fallback()) {
+                LLAMA_LOG_WARN("%s: NUMA mirror: allocation failed; continuing WITHOUT weight mirroring "
+                        "(LLAMA_NUMA_MIRROR_FALLBACK)\n", __func__);
+                return true;
+            }
+            LLAMA_LOG_ERROR("%s: NUMA mirror: allocation of the per-node weight copies failed. "
+                    "Set LLAMA_NUMA_MIRROR_FALLBACK=1 to run without mirroring.\n", __func__);
+            return false;
         }
         model.numa_mirror_bufs.push_back(mb);
     }
@@ -9682,12 +9800,11 @@ static void llama_mirror_model_weights(const llama_model & model) {
             mb.node_base[n] = NULL;
         }
         mb.node_base[0] = base;
-        ggml_numa_bind(base, mb.size, 0);
+        llama_numa_bind_parallel(base, mb.size, 0);
         bool ok = true;
         for (int n = 1; n < n_nodes; ++n) {
-            void * p = ggml_numa_alloc(mb.size, n);
+            void * p = llama_numa_copy_to_node(base, mb.size, n);
             if (!p) { ok = false; break; }
-            memcpy(p, base, mb.size);
             mb.node_base[n] = p;
         }
         if (ok) {
@@ -9707,23 +9824,24 @@ static void llama_mirror_model_weights(const llama_model & model) {
         }
     }
 
-    LLAMA_LOG_INFO("%s: NUMA mirror: duplicated %d weight tensors across %d nodes\n",
-            __func__, n_mirrored, n_nodes);
+    LLAMA_LOG_INFO("%s: NUMA mirror: duplicated %d weight tensors across %d nodes in %.1f s\n",
+            __func__, n_mirrored, n_nodes, (ggml_time_us() - t_mirror_start)*1e-6);
+    return true;
 }
 
 // Duplicate the KV cache buffers once per NUMA node and point each k_l/v_l tensor at its per-node
 // copies. The copies start zeroed (matching the just-cleared cache); subsequent writes are fanned
 // out to every node by ggml_numa_replicate_kv_write, and reads are redirected per thread.
-static void llama_mirror_kv_cache(struct llama_kv_cache & cache, const llama_hparams & hparams) {
+static bool llama_mirror_kv_cache(struct llama_kv_cache & cache, const llama_hparams & hparams) {
     if (!ggml_numa_mirror_active() || !(ggml_numa_get_mirror() & GGML_NUMA_MIRROR_KV)) {
-        return;
+        return true;
     }
     if (!cache.numa_mirror_bufs.empty()) {
-        return; // already mirrored
+        return true; // already mirrored
     }
     const int n_nodes = ggml_numa_node_count();
     if (n_nodes < 2) {
-        return;
+        return true;
     }
 
     size_t total = 0;
@@ -9733,7 +9851,7 @@ static void llama_mirror_kv_cache(struct llama_kv_cache & cache, const llama_hpa
         }
     }
     if (total == 0) {
-        return;
+        return true;
     }
 
     const size_t extra = total * (size_t) (n_nodes - 1);
@@ -9741,8 +9859,15 @@ static void llama_mirror_kv_cache(struct llama_kv_cache & cache, const llama_hpa
     LLAMA_LOG_INFO("%s: NUMA mirror: KV cache %.2f GiB; +%.2f GiB for %d-node mirror (%.2f GiB available)\n",
             __func__, total/1073741824.0, extra/1073741824.0, n_nodes, avail/1073741824.0);
     if (avail > 0 && extra + (2ull << 30) > avail) {
-        LLAMA_LOG_WARN("%s: NUMA mirror: insufficient RAM to mirror the KV cache; continuing WITHOUT KV mirror\n", __func__);
-        return;
+        if (llama_numa_mirror_fallback()) {
+            LLAMA_LOG_WARN("%s: NUMA mirror: insufficient RAM to mirror the KV cache; continuing WITHOUT KV mirror "
+                    "(LLAMA_NUMA_MIRROR_FALLBACK)\n", __func__);
+            return true;
+        }
+        LLAMA_LOG_ERROR("%s: NUMA mirror: insufficient RAM to mirror the KV cache (need +%.2f GiB, %.2f GiB "
+                "available). Free RAM, lower -c, or set LLAMA_NUMA_MIRROR_FALLBACK=1.\n",
+                __func__, extra/1073741824.0, avail/1073741824.0);
+        return false;
     }
 
     for (auto buf : cache.bufs) {
@@ -9757,7 +9882,7 @@ static void llama_mirror_kv_cache(struct llama_kv_cache & cache, const llama_hpa
             mb.node_base[n] = NULL;
         }
         mb.node_base[0] = base;            // node 0 aliases the original (cleared) buffer
-        ggml_numa_bind(base, mb.size, 0);  // best-effort migrate it onto node 0
+        llama_numa_bind_parallel(base, mb.size, 0);  // best-effort migrate it onto node 0
         bool ok = true;
         for (int n = 1; n < n_nodes; ++n) {
             void * p = ggml_numa_alloc(mb.size, n); // mmap(ANON) is zero-filled, matching the cleared buffer
@@ -9765,7 +9890,7 @@ static void llama_mirror_kv_cache(struct llama_kv_cache & cache, const llama_hpa
             // fault the pages now (and place them node-locally) so this allocation actually counts
             // against MemAvailable; otherwise the weight-mirror RAM check can't see this reservation
             // and combined over-subscription would surface as a mid-decode SIGBUS instead of here.
-            memset(p, 0, mb.size);
+            llama_numa_parallel_range(n, mb.size, [p](size_t b, size_t e) { memset((char *) p + b, 0, e - b); });
             mb.node_base[n] = p;
         }
         if (!ok) {
@@ -9778,8 +9903,14 @@ static void llama_mirror_kv_cache(struct llama_kv_cache & cache, const llama_hpa
                 }
             }
             cache.numa_mirror_bufs.clear();
-            LLAMA_LOG_WARN("%s: NUMA mirror: KV allocation failed; continuing WITHOUT KV mirror\n", __func__);
-            return;
+            if (llama_numa_mirror_fallback()) {
+                LLAMA_LOG_WARN("%s: NUMA mirror: KV allocation failed; continuing WITHOUT KV mirror "
+                        "(LLAMA_NUMA_MIRROR_FALLBACK)\n", __func__);
+                return true;
+            }
+            LLAMA_LOG_ERROR("%s: NUMA mirror: KV allocation failed. Set LLAMA_NUMA_MIRROR_FALLBACK=1 to run "
+                    "without the KV mirror.\n", __func__);
+            return false;
         }
         cache.numa_mirror_bufs.push_back(mb);
     }
@@ -9857,6 +9988,7 @@ static void llama_mirror_kv_cache(struct llama_kv_cache & cache, const llama_hpa
         LLAMA_LOG_INFO("%s: NUMA mirror: placed delta-net state of %d tensors (%d slots) across %d nodes by head range\n",
                 __func__, n_state_bound, n_state_rows, n_nodes);
     }
+    return true;
 }
 
 static void llama_repack_up_gate_exps(llama_context & lctx) {
@@ -10720,7 +10852,11 @@ struct llama_context * llama_init_from_model(
             llama_repack_up_gate_exps(*ctx);
 
             // NUMA mirror: duplicate the (now final) weights per node before building graphs
-            llama_mirror_model_weights(ctx->model);
+            if (!llama_mirror_model_weights(ctx->model)) {
+                LLAMA_LOG_ERROR("%s: NUMA mirror of the model weights failed\n", __func__);
+                llama_free(ctx);
+                return nullptr;
+            }
 
             if (cparams.moe_cache_size > 0) {
                 try {
