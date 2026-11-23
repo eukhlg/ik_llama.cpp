@@ -7,8 +7,22 @@ multi-socket / multi-NUMA-node servers.
 
 The NUMA mirroring code is borrowed from the upstream
 [mikechambers84/ik_llama.cpp](https://github.com/mikechambers84/ik_llama.cpp/tree/numa-mirror)
-`numa-mirror` branch by Mike Chambers. This fork merges it into current ik_llama.cpp `main`
-and keeps it up to date, with fixes for code paths added to ik_llama.cpp since then.
+`numa-mirror` branch by Mike Chambers. This fork merges it into current ik_llama.cpp `main`,
+keeps it up to date, and adds:
+
+- **Coverage of newer ik_llama.cpp code paths:** the expert-chunking MoE kernels and fused
+  up/gate ops read the node-local weight copies; the `-mtprot` requantized MTP output head
+  is mirrored too.
+- **Parallel KV/state replication:** writes to the mirrored KV cache and recurrent state are
+  split across all threads by bytes instead of by rows.
+- **Faster delta-net (Qwen3-Next / Qwen3.5 / Qwen3.6 linear attention):** work is balanced
+  by (head, row block), with an AVX-512 path, and each slot's recurrent state is placed on
+  the NUMA node that processes its heads.
+- **Shared small-batch activation quantization:** with 1–3 tokens per graph (token
+  generation, MTP), quantizing the activations is split into row chunks across all threads
+  instead of one row per thread.
+- **Barrier diagnostics:** `GGML_NUMA_BARRIER_STATS=<N>` prints, every N graphs, how thread
+  time splits into compute, imbalance and barrier handoff, per op and per thread.
 
 ## What it does
 
@@ -54,8 +68,32 @@ has to fit that many times. Because of this, `--numa mirror` implies `--no-mmap`
   `echo 0 | sudo tee /proc/sys/kernel/numa_balancing`.
 - **Thread count:** token generation is memory-bandwidth bound and may peak *below* the full
   physical-core count; it can be worth sweeping `-t` to find the sweet spot for your machine.
+- **Pin threads to CPUs:** add `-cr <cpus>` (e.g. `-cr 0-23`) so thread *i* runs on the
+  *i*-th listed CPU. List node 0's CPUs first, then node 1's, matching the mirror's
+  split of threads into one block per node. This cut barrier imbalance from 23.5% to
+  16.7% of thread time in our tests.
 
 See [`examples/main/README.md`](examples/main/README.md) for the full list of `--numa` modes.
+
+## Benchmarks
+
+**Setup:** Dell PowerEdge R650xs, 2× Xeon Gold 6326, VMware ESXi VM with 24 vCPU / 64 GB
+in 2 vNUMA nodes (12 vCPU each); Docker container pinned with `--cpuset-cpus 0-23
+--cpuset-mems 0,1 --cap-add SYS_NICE`. Model: Qwen3.6-35B-A3B Q4_K_M (20.2 GiB) with MTP
+speculative decoding (`--spec-type mtp:n_max=N,p_min=0.75`), `llama-server -c 8192 -np 1 -rtr`.
+
+**Method:** generation tok/s, median of 9 samples (3 prompts × 3 runs, 256 tokens,
+temperature 0.7) per MTP draft length; draft acceptance 84–88% throughout.
+
+| Configuration | draft 1 | draft 2 | draft 3 |
+|---|---|---|---|
+| `--numa isolate`, 1 node, 12 threads | 33.07 | 34.34 | 34.93 |
+| `--numa distribute`, 24 threads | 32.10 | 32.51 | 36.19 |
+| mikechambers84 `numa-mirror` (July base), 24 threads | 46.00 | 46.10 | 48.14 |
+| this fork, `--numa mirror`, 24 threads | 51.40 | 51.48 | 53.62 |
+| this fork, `--numa mirror -mtprot iq4_xs -cr 0-23`, 24 threads | **55.35** | **54.58** | **55.65** |
+
+Mirror gives 1.59–1.67× over a single node; `distribute` without mirroring gives no gain.
 
 ---
 
