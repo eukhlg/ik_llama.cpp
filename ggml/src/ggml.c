@@ -31358,7 +31358,80 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     return 0;
 }
 
+// Opt-in graph audit (GGML_GRAPH_STATS=1): once per distinct graph (by node count), print how
+// many compute nodes of each op it has and the most frequent pairs of consecutive compute
+// nodes, with an example of each pair's tensor names. View-type nodes (no work) are skipped.
+static bool ggml_gstats_is_noop(const struct ggml_tensor * t) {
+    switch (t->op) {
+        case GGML_OP_NONE: case GGML_OP_VIEW: case GGML_OP_RESHAPE:
+        case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void ggml_graph_stats_dump(const struct ggml_cgraph * cgraph) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * e = getenv("GGML_GRAPH_STATS");
+        enabled = e && atoi(e) != 0;
+    }
+    if (!enabled) return;
+    static int seen[32];
+    static int n_seen = 0;
+    for (int i = 0; i < n_seen; ++i) if (seen[i] == cgraph->n_nodes) return;
+    if (n_seen >= 32) return;
+    seen[n_seen++] = cgraph->n_nodes;
+
+    int op_count[GGML_OP_COUNT] = {0};
+    int * pair = (int *) calloc((size_t) GGML_OP_COUNT * GGML_OP_COUNT, sizeof(int));
+    int * pair_ex = (int *) malloc((size_t) GGML_OP_COUNT * GGML_OP_COUNT * sizeof(int));
+    if (!pair || !pair_ex) { free(pair); free(pair_ex); return; }
+    int n_compute = 0, prev = -1;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const struct ggml_tensor * t = cgraph->nodes[i];
+        if (ggml_gstats_is_noop(t)) continue;
+        ++n_compute;
+        op_count[t->op]++;
+        if (prev >= 0) {
+            const int k = cgraph->nodes[prev]->op * GGML_OP_COUNT + t->op;
+            if (pair[k]++ == 0) pair_ex[k] = i;
+        }
+        prev = i;
+    }
+    fprintf(stderr, "\n=== graph stats: %d nodes, %d compute nodes, first node '%s' ne1=%lld ===\n",
+            cgraph->n_nodes, n_compute, cgraph->n_nodes ? cgraph->nodes[0]->name : "",
+            cgraph->n_nodes ? (long long) cgraph->nodes[0]->ne[1] : 0LL);
+    fprintf(stderr, "op counts:");
+    for (int pass = 0; pass < GGML_OP_COUNT; ++pass) {
+        int best = -1;
+        for (int o = 0; o < GGML_OP_COUNT; ++o) if (op_count[o] > 0 && (best < 0 || op_count[o] > op_count[best])) best = o;
+        if (best < 0) break;
+        fprintf(stderr, "%s %s %d", pass % 6 ? "," : "\n ", ggml_op_name((enum ggml_op) best), op_count[best]);
+        op_count[best] = 0;
+    }
+    fprintf(stderr, "\ntop consecutive op pairs (count  prev -> next  e.g. names):\n");
+    for (int r = 0; r < 30; ++r) {
+        int best = -1;
+        for (int k = 0; k < GGML_OP_COUNT * GGML_OP_COUNT; ++k) if (pair[k] > 0 && (best < 0 || pair[k] > pair[best])) best = k;
+        if (best < 0) break;
+        const int i = pair_ex[best];
+        int j = i - 1;
+        while (j >= 0 && ggml_gstats_is_noop(cgraph->nodes[j])) --j;
+        const struct ggml_tensor * a = j >= 0 ? cgraph->nodes[j] : NULL;
+        const struct ggml_tensor * b = cgraph->nodes[i];
+        fprintf(stderr, "  %5d  %-18s -> %-18s  %s [%lld,%lld] -> %s [%lld,%lld]\n", pair[best],
+                ggml_op_name((enum ggml_op) (best / GGML_OP_COUNT)), ggml_op_name((enum ggml_op) (best % GGML_OP_COUNT)),
+                a ? a->name : "?", a ? (long long) a->ne[0] : 0LL, a ? (long long) a->ne[1] : 0LL,
+                b->name, (long long) b->ne[0], (long long) b->ne[1]);
+        pair[best] = 0;
+    }
+    free(pair); free(pair_ex);
+}
+
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
+    ggml_graph_stats_dump(cgraph);
     GGML_ASSERT(cplan);
     GGML_ASSERT(cplan->n_threads > 0);
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
