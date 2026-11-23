@@ -25404,6 +25404,9 @@ static int ggml_compute_forward_ssm_conv_f32(
     const int ith = params->ith;
     const int nth = params->nth;
 
+    // NUMA mirror: conv1d weights are a mirrored model tensor; read the node-local copy
+    const char * const conv_w = (const char *) ggml_numa_tensor_data(src2, ggml_numa_node_for_thread(ith, nth));
+
     const int nc   = src2->ne[0]; // d_conv
     const int nr   = src0->ne[1]; // d_inner
     const int n_t  = src1->ne[1]; // n_tokens
@@ -25438,7 +25441,7 @@ static int ggml_compute_forward_ssm_conv_f32(
             }
         }
         if (iqk_ssm_conv4(nr, nc, n_t, src0->nb[1], src1->nb[0], src1->nb[1], src2->nb[1],
-                    (const float *)src1->data, (const float *)src0->data, (const float *)src2->data,
+                    (const float *)src1->data, (const float *)src0->data, (const float *)conv_w,
                     (float *)dst->data, dst_silu, ith, nth)) {
             return node + (dst_silu ? 2 : 0);
         }
@@ -25476,7 +25479,7 @@ static int ggml_compute_forward_ssm_conv_f32(
         float *   s  = (float *)   ((char *)  dst->data + ir0*(src2->nb[1]) + sq[0]*(src2->nb[2]) + nr*n_t*sizeof(float)); // {d_conv, d_inner, n_kv}
         float *   s0; // {d_conv - 1, d_inner, n_kv}
         float *   x0 = (float *)   ((char *) src1->data + ir0*(src1->nb[0]) + i2*(src1->nb[1])); // {d_inner, n_tokens}
-        float *   c  = (float *)   ((char *) src2->data + ir0*(src2->nb[1])); // {d_conv, d_inner}
+        const float * c = (const float *) (conv_w + ir0*(src2->nb[1])); // {d_conv, d_inner}
         int ne0s0;
 
         GGML_ASSERT(0 <= sq[0] && sq[0] < n_kv);
