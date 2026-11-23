@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+#include <cstdlib>
 #include "iqk_config.h"
 #include "iqk_mul_mat.h"
 #include "iqk_flash_impl.h"
@@ -146,6 +147,15 @@ bool iqk_fa_indexed_kv_heads_rows(int int_type_k, int int_type_v, int Dk, int Dv
 }
 }
 
+// IQK_FA_NO_MT_SPLIT=1 disables the multi-token GQA split-K path (A/B tests)
+static bool iqk_fa_mt_split_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("IQK_FA_NO_MT_SPLIT");
+        return !(e && atoi(e) != 0);
+    }();
+    return enabled;
+}
+
 size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
     auto Q = dst->src[0];
     auto K = dst->src[1];
@@ -180,6 +190,14 @@ size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
     size_t size = 0;
     if (Q->ne[1] >= 8 && K->type == GGML_TYPE_Q8_0) {
         size = ggml_row_size(GGML_TYPE_Q8_0, K->ne[0]) * K->ne[1]*K->ne[2]*K->ne[3];
+    }
+    // multi-token GQA split-K (2..7 query tokens): must match iqk_flash_attn_noalibi
+    if (iqk_fa_mt_split_enabled() && Q->ne[1] >= 2 && Q->ne[1] <= 7 && Q->ne[3] == 1 && rk2 > 1 && Q->ne[2]/V->ne[2] == rk2 &&
+        K->ne[2] > 1 && nth >= 1 && K->ne[1]/32 > 1) {
+        int nstep_k = K->ne[2]*((K->ne[1] + 31)/32);
+        if (nstep_k > 4*nth + K->ne[2]) nstep_k = 4*nth + K->ne[2];
+        size_t result_size = (V->ne[0] + 16)*rk2*sizeof(float)*Q->ne[1];
+        return size + nstep_k*result_size;
     }
     if (Q->ne[1] == 1 && Q->ne[3] == 1 && Q->ne[2]/K->ne[2] > 1 && nth >= 1 && K->ne[1]/32 > 1) {
         if (K->ne[2] > 1) {
@@ -616,6 +634,83 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                 return true;
             }
         }
+    }
+
+    // GQA split-K for a few query tokens (2..7), e.g. MTP draft verification during decode.
+    // Same scheme as the single-token path below: KV is cut into chunks of nk rows per KV head,
+    // threads process chunks, then the partial results are combined per output row. Here each
+    // chunk is processed for every token with that token's mask row, so all rk2 query heads of a
+    // KV head share one pass over the chunk, and long contexts are split across all threads
+    // instead of one thread walking the whole KV cache per (head, token).
+    // Must match the multi-token branch of iqk_fa_work_buffer_size.
+    if (iqk_fa_mt_split_enabled() && neq3 == 1 && rk2 > 1 && rk2 == rv2 && neq1 >= 2 && neq1 <= 7 && nek2 > 1 && nek1/32 > 1 && nth >= 1) {
+        const size_t result_size_tok = (Dv + 16)*rk2*sizeof(float);
+        const size_t result_size     = result_size_tok*neq1;
+        int gcd = simple_gcd(nek2, nth);
+        int nth_k  = nth/gcd;
+        int nek2_k = nek2/gcd;
+        int nchunk = nek2_k*nek1/32;
+        int npt = (nchunk + nth_k - 1)/nth_k;
+        int nk;
+        if (npt*nth_k == nchunk) {
+            nk = 32 * (nek2*nek1/(32*nth));
+        } else {
+            int nm = 1;
+            while (nm*4 < npt) nm *= 2;
+            nk = 32*nm;
+        }
+        int nkk = (nek1 + nk - 1)/nk;
+        int nstep_k = nek2*nkk;
+        for (int istep_k = ith; istep_k < nstep_k; istep_k += nth) {
+            int ik02 = istep_k/nkk;
+            int ik01 = nk*(istep_k - ik02*nkk);
+            int this_nk = ik01 + nk <= nek1 ? nk : nek1 - ik01;
+            if (this_nk <= 0) break;
+            auto this_k = (const char *)k + ik01*stride_k + ik02*nbk2;
+            auto this_v = (const char *)v + ik01*stride_v + ik02*nbv2;
+            for (int iq1 = 0; iq1 < neq1; ++iq1) {
+                auto this_result = (float *)((char *)work_buffer + istep_k*result_size + iq1*result_size_tok);
+                auto this_q = (const float *)((const char *)q + iq1*stride_q + ik02*rk2*nbq2);
+                auto this_m = mask ? (const char *)mask + size_t(iq1)*stride_m + ik01*sizeof(uint16_t) : nullptr;
+                if (!iqk_flash_attn_impl(int_type_k, int_type_v,
+                         Dk, Dv, rk2, this_nk, nbq2, stride_k, stride_v, 0, Dv,
+                         this_q, (const void *)this_k, (const void *)this_v, (const void *)this_m, nullptr, 0,
+                         scale, softcap, this_result, this_result + (Dv+0)*rk2, this_result + (Dv+1)*rk2)) return false;
+            }
+        }
+
+        barrier(barrier_data);
+
+        // combine the nkk partial results of every (token, head) row
+        for (int row = ith; row < neq1*neq2; row += nth) {
+            int iq1 = row/neq2;
+            int iq2 = row - iq1*neq2;
+            int ik02 = iq2/rk2;
+            int il = iq2 - ik02*rk2;
+            auto Racc = (float *)((char *)qkv + (size_t(iq2) + size_t(iq1)*ne1)*nb1);
+            float M = -INFINITY, S = 0;
+            for (int ikk = 0; ikk < nkk; ++ikk) {
+                int istep_k = ik02*nkk + ikk;
+                auto this_result = (const float *)((const char *)work_buffer + istep_k*result_size + iq1*result_size_tok);
+                const float * R  = this_result + il*Dv;
+                const float * Mj = this_result + Dv*rk2;
+                const float * Sj = Mj + rk2;
+                accumulate_qkv(Dv, M, S, Mj[il], Sj[il], Racc, R);
+            }
+            if (sinks) {
+                float s = ((const float *)sinks)[iq2];
+                if (s > M) {
+                    float m = expf(M - s);
+                    for (int i = 0; i < Dv; ++i) Racc[i] *= m;
+                    S = S*m + 1;
+                } else {
+                    S += expf(s - M);
+                }
+            }
+            float norm = S > 0 ? 1/S : 1;
+            for (int i = 0; i < Dv; ++i) Racc[i] *= norm;
+        }
+        return true;
     }
 
                                                                        // not sure why I wanted this to be true
