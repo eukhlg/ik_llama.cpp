@@ -77,6 +77,7 @@ ENTRYPOINT ["/app/tools.sh"]
 FROM base AS server
 ENV LLAMA_ARG_HOST=0.0.0.0
 COPY --from=build /app/dist/bin/llama-server /app/llama-server
+COPY --from=build /app/dist/bin/llama-kbench /app/llama-kbench
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD [ "curl", "-f", "http://localhost:8080/health" ]
 ENTRYPOINT [ "/app/llama-server" ]
