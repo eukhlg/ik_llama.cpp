@@ -2730,6 +2730,8 @@ bool llama_kv_cache::per_step_restore(ggml_backend_sched_t sched,llama_ckpt_data
     }();
     std::vector<llama_host_copy> * host_copies_p = serial_restore ? nullptr : &host_copies;
     const uint32_t n_layer = (uint32_t) s_l.size();
+    const bool ph = ggml_phase_enabled();
+    int64_t ph_t = ph ? ggml_phase_now_ns() : 0;
 
     for (uint32_t il = 0; il < n_layer; ++il) {
         if (il >= ckpt.per_step_ple.size() || ckpt.per_step_ple[il].empty()) continue;
@@ -2761,6 +2763,8 @@ bool llama_kv_cache::per_step_restore(ggml_backend_sched_t sched,llama_ckpt_data
             backends_to_sync.insert(backend);
         }
     }
+
+    if (ph) { const int64_t t = ggml_phase_now_ns(); ggml_phase_add(GGML_PHASE_RESTORE_PLE, t - ph_t); ph_t = t; }
 
     for (uint32_t il = 0; il < n_layer; ++il) {
         if (s_l[il] == nullptr || il >= ckpt.per_step_ssm.size() ||
@@ -2797,10 +2801,12 @@ bool llama_kv_cache::per_step_restore(ggml_backend_sched_t sched,llama_ckpt_data
         }
     }
 
+    if (ph) { const int64_t t = ggml_phase_now_ns(); ggml_phase_add(GGML_PHASE_RESTORE_SSM, t - ph_t); ph_t = t; }
     // TODO: do we need to synchronize here?
     for (auto backend : backends_to_sync) {
         ggml_backend_synchronize(backend);
     }
+    if (ph) ggml_phase_add(GGML_PHASE_RESTORE_SYNC, ggml_phase_now_ns() - ph_t);
     // all host state copies of all layers at once, in parallel and node-local
     llama_parallel_host_copy(host_copies);
 
@@ -9717,8 +9723,12 @@ static void llama_parallel_host_copy(const std::vector<llama_host_copy> & items)
     size_t total = 0;
     for (const auto & it : items) total += it.bytes;
     if (total == 0) return;
+    const bool    ph   = ggml_phase_enabled();
+    const int64_t ph_t = ph ? ggml_phase_now_ns() : 0;
+    if (ph) ggml_phase_add_bytes(GGML_PHASE_RESTORE_COPY, (int64_t) total);
     if (total < (1u << 20)) {
         for (const auto & it : items) memcpy(it.dst, it.src, it.bytes);
+        if (ph) ggml_phase_add(GGML_PHASE_RESTORE_COPY, ggml_phase_now_ns() - ph_t);
         return;
     }
     const int n_nodes = ggml_numa_mirror_active() ? std::max(1, ggml_numa_node_count()) : 1;
@@ -9751,7 +9761,10 @@ static void llama_parallel_host_copy(const std::vector<llama_host_copy> & items)
     std::vector<std::thread> threads;
     threads.reserve(plan.size());
     for (const auto & w : plan) threads.emplace_back(job, w);
+    const int64_t ph_s = ph ? ggml_phase_now_ns() : 0;
+    if (ph) ggml_phase_add(GGML_PHASE_RESTORE_SPAWN, ph_s - ph_t);
     for (auto & th : threads) th.join();
+    if (ph) ggml_phase_add(GGML_PHASE_RESTORE_COPY, ggml_phase_now_ns() - ph_s);
 }
 
 // Allocate a node-bound copy of [src, src + size) on `node`, filled in parallel by that node's threads

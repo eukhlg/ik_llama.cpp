@@ -523,6 +523,12 @@ static llama_token llama_sampling_sample_impl(
 
     std::vector<float> original_logits;
     llama_sampling_prepare(ctx_sampling, ctx_main, ctx_cfg, idx, /* grammar_first= */ grammar_first, &original_logits);
+    // opt-in phase timing (LLAMA_PHASE_STATS): everything after prepare, until return
+    struct chain_timer {
+        int64_t t0;
+        chain_timer() : t0(ggml_phase_enabled() ? ggml_phase_now_ns() : 0) {}
+        ~chain_timer() { if (t0) ggml_phase_add(GGML_PHASE_SAMPLE_CHAIN, ggml_phase_now_ns() - t0); }
+    } chain_timer_;
     llama_token_data_array & cur_p = ctx_sampling->cur_p;
     if (ctx_sampling->grammar != NULL && !grammar_first) {
         GGML_ASSERT(!original_logits.empty());
@@ -564,7 +570,9 @@ static llama_token llama_sampling_sample_impl(
             // temperature sampling
             size_t min_keep = std::max(1, params.min_keep);
 
+            const int64_t q_t0 = ggml_phase_enabled() ? ggml_phase_now_ns() : 0;
             sampler_queue(ctx_main, params,ctx_sampling, cur_p, min_keep);
+            if (q_t0) ggml_phase_add(GGML_PHASE_SAMPLE_QUEUE, ggml_phase_now_ns() - q_t0);
             id = llama_sample_token_with_rng(ctx_main, &cur_p, ctx_sampling->rng);
 
         }
@@ -624,6 +632,10 @@ static llama_token_data_array llama_sampling_prepare_impl(
     auto & prev = ctx_sampling->prev;
     auto & cur  = ctx_sampling->cur;
 
+    // opt-in phase timing (LLAMA_PHASE_STATS)
+    const bool ph   = ggml_phase_enabled();
+    int64_t    ph_t = ph ? ggml_phase_now_ns() : 0;
+
     // Get a pointer to the logits
     float * logits = llama_get_logits_ith(ctx_main, idx);
 
@@ -663,6 +675,8 @@ static llama_token_data_array llama_sampling_prepare_impl(
 
     llama_token_data_array & cur_p = ctx_sampling->cur_p;
 
+    if (ph) { const int64_t t = ggml_phase_now_ns(); ggml_phase_add(GGML_PHASE_SAMPLE_CAND, t - ph_t); ph_t = t; }
+
     // apply penalties
     const auto& penalty_tokens = params.use_penalty_prompt_tokens ? params.penalty_prompt_tokens : prev;
     const int penalty_tokens_used_size = std::min((int)penalty_tokens.size(), penalty_last_n);
@@ -689,6 +703,8 @@ static llama_token_data_array llama_sampling_prepare_impl(
             }
         }
     }
+
+    if (ph) ggml_phase_add(GGML_PHASE_SAMPLE_PENALTY, ggml_phase_now_ns() - ph_t);
 
     // apply grammar checks before sampling logic
     if (grammar_first && ctx_sampling->grammar != NULL) {
@@ -1353,6 +1369,12 @@ static float prob_scalar(int n, const float * logits, float max_val) {
 
 llama_token common_sampler_sample_speculative(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, float * out_prob) {
     GGML_UNUSED(gsmpl);
+    // opt-in phase timing (LLAMA_PHASE_STATS)
+    struct pick_timer {
+        int64_t t0;
+        pick_timer() : t0(ggml_phase_enabled() ? ggml_phase_now_ns() : 0) {}
+        ~pick_timer() { if (t0) ggml_phase_add(GGML_PHASE_DRAFT_PICK, ggml_phase_now_ns() - t0); }
+    } pick_timer_;
 
     float * logits = llama_get_logits_ith(ctx, idx);
     const int n_vocab = llama_n_vocab(llama_get_model(ctx));

@@ -994,11 +994,23 @@ extern "C" {
         GGML_PHASE_POST,          // after compute: outputs, carry, checkpoint capture
         GGML_PHASE_SAMPLE,        // sampling (common)
         GGML_PHASE_RESTORE,       // recurrent state restore after rejected drafts
+        // sub-phases (inside RESTORE / SAMPLE) and the MTP draft token pick
+        GGML_PHASE_RESTORE_PLE,   // restore: per-layer embedding snapshot copies
+        GGML_PHASE_RESTORE_SSM,   // restore: state copy setup per layer (collect host copies / async copies)
+        GGML_PHASE_RESTORE_SYNC,  // restore: backend synchronize
+        GGML_PHASE_RESTORE_SPAWN, // restore: start the host copy threads
+        GGML_PHASE_RESTORE_COPY,  // restore: host copy until all threads joined (bytes counted)
+        GGML_PHASE_SAMPLE_CAND,   // sampling: logit bias + candidate array (n_vocab entries)
+        GGML_PHASE_SAMPLE_PENALTY,// sampling: repetition penalties
+        GGML_PHASE_SAMPLE_CHAIN,  // sampling: everything after prepare (sampler queue + token pick)
+        GGML_PHASE_SAMPLE_QUEUE,  // sampling: sampler_queue only (inside CHAIN)
+        GGML_PHASE_DRAFT_PICK,    // MTP draft token pick (common_sampler_sample_speculative)
         GGML_PHASE_COUNT,
     };
     GGML_API bool    ggml_phase_enabled(void);
     GGML_API int64_t ggml_phase_now_ns(void);
     GGML_API void    ggml_phase_add(int phase, int64_t ns);
+    GGML_API void    ggml_phase_add_bytes(int phase, int64_t bytes);  // reported as MB per call and GB/s
     GGML_API void    ggml_phase_cycle(void);   // call once per main-model decode
     GGML_API int64_t ggml_cycles(void);
     GGML_API int64_t ggml_cycles_per_ms(void);

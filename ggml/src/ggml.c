@@ -31324,6 +31324,7 @@ static int64_t ggml_ins_now_ns(void) {
 static int     g_phase_every = -1;           // -1 = not read yet, 0 = off
 static int64_t g_phase_ns[GGML_PHASE_COUNT];
 static int64_t g_phase_cnt[GGML_PHASE_COUNT];
+static int64_t g_phase_bytes[GGML_PHASE_COUNT];
 static int64_t g_phase_window_t0 = 0;
 static int     g_phase_cycles = 0;
 static atomic_int_fast64_t g_phase_wake_max;  // latest worker start time in the current graph
@@ -31350,27 +31351,52 @@ void ggml_phase_add(int phase, int64_t ns) {
     g_phase_cnt[phase] += 1;
 }
 
+void ggml_phase_add_bytes(int phase, int64_t bytes) {
+    if (phase < 0 || phase >= GGML_PHASE_COUNT) return;
+    g_phase_bytes[phase] += bytes;
+}
+
 void ggml_phase_cycle(void) {
     if (!ggml_phase_enabled() || ++g_phase_cycles < g_phase_every) return;
     static const char * names[GGML_PHASE_COUNT] = {
         "decode main model (total)", "decode MTP draft (total)",
         "  graph prep (reset/build/alloc, both)", "  graph compute (both)", "    thread wake-up (in compute)",
         "  after compute (outputs, carry, ckpt)", "sampling", "recurrent state restore",
+        "  restore: per-layer embed copies", "  restore: state copy setup", "  restore: backend sync",
+        "  restore: start copy threads", "  restore: host copy (threads)",
+        "  sampling: bias + candidates", "  sampling: penalties", "  sampling: chain after prepare",
+        "    sampling: sampler queue", "draft token pick (MTP)",
+    };
+    // report order: sub-phases right under their parent
+    static const int order[GGML_PHASE_COUNT] = {
+        GGML_PHASE_DECODE_MAIN, GGML_PHASE_DECODE_MTP, GGML_PHASE_PREP, GGML_PHASE_COMPUTE, GGML_PHASE_WAKE,
+        GGML_PHASE_POST, GGML_PHASE_SAMPLE, GGML_PHASE_SAMPLE_CAND, GGML_PHASE_SAMPLE_PENALTY,
+        GGML_PHASE_SAMPLE_CHAIN, GGML_PHASE_SAMPLE_QUEUE, GGML_PHASE_DRAFT_PICK, GGML_PHASE_RESTORE,
+        GGML_PHASE_RESTORE_PLE, GGML_PHASE_RESTORE_SSM, GGML_PHASE_RESTORE_SYNC, GGML_PHASE_RESTORE_SPAWN,
+        GGML_PHASE_RESTORE_COPY,
     };
     const int64_t now  = ggml_ins_now_ns();
     const double  wall = (double) (now - g_phase_window_t0);
     const double  top  = (double) (g_phase_ns[GGML_PHASE_DECODE_MAIN] + g_phase_ns[GGML_PHASE_DECODE_MTP] +
-                                   g_phase_ns[GGML_PHASE_SAMPLE] + g_phase_ns[GGML_PHASE_RESTORE]);
+                                   g_phase_ns[GGML_PHASE_SAMPLE] + g_phase_ns[GGML_PHASE_RESTORE] +
+                                   g_phase_ns[GGML_PHASE_DRAFT_PICK]);
     fprintf(stderr, "\n=== phase stats: %d main decodes, %.1f ms wall ===\n", g_phase_cycles, wall * 1e-6);
     fprintf(stderr, "%-40s %10s %7s %8s %9s\n", "phase", "ms", "%wall", "calls", "avg_us");
-    for (int i = 0; i < GGML_PHASE_COUNT; ++i) {
-        fprintf(stderr, "%-40s %10.2f %6.1f%% %8lld %9.1f\n", names[i], g_phase_ns[i] * 1e-6,
+    for (int k = 0; k < GGML_PHASE_COUNT; ++k) {
+        const int i = order[k];
+        if (i >= GGML_PHASE_RESTORE_PLE && g_phase_cnt[i] == 0) continue;   // sub-phase never hit
+        fprintf(stderr, "%-40s %10.2f %6.1f%% %8lld %9.1f", names[i], g_phase_ns[i] * 1e-6,
                 wall > 0 ? 100.0 * g_phase_ns[i] / wall : 0.0, (long long) g_phase_cnt[i],
                 g_phase_cnt[i] ? g_phase_ns[i] * 1e-3 / g_phase_cnt[i] : 0.0);
+        if (g_phase_bytes[i] > 0 && g_phase_cnt[i] > 0 && g_phase_ns[i] > 0) {
+            fprintf(stderr, "   %.1f MB/call, %.1f GB/s", g_phase_bytes[i] / 1e6 / g_phase_cnt[i],
+                    (double) g_phase_bytes[i] / g_phase_ns[i]);
+        }
+        fprintf(stderr, "\n");
     }
-    fprintf(stderr, "%-40s %10.2f %6.1f%%\n", "unattributed (wall - decodes - sampling - restore)",
+    fprintf(stderr, "%-40s %10.2f %6.1f%%\n", "unattributed (wall - decodes - sampling - restore - draft pick)",
             (wall - top) * 1e-6, wall > 0 ? 100.0 * (wall - top) / wall : 0.0);
-    for (int i = 0; i < GGML_PHASE_COUNT; ++i) { g_phase_ns[i] = 0; g_phase_cnt[i] = 0; }
+    for (int i = 0; i < GGML_PHASE_COUNT; ++i) { g_phase_ns[i] = 0; g_phase_cnt[i] = 0; g_phase_bytes[i] = 0; }
     g_phase_cycles = 0;
     g_phase_window_t0 = now;
 }
