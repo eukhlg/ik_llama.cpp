@@ -2662,6 +2662,14 @@ bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens) {
     return true;
 }
 
+// opt-in phase timing (LLAMA_PHASE_STATS, roadmap 9.2): adds the scope's wall time to a phase
+struct llama_phase_scope {
+    int     phase;
+    int64_t t0;
+    explicit llama_phase_scope(int p) : phase(p), t0(ggml_phase_enabled() ? ggml_phase_now_ns() : 0) {}
+    ~llama_phase_scope() { if (t0) ggml_phase_add(phase, ggml_phase_now_ns() - t0); }
+};
+
 // host-memory copy collected during a recurrent-state restore, executed in parallel afterwards
 struct llama_host_copy {
     void       * dst;
@@ -2706,6 +2714,7 @@ static void restore_recurrent_cache_tensors(int step, uint32_t slot, ggml_backen
 }
 
 bool llama_kv_cache::per_step_restore(ggml_backend_sched_t sched,llama_ckpt_data ckpt_type, int step, uint32_t slot) {
+    llama_phase_scope phase_scope(GGML_PHASE_RESTORE);
     auto & ckpt = llama_get_ckpt(ckpt_type);
     if (ckpt.per_step_ssm.empty() || ckpt.per_step_max_allocated <= 1 ||
             step < 0 || step >= ckpt.per_step_max_allocated - 1) {
@@ -8033,6 +8042,7 @@ static int llama_decode_internal(
         ggml_cgraph * gf = nullptr;
         const uint64_t seq_fingerprint = llama_ubatch_seq_fingerprint(u_batch, lctx.model.arch);
         const uint64_t state_hash      = model_state_hash(lctx);
+        const int64_t  phase_prep_t0   = ggml_phase_enabled() ? ggml_phase_now_ns() : 0;
         if (!lctx.can_reuse_graph(u_batch, seq_fingerprint, state_hash)) {
             lctx.reset_scheduler();
             ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
@@ -8082,6 +8092,7 @@ static int llama_decode_internal(
             //printf("Reusing graph with type = %d, n_kv = %d, n_tokens = %d\n", cparams.mtp_op_type, (int)prev->n_kv, (int)prev->n_tokens);
             gf = prev->graph;
         }
+        if (phase_prep_t0) ggml_phase_add(GGML_PHASE_PREP, ggml_phase_now_ns() - phase_prep_t0);
 
         if (cparams.mtp_op_type != MTP_OP_NONE) {
             if (!prepare_mtp_graph_inputs(lctx, cur_token, n_tokens, n_tokens_all)) {
@@ -8168,7 +8179,11 @@ static int llama_decode_internal(
         tim1 = ggml_time_us();
 #endif
         //fprintf(stderr, "%s: invoking llama_graph_compute\n", __func__);
-        llama_graph_compute(lctx, gf, n_threads, n_tokens_all == 1);
+        {
+            llama_phase_scope phase_scope(GGML_PHASE_COMPUTE);
+            llama_graph_compute(lctx, gf, n_threads, n_tokens_all == 1);
+        }
+        const int64_t phase_post_t0 = ggml_phase_enabled() ? ggml_phase_now_ns() : 0;
 
         if (llm_arch_is_dsv4(lctx.model.arch) &&
             llama_dsv4_per_step_capture_active(lctx, { LLAMA_CHECKPOINT_SPEC, 0, 0 }) &&
@@ -8395,6 +8410,7 @@ static int llama_decode_internal(
 
         n_outputs_prev += lctx.n_outputs;
         n_outputs_prev_embd += (has_mtp && embd) ? embd->ne[1] : lctx.n_outputs;
+        if (phase_post_t0) ggml_phase_add(GGML_PHASE_POST, ggml_phase_now_ns() - phase_post_t0);
         cur_token += n_tokens;
         if (reset_previous) {
             // The graph was built with a position-zero state reset. Reusing it at later
@@ -14687,7 +14703,13 @@ int32_t llama_encode(
 int32_t llama_decode(
         struct llama_context * ctx,
           struct llama_batch   batch) {
-    const int ret = llama_decode_internal(*ctx, batch);
+    const bool is_main = ctx->cparams.mtp_op_type == MTP_OP_NONE;
+    int ret;
+    {
+        llama_phase_scope phase_scope(is_main ? GGML_PHASE_DECODE_MAIN : GGML_PHASE_DECODE_MTP);
+        ret = llama_decode_internal(*ctx, batch);
+    }
+    if (is_main) ggml_phase_cycle();
     if (ret < 0) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }

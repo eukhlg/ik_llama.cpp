@@ -712,8 +712,12 @@ llama_token common_sampler_sample(
     struct llama_context * ctx_main,
     const int idx,
     bool grammar_first) {
+    // opt-in phase timing (LLAMA_PHASE_STATS)
+    const int64_t phase_t0 = ggml_phase_enabled() ? ggml_phase_now_ns() : 0;
     // Call the implementation function with is_resampling set to false by default
-    return llama_sampling_sample_impl(ctx_sampling, ctx_main, nullptr, idx, /* is_resampling= */ grammar_first);
+    const llama_token id = llama_sampling_sample_impl(ctx_sampling, ctx_main, nullptr, idx, /* is_resampling= */ grammar_first);
+    if (phase_t0) ggml_phase_add(GGML_PHASE_SAMPLE, ggml_phase_now_ns() - phase_t0);
+    return id;
 }
 
 llama_token_data_array llama_sampling_prepare(

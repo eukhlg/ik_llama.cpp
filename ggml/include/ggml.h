@@ -983,6 +983,23 @@ extern "C" {
     GGML_API void    ggml_time_init(void); // call this once at the beginning of the program
     GGML_API int64_t ggml_time_ms(void);
     GGML_API int64_t ggml_time_us(void);
+
+    // opt-in phase timing for performance analysis (LLAMA_PHASE_STATS=<N>); see ggml.c
+    enum ggml_phase_id {
+        GGML_PHASE_DECODE_MAIN,   // llama_decode, main model (total)
+        GGML_PHASE_DECODE_MTP,    // llama_decode, MTP draft context (total)
+        GGML_PHASE_PREP,          // graph reset / build / alloc (or reuse)
+        GGML_PHASE_COMPUTE,       // graph compute
+        GGML_PHASE_WAKE,          // inside compute: until the last worker thread started
+        GGML_PHASE_POST,          // after compute: outputs, carry, checkpoint capture
+        GGML_PHASE_SAMPLE,        // sampling (common)
+        GGML_PHASE_RESTORE,       // recurrent state restore after rejected drafts
+        GGML_PHASE_COUNT,
+    };
+    GGML_API bool    ggml_phase_enabled(void);
+    GGML_API int64_t ggml_phase_now_ns(void);
+    GGML_API void    ggml_phase_add(int phase, int64_t ns);
+    GGML_API void    ggml_phase_cycle(void);   // call once per main-model decode
     GGML_API int64_t ggml_cycles(void);
     GGML_API int64_t ggml_cycles_per_ms(void);
 
