@@ -2662,10 +2662,30 @@ bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens) {
     return true;
 }
 
+// host-memory copy collected during a recurrent-state restore, executed in parallel afterwards
+struct llama_host_copy {
+    void       * dst;
+    const void * src;
+    size_t       bytes;
+};
+static void llama_parallel_host_copy(const std::vector<llama_host_copy> & items); // defined below
+
 static void restore_recurrent_cache_tensors(int step, uint32_t slot, ggml_backend_sched_t sched,
         size_t ssm_bytes, size_t conv_bytes,
         ggml_tensor * s_l, ggml_tensor * per_step_ssm, ggml_tensor * per_step_conv,
-        std::unordered_set<ggml_backend_t> & backends_to_sync) {
+        std::unordered_set<ggml_backend_t> & backends_to_sync,
+        std::vector<llama_host_copy> * host_copies) {
+    const size_t slot_off0 = slot * s_l->nb[1];
+    if (host_copies && s_l->buffer && per_step_ssm->buffer && per_step_conv->buffer &&
+        ggml_backend_buffer_is_host(s_l->buffer) && ggml_backend_buffer_is_host(per_step_ssm->buffer) &&
+        ggml_backend_buffer_is_host(per_step_conv->buffer)) {
+        // delta-net state (the bulk, ~2 MB per layer) and conv state of this slot
+        host_copies->push_back({ (char *) s_l->data + slot_off0 + conv_bytes,
+                                 (const char *) per_step_ssm->data + (size_t) step * ssm_bytes, ssm_bytes });
+        host_copies->push_back({ (char *) s_l->data + slot_off0,
+                                 (const char *) per_step_conv->data + (size_t) step * conv_bytes, conv_bytes });
+        return;
+    }
     auto dst_backend = ggml_backend_sched_get_tensor_backend(sched, s_l);
     auto dst = *s_l;
     const size_t slot_off = slot * dst.nb[1];
@@ -2693,6 +2713,13 @@ bool llama_kv_cache::per_step_restore(ggml_backend_sched_t sched,llama_ckpt_data
     }
 
     std::unordered_set<ggml_backend_t> backends_to_sync;
+    std::vector<llama_host_copy> host_copies;
+    // LLAMA_SERIAL_STATE_RESTORE=1: old behaviour (one copy per layer on this thread), for A/B tests
+    static const bool serial_restore = [] {
+        const char * e = getenv("LLAMA_SERIAL_STATE_RESTORE");
+        return e && atoi(e) != 0;
+    }();
+    std::vector<llama_host_copy> * host_copies_p = serial_restore ? nullptr : &host_copies;
     const uint32_t n_layer = (uint32_t) s_l.size();
 
     for (uint32_t il = 0; il < n_layer; ++il) {
@@ -2742,7 +2769,7 @@ bool llama_kv_cache::per_step_restore(ggml_backend_sched_t sched,llama_ckpt_data
                 (size_t) ckpt.per_step_max_allocated * sizeof(float);
             restore_recurrent_cache_tensors(step, slot, sched, ssm_bytes, conv_bytes,
                 s_l[il], per_step_ssm.front(), per_step_conv.front(),
-                backends_to_sync);
+                backends_to_sync, host_copies_p);
         } else {
             auto split_sl = (const ggml_split_tensor_t *) s_l[il]->extra;
             for (int id = 0; id < split_sl->n_device; ++id) {
@@ -2756,7 +2783,7 @@ bool llama_kv_cache::per_step_restore(ggml_backend_sched_t sched,llama_ckpt_data
                     (size_t) ckpt.per_step_max_allocated * sizeof(float);
                 restore_recurrent_cache_tensors(step, slot, sched, ssm_bytes, conv_bytes,
                     split_sl->splits[id], (ggml_tensor *) per_step_ssm_tensor,
-                    (ggml_tensor *) per_step_conv_tensor, backends_to_sync);
+                    (ggml_tensor *) per_step_conv_tensor, backends_to_sync, nullptr);
             }
         }
     }
@@ -2765,6 +2792,8 @@ bool llama_kv_cache::per_step_restore(ggml_backend_sched_t sched,llama_ckpt_data
     for (auto backend : backends_to_sync) {
         ggml_backend_synchronize(backend);
     }
+    // all host state copies of all layers at once, in parallel and node-local
+    llama_parallel_host_copy(host_copies);
 
     return true;
 }
@@ -9661,6 +9690,52 @@ static void llama_numa_parallel_range(int node, size_t size, const std::function
         });
     }
     for (auto & w : workers) w.join();
+}
+
+// Copy many host ranges at once (recurrent-state restore after rejected speculative drafts:
+// ~60 MB per restore on Qwen3.5/3.6, previously one memcpy per layer on the calling thread while
+// all compute threads waited). With the NUMA mirror active, node k's threads copy the k-th
+// 1/n_nodes slice of every range, which matches how the delta-net state is placed (by head
+// range per node), so reads and writes stay node-local. Otherwise up to 8 unpinned threads.
+static void llama_parallel_host_copy(const std::vector<llama_host_copy> & items) {
+    size_t total = 0;
+    for (const auto & it : items) total += it.bytes;
+    if (total == 0) return;
+    if (total < (1u << 20)) {
+        for (const auto & it : items) memcpy(it.dst, it.src, it.bytes);
+        return;
+    }
+    const int n_nodes = ggml_numa_mirror_active() ? std::max(1, ggml_numa_node_count()) : 1;
+    struct worker { int node, cpu, t, nt; };
+    std::vector<worker> plan;
+    for (int node = 0; node < n_nodes; ++node) {
+        std::vector<int> cpus = n_nodes > 1 ? llama_numa_node_cpus(node) : std::vector<int>{};
+        const int nt = (int) std::min<size_t>(8, cpus.empty() ? 8 : cpus.size());
+        for (int t = 0; t < nt; ++t) {
+            plan.push_back({ node, cpus.empty() ? -1 : cpus[t % cpus.size()], t, nt });
+        }
+    }
+    auto job = [&items, n_nodes](const worker w) {
+#if defined(__linux__)
+        if (w.cpu >= 0) {
+            cpu_set_t m;
+            CPU_ZERO(&m);
+            CPU_SET(w.cpu, &m);
+            pthread_setaffinity_np(pthread_self(), sizeof(m), &m);
+        }
+#endif
+        for (const auto & it : items) {
+            const size_t a  = it.bytes * w.node / n_nodes;
+            const size_t b  = it.bytes * (w.node + 1) / n_nodes;
+            const size_t ta = a + (b - a) * w.t / w.nt;
+            const size_t tb = a + (b - a) * (w.t + 1) / w.nt;
+            if (tb > ta) memcpy((char *) it.dst + ta, (const char *) it.src + ta, tb - ta);
+        }
+    };
+    std::vector<std::thread> threads;
+    threads.reserve(plan.size());
+    for (const auto & w : plan) threads.emplace_back(job, w);
+    for (auto & th : threads) th.join();
 }
 
 // Allocate a node-bound copy of [src, src + size) on `node`, filled in parallel by that node's threads
