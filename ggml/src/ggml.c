@@ -31392,7 +31392,7 @@ static const char * g_obs_names[OBS_COUNT] = {
     "dense matmul (weights)", "output head", "shared expert up/gate", "MoE up/gate (routed)",
     "MoE down (routed)", "flash attention (KV bytes)", "delta-net", "ssm conv", "other ops",
 };
-#define OBS_KINDS 2      /* 0 = main graph, 1 = small (MTP draft) graph */
+#define OBS_KINDS 3      /* 0 = main decode graph, 1 = small (MTP draft) graph, 2 = prompt processing (> 8 tokens) */
 #define OBS_TOKB  5      /* token buckets 1,2,3,4,5+ */
 static int     g_obs_every = -1;
 static int     g_obs_graphs = 0;
@@ -31437,7 +31437,7 @@ static int ggml_obs_distinct(const struct ggml_tensor * ids, int n_as) {
         }
     }
     const int b = (int) MIN(ids->ne[1], OBS_TOKB) - 1;
-    if (b >= 0) {
+    if (b >= 0 && g_obs_kind != 2) {           // routing reuse for decode graphs only
         g_obs_moe_distinct[b] += distinct;
         g_obs_moe_slots[b]    += (double) ids->ne[0] * ids->ne[1];
         g_obs_moe_calls[b]    += 1;
@@ -31499,7 +31499,7 @@ static void ggml_obs_graph_done(int64_t graph_ns) {
     for (int k = 0; k < OBS_KINDS; ++k) {
         int64_t tot = 0; for (int c = 0; c < OBS_COUNT; ++c) tot += g_obs_ns[k][c];
         if (tot == 0) continue;
-        fprintf(stderr, "-- %s graphs: op time %.1f ms\n", k == 0 ? "main" : "small (MTP draft)", tot * 1e-6);
+        fprintf(stderr, "-- %s graphs: op time %.1f ms\n", k == 0 ? "main decode" : k == 1 ? "small (MTP draft)" : "prompt processing (> 8 tokens)", tot * 1e-6);
         fprintf(stderr, "%-28s %8s %10s %7s %10s %8s %8s\n", "category", "calls", "ms", "%time", "GB", "GB/s", "small%");
         for (int c = 0; c < OBS_COUNT; ++c) {
             if (!g_obs_calls[k][c]) continue;
@@ -31671,9 +31671,14 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     const int64_t ins_t0    = (ins_phase || ins_obs) ? ggml_ins_now_ns() : 0;
     if (ins_phase) atomic_store_explicit(&g_phase_wake_max, ins_t0, memory_order_relaxed);
     if (ins_obs) {
-        int nc = 0;
-        for (int i = 0; i < cgraph->n_nodes; ++i) if (!ggml_is_noop(cgraph->nodes[i])) ++nc;
-        g_obs_kind = nc < 200 ? 1 : 0;
+        int nc = 0; int64_t ntok = 0;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const struct ggml_tensor * t = cgraph->nodes[i];
+            if (ggml_is_noop(t)) continue;
+            ++nc;
+            if (!ntok && t->op == GGML_OP_MUL_MAT) ntok = t->ne[1];   // tokens in this graph
+        }
+        g_obs_kind = ntok > 8 ? 2 : nc < 200 ? 1 : 0;
     }
     GGML_ASSERT(cplan);
     GGML_ASSERT(cplan->n_threads > 0);
