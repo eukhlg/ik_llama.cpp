@@ -1,3 +1,6 @@
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
@@ -709,6 +712,20 @@ GGML_CALL static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer
         fprintf(stderr, "%s: failed to allocate buffer of size %zu\n", __func__, size);
         return NULL;
     }
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    // Large buffers (weights, KV cache) are streamed on every token. Ask for transparent huge
+    // pages before the first touch: with THP in "madvise" mode (the Ubuntu default) they would
+    // otherwise get 4 KB pages, while the NUMA mirror's own per-node copies already use 2 MB
+    // pages. Only whole 2 MB blocks inside the buffer are advised.
+    if (size >= (32u << 20)) {
+        const uintptr_t huge = 2u << 20;
+        const uintptr_t b = ((uintptr_t) data + huge - 1) & ~(huge - 1);
+        const uintptr_t e = ((uintptr_t) data + size) & ~(huge - 1);
+        if (e > b) {
+            madvise((void *) b, e - b, MADV_HUGEPAGE);
+        }
+    }
+#endif
 
     return ggml_backend_buffer_init(buft, cpu_backend_buffer_i, data, size);
 }
