@@ -422,9 +422,9 @@ extern "C" {
         GGML_TYPE_F64       = 28,
         GGML_TYPE_IQ1_M     = 29,
         GGML_TYPE_BF16      = 30,
-        GGML_TYPE_Q4_0_4_4  = 31,
-        GGML_TYPE_Q4_0_4_8  = 32,
-        GGML_TYPE_Q4_0_8_8  = 33,
+        // GGML_TYPE_Q4_0_4_4  = 31, <--- retired
+        // GGML_TYPE_Q4_0_4_8  = 32, <--- retired
+        // GGML_TYPE_Q4_0_8_8  = 33, <--- retired
         GGML_TYPE_I2_S      = 36,  // So we are able to consume MS BitNet I2_S quants
         GGML_TYPE_MXFP4     = 39,  // so we are compatible with mainline
         GGML_TYPE_NVFP4     = 40,
@@ -555,9 +555,6 @@ extern "C" {
         GGML_FTYPE_MOSTLY_IQ1_M   = 23, // except 1d tensors
         GGML_FTYPE_MOSTLY_BF16    = 24, // except 1d tensors
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors, using 26 to be compatible with mainline
-        GGML_FTYPE_MOSTLY_Q4_0_4_4 = 26, // except 1d tensors
-        GGML_FTYPE_MOSTLY_Q4_0_4_8 = 27, // except 1d tensors
-        GGML_FTYPE_MOSTLY_Q4_0_8_8 = 28, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0_128 = 29, // except 1d tensors
         //
         GGML_FTYPE_MOSTLY_Q6_0    = 127, // except 1d tensors
@@ -754,6 +751,8 @@ extern "C" {
         GGML_OP_DS4_COMP,
 
         GGML_OP_FMA,
+        GGML_OP_MULTI_ADD_UNARY,
+        GGML_OP_INKLING2_CLIP,
 
         GGML_OP_COUNT,
     };
@@ -1259,6 +1258,14 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    GGML_API struct ggml_tensor * ggml_multi_add_unary_scale(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * up,
+            int                   nadd,
+            float                 scale,
+            enum ggml_unary_op    unary_op);
+
     // Source may be F32, F16, or a supported quantized type; output is always F32.
     GGML_API struct ggml_tensor * ggml_hadamard(
             struct ggml_context * ctx,
@@ -1565,6 +1572,13 @@ extern "C" {
             struct ggml_tensor  * c,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    GGML_API struct ggml_tensor * ggml_inkling2_clip(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float scale, float bias,
+            float limit,
+            float clamp_min, float clamp_max);
 
     //
     // *** from mainline begin ***
@@ -2678,6 +2692,14 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // table: [distance, query head, query row]; the last distance entry applies beyond the table extent.
+    // positions follow query and KV view order.
+    GGML_API void ggml_flash_attn_ext_add_rel_bias(
+            struct ggml_tensor * a,
+            struct ggml_tensor * table,
+            struct ggml_tensor * pos_q,
+            struct ggml_tensor * pos_k);
 
     // Latent attention over a packed K/V cache with an independently-visible K/V prefix.
     // The value vector of cache row n is cache[dv_off .. dv_off+dv, n] (MLA "absorbed"

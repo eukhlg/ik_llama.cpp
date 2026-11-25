@@ -88,9 +88,6 @@ struct quantize_state_internal {
 
 std::pair<ggml_type, int> interleaved_properties(ggml_type type) {
     static std::unordered_map<ggml_type, std::pair<ggml_type, int>> k_map = {
-        { GGML_TYPE_Q4_0_4_4,    { GGML_TYPE_Q4_0, 4} },
-        { GGML_TYPE_Q4_0_4_8,    { GGML_TYPE_Q4_0, 4} },
-        { GGML_TYPE_Q4_0_8_8,    { GGML_TYPE_Q4_0, 8} },
         { GGML_TYPE_Q4_0_R8,     { GGML_TYPE_Q4_0, 8} },
         { GGML_TYPE_Q5_0_R4,     { GGML_TYPE_Q5_0, 4} },
         { GGML_TYPE_Q6_0_R4,     { GGML_TYPE_Q6_0, 4} },
@@ -1453,9 +1450,6 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         case LLAMA_FTYPE_MOSTLY_IQ3_S:   default_type = GGML_TYPE_IQ3_S;   break;
         case LLAMA_FTYPE_MOSTLY_IQ3_S_R4:default_type = GGML_TYPE_IQ3_S_R4;break;
         case LLAMA_FTYPE_MOSTLY_IQ3_M:   default_type = GGML_TYPE_IQ3_S;   break;
-        case LLAMA_FTYPE_MOSTLY_Q4_0_4_4: default_type = GGML_TYPE_Q4_0_4_4; break;
-        case LLAMA_FTYPE_MOSTLY_Q4_0_4_8: default_type = GGML_TYPE_Q4_0_4_8; break;
-        case LLAMA_FTYPE_MOSTLY_Q4_0_8_8: default_type = GGML_TYPE_Q4_0_8_8; break;
 
         default: throw std::runtime_error(format("invalid output file type %d\n", ftype));
     }
@@ -1757,10 +1751,18 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         // do not quantize relative position bias (T5)
         quantize &= name.find("attn_rel_b.weight") == std::string::npos;
 
-        // Xing4.0: do not quantize the mHC projection weights
-        if (model.arch == LLM_ARCH_XING4_0) {
+        // do not quantize the mHC projection weights
+        if (model.arch == LLM_ARCH_XING4_0 || model.arch == LLM_ARCH_SENSENOVA_LOOP) {
             quantize &= name.find("hc_attn_fn.weight") == std::string::npos;
             quantize &= name.find("hc_ffn_fn.weight")  == std::string::npos;
+        }
+
+        if (model.arch == LLM_ARCH_INKLING2_LOOP) {
+            quantize &= name.find("_conv.weight")  == std::string::npos;
+            quantize &= name.find("_clip.weight")  == std::string::npos;
+            quantize &= name.find("attn_rel_bias") == std::string::npos;
+            quantize &= name.find("loop_")         == std::string::npos;
+            quantize &= name.find("_res_query.weight") == std::string::npos;
         }
 
         // quantize the extra output tensor
@@ -2343,10 +2345,18 @@ static void estimate_imatrix_internal(const std::string & fname_inp,
         // do not quantize relative position bias (T5)
         quantize &= name.find("attn_rel_b.weight") == std::string::npos;
 
-        // Xing4.0: do not quantize the mHC projection weights
-        if (model.arch == LLM_ARCH_XING4_0) {
+        // do not quantize the mHC projection weights
+        if (model.arch == LLM_ARCH_XING4_0 || model.arch == LLM_ARCH_SENSENOVA_LOOP) {
             quantize &= name.find("hc_attn_fn.weight") == std::string::npos;
             quantize &= name.find("hc_ffn_fn.weight")  == std::string::npos;
+        }
+
+        if (model.arch == LLM_ARCH_INKLING2_LOOP) {
+            quantize &= name.find("_conv.weight")  == std::string::npos;
+            quantize &= name.find("_clip.weight")  == std::string::npos;
+            quantize &= name.find("attn_rel_bias") == std::string::npos;
+            quantize &= name.find("loop_")         == std::string::npos;
+            quantize &= name.find("_res_query.weight") == std::string::npos;
         }
 
         if (quantize) {

@@ -247,6 +247,7 @@ size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
     auto Q = dst->src[0];
     auto K = dst->src[1];
     auto V = dst->src[2];
+    if (dst->src[6] && (Q->ne[0] != 128 || V->ne[0] != 128)) return 0;
     auto indexer = dst->src[5];
     // must match the sparse entry in iqk_flash_attn_noalibi (an unsupported K/V type enters it there, then aborts)
     if (indexer && indexer->type == GGML_TYPE_I32 && indexer->ne[0] < K->ne[1] && indexer->ne[0] % 32 == 0 && dst->src[3] &&
@@ -279,14 +280,15 @@ size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
         size = ggml_row_size(GGML_TYPE_Q8_0, K->ne[0]) * K->ne[1]*K->ne[2]*K->ne[3];
     }
     // multi-token GQA split-K (2..7 query tokens): must match iqk_flash_attn_noalibi
-    if (iqk_fa_mt_split_enabled() && Q->ne[1] >= 2 && Q->ne[1] <= 7 && Q->ne[3] == 1 && rk2 > 1 && Q->ne[2]/V->ne[2] == rk2 &&
+    // (not with a relative-bias table: that case uses the generic path, which applies the bias)
+    if (iqk_fa_mt_split_enabled() && !dst->src[6] && Q->ne[1] >= 2 && Q->ne[1] <= 7 && Q->ne[3] == 1 && rk2 > 1 && Q->ne[2]/V->ne[2] == rk2 &&
         K->ne[2] > 1 && nth >= 1 && K->ne[1]/32 > 1) {
         const int max_nk = iqk_fa_split_k_max_nk(ggml_row_size(K->type, K->ne[0]) + ggml_row_size(V->type, V->ne[0]));
         int nstep_k = iqk_fa_split_k_max_steps(K->ne[1], K->ne[2], nth, max_nk);
         size_t result_size = (V->ne[0] + 16)*rk2*sizeof(float)*Q->ne[1];
         return size + nstep_k*result_size;
     }
-    if (Q->ne[1] == 1 && Q->ne[3] == 1 && Q->ne[2]/K->ne[2] > 1 && nth >= 1 && K->ne[1]/32 > 1) {
+    if (Q->ne[1] == 1 && Q->ne[3] == 1 && Q->ne[2]/K->ne[2] > 1 && nth >= 1 && (K->ne[1]/32 > 1 || dst->src[6])) {
         if (K->ne[2] > 1) {
             // Cover any nek1 that iqk_flash_attn_noalibi narrows to at run time.
             int nstep_k = iqk_fa_split_k_max_steps(K->ne[1], K->ne[2], nth);
@@ -296,7 +298,7 @@ size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
         }
         // With nth >= rk2 the consumer can fall through to the chunked loop, which uses up to 4*nth slots.
         int nstep_k = nth;
-        if (nth >= rk2) {
+        if (nth >= rk2 || (dst->src[6] && dst->src[4])) {
             nstep_k = (K->ne[1] + 31)/32;
             if (nstep_k > 4*nth) nstep_k = 4*nth;
             if (nstep_k < nth) nstep_k = nth;
@@ -321,7 +323,7 @@ static inline const std::unordered_set<ggml_type> & supported_kv_types() {
     return k_supported;
 }
 
-static inline bool are_kv_types_supported(ggml_type type_k, ggml_type type_v) {
+static inline bool are_kv_types_supported(ggml_type type_k, ggml_type type_v, [[maybe_unused]] bool rel_bias = false) {
     if (type_k == GGML_TYPE_BF16) {
         if (type_v != type_k) {
             return false;
@@ -332,6 +334,9 @@ static inline bool are_kv_types_supported(ggml_type type_k, ggml_type type_v) {
         return false;
 #endif
     }
+#if !GGML_IQK_FA_ALL_QUANTS
+    if (rel_bias && type_k == GGML_TYPE_Q8_KV) return false;
+#endif
     auto & supported = supported_kv_types();
     auto it_k = supported.find(type_k);
     auto it_v = supported.find(type_v);
@@ -364,9 +369,15 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                             float         softcap,  // if > 0, a "soft-cap" operation is applied before softmax
                             float       * qkv,      // v*softmax(scale*(k*q))
                             [[maybe_unused]] void * work_buffer_in, [[maybe_unused]] barrier_t barrier, [[maybe_unused]] void * barrier_data,
-                            int ith, int nth, int n_swa, [[maybe_unused]] ggml_tensor * indexer) {
+                            int ith, int nth, int n_swa, [[maybe_unused]] const ggml_tensor * dst) {
 
     if (type_q != 0 || type_mask != 1 || max_bias > 0) return false;
+
+    auto indexer = dst->src[5];
+    auto table = dst->src[6];
+    auto pos_q = dst->src[7];
+    auto pos_k = dst->src[8];
+    if (table && (Dk != 128 || Dv != 128)) return false;
 
     if (indexer && indexer->type == GGML_TYPE_I32) {
         // an unsupported K/V type must reach the abort below, as without the indexer, not the generic indexer path
@@ -507,7 +518,8 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
         }
     }
 
-    if (auto type_k = ggml_type(int_type_k_in), type_v = ggml_type(int_type_v); !are_kv_types_supported(type_k, type_v)) {
+    if (auto type_k = ggml_type(int_type_k_in), type_v = ggml_type(int_type_v); !are_kv_types_supported(type_k, type_v, table != nullptr)) {
+        if (table) return false;
         if (ith == 0) {
             fprintf(stderr, "\n==================== K cache %s coupled with V cache %s is not a supported combination on the CPU backend.\n",
                     ggml_type_name(type_k), ggml_type_name(type_v));
@@ -528,6 +540,7 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
         GGML_ABORT("Fatal error");
     }
 
+    auto key_positions = pos_k ? (const int32_t *)pos_k->data : nullptr;
     if (n_swa > 0 && mask) {
         constexpr int kMinBatch = 256;
         int ntokens = std::max(kMinBatch, neq1);
@@ -537,6 +550,7 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
             k = (const char *)k + int64_t(first)*stride_k;
             v = (const char *)v + int64_t(first)*stride_v;
             mask = (const uint16_t *)mask + first;
+            if (key_positions) key_positions += first;
             nek1 -= first;
         }
     }
@@ -547,7 +561,7 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
     int rv3 = neq3/nev3;
 
     int first_k = 0, last_k = nek1;
-    if (neq3 == 1 && rk2 > 1 && neq1 == 1 && nek1 > 256 && mask) {
+    if (neq3 == 1 && rk2 > 1 && neq1 == 1 && (nek1 > 256 || table) && mask) {
         // This is a quick hack for SWA models.
         // Given that the mask is the same for all layers, ideally we should determine the
         // cache bounds once, and reuse for the whole graph. But even with this simple hack
@@ -572,9 +586,17 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
             k = (const void *)((const char *)k + first_k*stride_k);
             v = (const void *)((const char *)v + first_k*stride_v);
             mask = (const void *)((const uint16_t *)mask + first_k);
+            if (key_positions) key_positions += first_k;
             nek1 = last_k - first_k;
         }
     }
+
+    auto bias_for = [&](int row, int head, int key, bool packed_heads) -> IQKRelBias {
+        if (!table) return {};
+        auto data = (const char *)table->data + row*table->nb[2] + head*table->nb[1];
+        return {(const float *)data, (const int32_t *)pos_q->data + row, key_positions + key,
+                table->nb[packed_heads ? 1 : 2]/sizeof(float), packed_heads ? 0 : 1, int32_t(table->ne[0] - 1)};
+    };
 
     int int_type_k = int_type_k_in;
     auto work_buffer = work_buffer_in;
@@ -603,7 +625,7 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
     // (especially when combining the results from the threads).
     // So, for now, making it work just for MLA (nek2 = 1).
     // I think it would also speed up things for GQA, but I'm leaving this for another day.
-    if (neq3 == 1 && rk2 > 1 && neq1 == 1 && nth >= 1 && nek1/32 > 1 && nek2 == 1) {
+    if (neq3 == 1 && rk2 > 1 && neq1 == 1 && nth >= 1 && nek1/32 > 1 && nek2 == 1 && !(table && sinks)) {
         int nstep_k = nek1/32;
         if (nstep_k >= 4*nth) {
             int nstep_k_per_thread = (nstep_k + nth - 1)/nth;
@@ -632,7 +654,8 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                      Dk, Dv, rk2, nstep_k_this_thread, nbq2, stride_k, stride_v, 0, Dv, //Dk*sizeof(uint16_t), Dv,
                      (const float *)qth, (const void *)kth, (const void *)vth, (const void *)mth, nullptr, 0,
                      scale, softcap,
-                     work_this_thread, work_this_thread + (Dv+0)*rk2, work_this_thread + (Dv+1)*rk2)) return false;
+                     work_this_thread, work_this_thread + (Dv+0)*rk2, work_this_thread + (Dv+1)*rk2,
+                     bias_for(0, 0, kv_offset, true))) return false;
 
             barrier(barrier_data);
 
@@ -669,11 +692,12 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                 auto size_thread = (Dv + 16)*nq_per_thread*sizeof(float);
                 auto result_buffer = work;
 
-                auto kth = (const char *)k + ith_k*(nek1/gcd_k)*stride_k;
-                auto vth = (const char *)v + ith_k*(nek1/gcd_k)*stride_v;
-                auto q_offset = ith_q < ith_mid ? ith_q*nq_per_thread*nbq2 : (ith_mid*nq_per_thread + (ith_q - ith_mid)*nq_this_thread)*nbq2;
-                auto qth = (const char *)q + q_offset;
-                auto mth = mask ? (const char *)mask + ith_k*(nek1/gcd_k)*sizeof(uint16_t) : nullptr; // we don't have ggml_half available here
+                int kv_offset = ith_k*(nek1/gcd_k);
+                auto kth = (const char *)k + kv_offset*stride_k;
+                auto vth = (const char *)v + kv_offset*stride_v;
+                int head = ith_q < ith_mid ? ith_q*nq_per_thread : ith_mid*nq_per_thread + (ith_q - ith_mid)*nq_this_thread;
+                auto qth = (const char *)q + head*nbq2;
+                auto mth = mask ? (const char *)mask + kv_offset*sizeof(uint16_t) : nullptr; // we don't have ggml_half available here
 
                 // Each thread will produce a result of size Dv*nq_this_thread*sizeof(float)
                 // In addition, we need M, S for the nq_this_thread rows the thread is processing
@@ -684,7 +708,8 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                             Dk, Dv, nq_this_thread, nek1/gcd_k, nbq2, stride_k, stride_v, 0, Dv, //Dk*sizeof(uint16_t), Dv,
                             (const float *)qth, (const void *)kth, (const void *)vth, (const void *)mth, nullptr, 0,
                             scale, softcap,
-                            work_this_thread, work_this_thread + (Dv+0)*nq_this_thread, work_this_thread + (Dv+1)*nq_this_thread)) return false;
+                            work_this_thread, work_this_thread + (Dv+0)*nq_this_thread, work_this_thread + (Dv+1)*nq_this_thread,
+                            bias_for(0, head, kv_offset, true))) return false;
 
                 barrier(barrier_data);
 
@@ -729,7 +754,7 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
     // KV head share one pass over the chunk, and long contexts are split across all threads
     // instead of one thread walking the whole KV cache per (head, token).
     // Must match the multi-token branch of iqk_fa_work_buffer_size.
-    if (iqk_fa_mt_split_enabled() && neq3 == 1 && rk2 > 1 && rk2 == rv2 && neq1 >= 2 && neq1 <= 7 && nek2 > 1 && nek1/32 > 1 && nth >= 1) {
+    if (iqk_fa_mt_split_enabled() && !table && neq3 == 1 && rk2 > 1 && rk2 == rv2 && neq1 >= 2 && neq1 <= 7 && nek2 > 1 && nek1/32 > 1 && nth >= 1) {
         const size_t result_size_tok = (Dv + 16)*rk2*sizeof(float);
         const size_t result_size     = result_size_tok*neq1;
         const int max_nk = iqk_fa_split_k_max_nk(ggml_row_size(ggml_type(int_type_k_in), Dk) + ggml_row_size(ggml_type(int_type_v), Dv));
@@ -815,7 +840,8 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
             if (!iqk_flash_attn_impl(int_type_k, int_type_v,
                      Dk, Dv, rk2, this_nk, nbq2, stride_k, stride_v, 0, Dv,
                      this_q, (const void *)this_k, (const void *)this_v, (const void *)this_m, nullptr, 0,
-                     scale, softcap, this_result, this_result + (Dv+0)*rk2, this_result + (Dv+1)*rk2)) return false;
+                     scale, softcap, this_result, this_result + (Dv+0)*rk2, this_result + (Dv+1)*rk2,
+                     bias_for(0, ik02*rk2, ik01, true))) return false;
         }
 
         barrier(barrier_data);
@@ -883,7 +909,8 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                         (const void  *)((const char *)v + iq2/rv2*nbv2 + iq3/rv3*nbv3),
                         mask ? (const void  *)((const char *)mask + size_t(iq1)*stride_m) : nullptr, sinksf, 0,
                         scale, softcap,
-                        (float *)((char *)qkv + (iq3*ne2*ne1 + iq2 + iq1*ne1)*nb1), nullptr, nullptr)) return false;
+                        (float *)((char *)qkv + (iq3*ne2*ne1 + iq2 + iq1*ne1)*nb1), nullptr, nullptr,
+                        bias_for(iq1, iq2, 0, false))) return false;
                 }
             }
         }
@@ -917,7 +944,7 @@ bool iqk_flash_attn_noalibi([[maybe_unused]] int type_q, [[maybe_unused]] int ty
                             [[maybe_unused]] float         softcap,  // if > 0, a "soft-cap" operation is applied before softmax
                             [[maybe_unused]] float       * qkv,      // v*softmax(scale*(k*q))
                             [[maybe_unused]] void * work_buffer, [[maybe_unused]] barrier_t barrier, [[maybe_unused]] void * barrier_data,
-                            [[maybe_unused]] int ith, [[maybe_unused]] int nth, [[maybe_unused]] int n_swa, [[maybe_unused]] ggml_tensor * indexer) {
+                            [[maybe_unused]] int ith, [[maybe_unused]] int nth, [[maybe_unused]] int n_swa, [[maybe_unused]] const ggml_tensor * dst) {
     return false;
 }
 

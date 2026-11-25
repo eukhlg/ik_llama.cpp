@@ -199,6 +199,7 @@ llama_build_and_test(test-chat-template.cpp )
 llama_build_and_test(test-json-partial.cpp )
 llama_build_and_test(test-cpu-affinity.cpp )
 llama_build_and_test(test-nanbeige-loop.cpp )
+llama_build_and_test(test-sensenova-loop.cpp )
 #llama_build_and_test(test-log.cpp)
 llama_build_and_test(
     test-peg-parser.cpp
@@ -215,6 +216,9 @@ llama_build_and_test(test-regex-partial.cpp)
 
 llama_build_and_test(test-iq4-ks-kt-decode.cpp)
 target_include_directories(test-iq4-ks-kt-decode PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
+llama_build_and_test(test-quant-scale.cpp)
+target_include_directories(test-quant-scale PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
 # llama_target_and_test(test-opt.cpp) # SLOW
 
