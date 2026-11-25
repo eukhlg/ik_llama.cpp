@@ -27,6 +27,10 @@ keeps it up to date, and adds:
   in free RAM now fails at startup instead of silently running unmirrored
   (`LLAMA_NUMA_MIRROR_FALLBACK=1` restores the fallback).
 
+With all changes, `--numa mirror` on two nodes generates 54.7 / 57.6 / 59.0 tok/s at MTP draft
+1 / 2 / 3: 1.65–1.69× a single node and 19–25% faster than the original `numa-mirror` branch
+(see [Mirror](#mirror)).
+
 **General (also without the mirror)**
 
 - **Faster delta-net (Qwen3-Next / Qwen3.5 / Qwen3.6 linear attention):** work is balanced
