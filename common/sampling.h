@@ -274,6 +274,12 @@ struct common_sampler {
 
     std::vector<float>* server_biases;
 
+    // roadmap 5.3: allow the sampling fast path (no n_vocab-entry candidate array when the result
+    // provably depends only on the argmax / the top-k logits). Off by default; the server enables it
+    // for its slot samplers. LLAMA_SAMPLER_FAST=0 disables it globally (A/B tests).
+    bool allow_fast_path = false;
+    std::vector<std::pair<float, int>> fast_top;   // scratch for the fast path
+
     // expiring logit bias
     struct elb_state {
         struct elb_token {
