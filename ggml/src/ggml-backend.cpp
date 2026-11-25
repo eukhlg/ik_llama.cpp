@@ -1,5 +1,7 @@
 #if defined(__linux__)
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
@@ -140,8 +142,67 @@ bool ggml_backend_buffer_is_host(ggml_backend_buffer_t buffer) {
     return buffer && ggml_backend_buft_is_host(ggml_backend_buffer_get_type(buffer));
 }
 
+// ---------------------------------------------------------------------------------------------
+// Roadmap 5.4 (opt-in): NUMA placement of compute buffers (activations / intermediate tensors
+// allocated by the graph allocator) and of the CPU backend's work buffer. By default their pages
+// land wherever they are first touched, i.e. mixed between nodes. LLAMA_COMPUTE_BUF_NUMA:
+//   interleave   pages alternate between all nodes
+//   node0/node1  pages bound to that node
+//   unset        first touch (unchanged behaviour)
+// Weights, KV cache and recurrent state are not affected (their buffers are not COMPUTE buffers).
+// Placement only: results are identical.
+// ---------------------------------------------------------------------------------------------
+static int ggml_compute_buf_numa_policy(void) {   // -1 none, -2 interleave, >= 0 bind to that node
+    static const int policy = [] {
+        const char * e = getenv("LLAMA_COMPUTE_BUF_NUMA");
+        if (!e || !*e) return -1;
+        const std::string v(e);
+        if (v == "interleave") return -2;
+        if (v.rfind("node", 0) == 0) return atoi(v.c_str() + 4);
+        fprintf(stderr, "%s: unknown LLAMA_COMPUTE_BUF_NUMA=%s (use interleave, node0, node1)\n", __func__, e);
+        return -1;
+    }();
+    return policy;
+}
+
+static void ggml_compute_buf_numa_apply(void * data, size_t size, const char * what) {
+#if defined(__linux__) && defined(SYS_mbind)
+    const int policy = ggml_compute_buf_numa_policy();
+    const int n_nodes = ggml_numa_node_count();
+    if (policy == -1 || n_nodes < 2 || data == NULL || size == 0) return;
+    if (policy >= n_nodes) return;
+    // whole pages inside the range only (heap allocations need not be page aligned)
+    const uintptr_t pg = (uintptr_t) sysconf(_SC_PAGESIZE);
+    const uintptr_t b = ((uintptr_t) data + pg - 1) & ~(pg - 1);
+    const uintptr_t e = ((uintptr_t) data + size) & ~(pg - 1);
+    if (e <= b) return;
+    unsigned long mask = 0;
+    int mode;
+    if (policy == -2) {
+        for (int i = 0; i < n_nodes && i < 64; ++i) mask |= 1ul << i;
+        mode = 3;   // MPOL_INTERLEAVE
+    } else {
+        mask = 1ul << policy;
+        mode = 2;   // MPOL_BIND
+    }
+    const unsigned long MPOL_MF_MOVE_ = 1ul << 1;   // migrate pages already touched
+    const long rc = syscall(SYS_mbind, (void *) b, (unsigned long) (e - b), mode, &mask, 64ul + 1, MPOL_MF_MOVE_);
+    static int n_reports = 0;
+    if (n_reports < 8) {
+        ++n_reports;
+        fprintf(stderr, "ggml: %s %.1f MiB -> %s%s\n", what, (e - b) / 1048576.0,
+                policy == -2 ? "interleave" : (policy == 0 ? "node0" : "node1"), rc != 0 ? " (mbind failed)" : "");
+    }
+#else
+    GGML_UNUSED(data); GGML_UNUSED(size); GGML_UNUSED(what);
+#endif
+}
+
 void ggml_backend_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
     buffer->usage = usage;
+    if (usage == GGML_BACKEND_BUFFER_USAGE_COMPUTE && buffer->buft == ggml_backend_cpu_buffer_type()) {
+        ggml_compute_buf_numa_apply(ggml_backend_buffer_get_base(buffer), ggml_backend_buffer_get_size(buffer), "compute buffer");
+    }
 
     // FIXME: add a generic callback to the buffer interface
     if (ggml_backend_buffer_is_multi_buffer(buffer)) {
@@ -908,6 +969,7 @@ GGML_CALL static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t 
             return GGML_STATUS_ALLOC_FAILED;
         }
         cpu_ctx->work_size = cplan.work_size;
+        ggml_compute_buf_numa_apply(cpu_ctx->work_data, cpu_ctx->work_size, "cpu work buffer");
     }
     cplan.work_data = (uint8_t *)cpu_ctx->work_data;
 
