@@ -31690,6 +31690,12 @@ static void ggml_graph_stats_dump(const struct ggml_cgraph * cgraph) {
     free(pair); free(pair_ex);
 }
 
+// compute team of the last ggml_graph_compute, reused by ggml_parallel_host_copy
+#define GGML_HC_MAX_AFFINITY 1024
+static int     g_hc_n_threads = 0;
+static int     g_hc_n_aff     = 0;
+static int32_t g_hc_aff[GGML_HC_MAX_AFFINITY];
+
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_graph_stats_dump(cgraph);
     const bool    ins_phase = ggml_phase_enabled();
@@ -31735,6 +31741,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
+        g_hc_n_aff = 0;
+        if (cplan->cpu_affinity != NULL && cplan->n_cpu_affinity > 0 && cplan->n_cpu_affinity <= GGML_HC_MAX_AFFINITY) {
+            memcpy(g_hc_aff, cplan->cpu_affinity, (size_t) cplan->n_cpu_affinity * sizeof(int32_t));
+            g_hc_n_aff = cplan->n_cpu_affinity;
+        }
 //#if IK_PRINT_TIMING
 //        int64_t tim1 = ggml_time_us();
 //#endif
@@ -31757,6 +31768,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             };
             ggml_graph_compute_thread(&worker);
         }
+        g_hc_n_threads = n_threads;   // the team size OpenMP actually gave us
 //#if IK_PRINT_TIMING
 //        int64_t tim2 = ggml_time_us();
 //        printf("%s(...): %d us\n", __func__, (int)(tim2-tim1));
@@ -31820,6 +31832,69 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 #endif
 
     return state_shared.ec;
+}
+
+bool ggml_parallel_host_copy(const struct ggml_host_copy_range * items, int n_items) {
+#if defined(GGML_USE_OPENMP)
+    const int nt = g_hc_n_threads;
+    if (nt <= 1 || n_items <= 0) {
+        return false;
+    }
+    const bool mirror  = ggml_numa_mirror_active();
+    const int  n_nodes = mirror ? ggml_numa_node_count() : 1;
+#if defined(__gnu_linux__)
+    cpu_set_t saved_affinity;
+    const bool restore_affinity = pthread_getaffinity_np(pthread_self(), sizeof(saved_affinity), &saved_affinity) == 0;
+#endif
+    #pragma omp parallel num_threads(nt)
+    {
+        const int ith = omp_get_thread_num();
+        const int nth = omp_get_num_threads();
+        // same placement as a graph compute: NUMA node pinning, then the explicit CPU list
+        set_numa_thread_affinity(ith, nth);
+#if defined(__gnu_linux__)
+        if (g_hc_n_aff > 0) {
+            const int cpu = g_hc_aff[ith % g_hc_n_aff];
+            if (cpu >= 0 && cpu < CPU_SETSIZE && sched_getcpu() != cpu) {
+                cpu_set_t mask;
+                CPU_ZERO(&mask);
+                CPU_SET(cpu, &mask);
+                pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask);
+            }
+        }
+#endif
+        // this thread's node and its rank among that node's threads (block split, as in compute)
+        const int node = mirror ? ggml_numa_node_for_thread(ith, nth) : 0;
+        int first = 0, cnt = 0;
+        for (int t = 0; t < nth; ++t) {
+            const int tn = mirror ? ggml_numa_node_for_thread(t, nth) : 0;
+            if (tn == node) { if (cnt == 0) first = t; ++cnt; }
+        }
+        const int r = ith - first;
+        for (int k = 0; k < n_items; ++k) {
+            const size_t bytes = items[k].bytes;
+            const size_t a  = bytes * node / n_nodes;
+            const size_t b  = bytes * (node + 1) / n_nodes;
+            const size_t ta = a + (b - a) * r / cnt;
+            const size_t tb = a + (b - a) * (r + 1) / cnt;
+            if (tb > ta) {
+                memcpy((char *) items[k].dst + ta, (const char *) items[k].src + ta, tb - ta);
+            }
+        }
+    }
+    // don't leave affinity set on the calling thread (as after a graph compute)
+    clear_numa_thread_affinity();
+#if defined(__gnu_linux__)
+    if (restore_affinity) {
+        pthread_setaffinity_np(pthread_self(), sizeof(saved_affinity), &saved_affinity);
+    }
+#endif
+    return true;
+#else
+    UNUSED(items);
+    UNUSED(n_items);
+    return false;
+#endif
 }
 
 enum ggml_status ggml_graph_compute_with_ctx(struct ggml_context * ctx, struct ggml_cgraph * cgraph, int n_threads) {

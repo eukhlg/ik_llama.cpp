@@ -9731,6 +9731,22 @@ static void llama_parallel_host_copy(const std::vector<llama_host_copy> & items)
         if (ph) ggml_phase_add(GGML_PHASE_RESTORE_COPY, ggml_phase_now_ns() - ph_t);
         return;
     }
+    // Preferred: ggml's compute team (OpenMP pool). Those threads are already running and pinned,
+    // and spin between graphs on the same CPUs, so separate copy threads would have to share cores
+    // with them. LLAMA_RESTORE_OWN_THREADS=1 forces the separate threads below, for A/B tests.
+    static const bool own_threads = [] {
+        const char * e = getenv("LLAMA_RESTORE_OWN_THREADS");
+        return e && atoi(e) != 0;
+    }();
+    if (!own_threads) {
+        std::vector<ggml_host_copy_range> ranges;
+        ranges.reserve(items.size());
+        for (const auto & it : items) ranges.push_back({ it.dst, it.src, it.bytes });
+        if (ggml_parallel_host_copy(ranges.data(), (int) ranges.size())) {
+            if (ph) ggml_phase_add(GGML_PHASE_RESTORE_COPY, ggml_phase_now_ns() - ph_t);
+            return;
+        }
+    }
     const int n_nodes = ggml_numa_mirror_active() ? std::max(1, ggml_numa_node_count()) : 1;
     struct worker { int node, cpu, t, nt; };
     std::vector<worker> plan;

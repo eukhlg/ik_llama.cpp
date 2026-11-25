@@ -1027,6 +1027,13 @@ extern "C" {
     GGML_API void     ggml_numa_set_mirror(uint32_t flags);        // which ggml_numa_mirror_flags to mirror
     GGML_API uint32_t ggml_numa_get_mirror(void);                  // current mirror flags
     GGML_API int      ggml_numa_node_for_thread(int ith, int nth); // block split of threads across nodes
+
+    // Copy many host ranges with the compute thread team of the last ggml_graph_compute (the OpenMP
+    // pool: same threads, same pinning). With the NUMA mirror active, node k's threads copy the k-th
+    // 1/n_nodes slice of every range. Must be called from the thread that runs graph computes.
+    // Returns false (nothing copied) when that team is not available, e.g. a build without OpenMP.
+    struct ggml_host_copy_range { void * dst; const void * src; size_t bytes; };
+    GGML_API bool     ggml_parallel_host_copy(const struct ggml_host_copy_range * items, int n_items);
     // allocate/free memory bound to a specific NUMA node (mmap + mbind + THP)
     GGML_API void *   ggml_numa_alloc(size_t size, int node);
     GGML_API void     ggml_numa_free(void * ptr, size_t size);
