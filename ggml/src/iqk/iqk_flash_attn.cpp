@@ -147,6 +147,74 @@ bool iqk_fa_indexed_kv_heads_rows(int int_type_k, int int_type_v, int Dk, int Dv
 }
 }
 
+// ---------------------------------------------------------------------------------------------
+// GQA split-K chunking (roadmap 5.2 / 5.6), shared by the single-token and multi-token split-K paths
+// and by iqk_fa_work_buffer_size. The KV cache of every KV head is cut into nkk chunks of nk rows
+// (nk a multiple of 32, the last chunk of a head may be shorter); chunk istep_k goes to thread
+// istep_k % nth. The previous choice could leave e.g. 56 chunks for 24 threads at 7k context
+// (slowest thread 1.29x the average). Now every candidate chunk count per head up to the work
+// buffer bound is costed with the actual round-robin assignment (rows + a fixed per-chunk overhead)
+// and the cheapest is taken (ties: fewer chunks). IQK_FA_OLD_CHUNKS=1 restores the old choice.
+// ---------------------------------------------------------------------------------------------
+static inline int iqk_fa_split_k_max_steps(int nek1, int nek2, int nth) {
+    // upper bound of nek2*nkk for any nek1' <= nek1: the work buffer is sized with this
+    int nstep_k = nek2*((nek1 + 31)/32);
+    if (nstep_k > 4*nth + nek2) nstep_k = 4*nth + nek2;
+    return nstep_k;
+}
+
+static int iqk_fa_split_k_chunk_old(int nek1, int nek2, int nth) {
+    int gcd = simple_gcd(nek2, nth);
+    int nth_k  = nth/gcd;
+    int nek2_k = nek2/gcd;
+    int nchunk = nek2_k*nek1/32;
+    int npt = (nchunk + nth_k - 1)/nth_k;
+    if (npt*nth_k == nchunk) {
+        return 32 * (nek2*nek1/(32*nth));
+    }
+    int nm = 1;
+    while (nm*4 < npt) nm *= 2;
+    return 32*nm;
+}
+
+static int iqk_fa_split_k_chunk(int nek1, int nek2, int nth) {
+    static const bool old = [] {
+        const char * e = getenv("IQK_FA_OLD_CHUNKS");
+        return e && atoi(e) != 0;
+    }();
+    // nek2 == 1 keeps the old choice: its work buffer is sized differently (see iqk_fa_work_buffer_size)
+    if (old || nek2 <= 1) return iqk_fa_split_k_chunk_old(nek1, nek2, nth);
+    // all threads of a graph ask with the same arguments: remember the last answer per thread
+    thread_local int c_nek1 = -1, c_nek2 = -1, c_nth = -1, c_nk = 0;
+    if (nek1 == c_nek1 && nek2 == c_nek2 && nth == c_nth) return c_nk;
+    constexpr int kOverheadRows = 32;   // per-chunk cost (setup, q reload, one more partial to combine)
+    const int nblk      = (nek1 + 31)/32;
+    const int max_steps = iqk_fa_split_k_max_steps(nek1, nek2, nth);
+    const int max_nkk   = std::max(1, std::min(nblk, max_steps/std::max(1, nek2)));
+    std::vector<int64_t> load(nth);
+    int best_nk = 32*nblk;
+    int64_t best_cost = INT64_MAX;
+    int best_steps = INT32_MAX;
+    for (int want = 1; want <= max_nkk; ++want) {
+        const int nk  = 32*((nblk + want - 1)/want);
+        const int nkk = (nek1 + nk - 1)/nk;
+        const int nstep_k = nek2*nkk;
+        if (nstep_k > max_steps) continue;
+        std::fill(load.begin(), load.end(), 0);
+        for (int istep_k = 0; istep_k < nstep_k; ++istep_k) {
+            const int ik01    = nk*(istep_k % nkk);
+            const int this_nk = ik01 + nk <= nek1 ? nk : nek1 - ik01;
+            load[istep_k % nth] += this_nk + kOverheadRows;
+        }
+        const int64_t cost = *std::max_element(load.begin(), load.end());
+        if (cost < best_cost || (cost == best_cost && nstep_k < best_steps)) {
+            best_cost = cost; best_steps = nstep_k; best_nk = nk;
+        }
+    }
+    c_nek1 = nek1; c_nek2 = nek2; c_nth = nth; c_nk = best_nk;
+    return best_nk;
+}
+
 // IQK_FA_NO_MT_SPLIT=1 disables the multi-token GQA split-K path (A/B tests)
 static bool iqk_fa_mt_split_enabled() {
     static const bool enabled = [] {
@@ -194,16 +262,14 @@ size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
     // multi-token GQA split-K (2..7 query tokens): must match iqk_flash_attn_noalibi
     if (iqk_fa_mt_split_enabled() && Q->ne[1] >= 2 && Q->ne[1] <= 7 && Q->ne[3] == 1 && rk2 > 1 && Q->ne[2]/V->ne[2] == rk2 &&
         K->ne[2] > 1 && nth >= 1 && K->ne[1]/32 > 1) {
-        int nstep_k = K->ne[2]*((K->ne[1] + 31)/32);
-        if (nstep_k > 4*nth + K->ne[2]) nstep_k = 4*nth + K->ne[2];
+        int nstep_k = iqk_fa_split_k_max_steps(K->ne[1], K->ne[2], nth);
         size_t result_size = (V->ne[0] + 16)*rk2*sizeof(float)*Q->ne[1];
         return size + nstep_k*result_size;
     }
     if (Q->ne[1] == 1 && Q->ne[3] == 1 && Q->ne[2]/K->ne[2] > 1 && nth >= 1 && K->ne[1]/32 > 1) {
         if (K->ne[2] > 1) {
             // Cover any nek1 that iqk_flash_attn_noalibi narrows to at run time.
-            int nstep_k = K->ne[2]*((K->ne[1] + 31)/32);
-            if (nstep_k > 4*nth + K->ne[2]) nstep_k = 4*nth + K->ne[2];
+            int nstep_k = iqk_fa_split_k_max_steps(K->ne[1], K->ne[2], nth);
             size_t result_size = (V->ne[0] + 16)*Q->ne[2]/K->ne[2]*sizeof(float);
             size += nstep_k*result_size;
             return size;
@@ -646,19 +712,7 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
     if (iqk_fa_mt_split_enabled() && neq3 == 1 && rk2 > 1 && rk2 == rv2 && neq1 >= 2 && neq1 <= 7 && nek2 > 1 && nek1/32 > 1 && nth >= 1) {
         const size_t result_size_tok = (Dv + 16)*rk2*sizeof(float);
         const size_t result_size     = result_size_tok*neq1;
-        int gcd = simple_gcd(nek2, nth);
-        int nth_k  = nth/gcd;
-        int nek2_k = nek2/gcd;
-        int nchunk = nek2_k*nek1/32;
-        int npt = (nchunk + nth_k - 1)/nth_k;
-        int nk;
-        if (npt*nth_k == nchunk) {
-            nk = 32 * (nek2*nek1/(32*nth));
-        } else {
-            int nm = 1;
-            while (nm*4 < npt) nm *= 2;
-            nk = 32*nm;
-        }
+        const int nk  = iqk_fa_split_k_chunk(nek1, nek2, nth);
         int nkk = (nek1 + nk - 1)/nk;
         int nstep_k = nek2*nkk;
         for (int istep_k = ith; istep_k < nstep_k; istep_k += nth) {
@@ -717,24 +771,7 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                                                                        // but it does not seem useful
     if (neq3 == 1 && rk2 > 1 && rk2 == rv2 && neq1 == 1 && nth >= 1) { // && nek2*nek1 >= 32*nth) {
         auto result_size = (Dv + 16)*rk2*sizeof(float);
-        int gcd = simple_gcd(nek2, nth);
-        int nth_k  = nth/gcd;
-        int nek2_k = nek2/gcd;
-        int nchunk = nek2_k*nek1/32;
-        int npt = (nchunk + nth_k - 1)/nth_k;
-        int nk;
-        if (npt*nth_k == nchunk) {
-            nk = 32 * (nek2*nek1/(32*nth));
-        } else {
-            //int nm = std::max(1, npt/8);
-            int nm = 1;
-            while (true) {
-                if (nm*4 >= npt) break;
-                nm *= 2;
-            }
-            nk = 32*nm;
-        }
-        //int nk = 32 * (nek2*nek1/(32*nth));
+        const int nk  = iqk_fa_split_k_chunk(nek1, nek2, nth);
         int nkk = (nek1 + nk - 1)/nk;
         int nstep_k = nek2*nkk;
         //if (ith == 0) {
