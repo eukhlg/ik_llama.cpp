@@ -1,31 +1,59 @@
-# NUMA-mirrored ik_llama.cpp
+# ik_llama.cpp with NUMA mirroring and faster decoding
 
 This is a fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) — itself a
 performance-focused fork of [llama.cpp](https://github.com/ggerganov/llama.cpp) (see the
 original README below) — that adds a **`--numa mirror`** mode for fast CPU inference on
-multi-socket / multi-NUMA-node servers.
+multi-socket / multi-NUMA-node servers, plus decode optimizations for MTP / speculative
+decoding (multi-token split-K attention, cheaper rollback, a sampling fast path) that also
+work without the mirror.
 
 The NUMA mirroring code is borrowed from the upstream
 [mikechambers84/ik_llama.cpp](https://github.com/mikechambers84/ik_llama.cpp/tree/numa-mirror)
 `numa-mirror` branch by Mike Chambers. This fork merges it into current ik_llama.cpp `main`,
 keeps it up to date, and adds:
 
+**For the NUMA mirror**
+
 - **Coverage of newer ik_llama.cpp code paths:** the expert-chunking MoE kernels and fused
   up/gate ops read the node-local weight copies; the `-mtprot` requantized MTP output head
   is mirrored too.
 - **Parallel KV/state replication:** writes to the mirrored KV cache and recurrent state are
   split across all threads by bytes instead of by rows.
+- **Node-local recurrent state:** each slot's delta-net state is placed on the NUMA node that
+  processes its heads, and a rollback after rejected MTP drafts copies each node's part on
+  that node.
+- **Faster, stricter mirror setup:** the per-node weight and KV copies are made in parallel by
+  each node's own CPUs (mirror copy 3.8 s instead of 20.7 s), and a mirror that does not fit
+  in free RAM now fails at startup instead of silently running unmirrored
+  (`LLAMA_NUMA_MIRROR_FALLBACK=1` restores the fallback).
+
+**General (also without the mirror)**
+
 - **Faster delta-net (Qwen3-Next / Qwen3.5 / Qwen3.6 linear attention):** work is balanced
-  by (head, row block), with an AVX-512 path, and each slot's recurrent state is placed on
-  the NUMA node that processes its heads.
+  by (head, row block), with an AVX-512 path.
 - **Shared small-batch activation quantization:** with 1–3 tokens per graph (token
   generation, MTP), quantizing the activations is split into row chunks across all threads
   instead of one row per thread.
-- **Split-K attention for multi-token decode:** with MTP, decode graphs verify 2–3 tokens; the
+- **Split-K attention for multi-token decode:** with MTP, decode graphs verify 2–4 tokens; the
   KV cache is now split across all threads for 2–7 query tokens too (previously only for one),
-  so generation speed holds up at long context.
-- **Barrier diagnostics:** `GGML_NUMA_BARRIER_STATS=<N>` prints, every N graphs, how thread
-  time splits into compute, imbalance and barrier handoff, per op and per thread.
+  so generation speed holds up at long context. The number of KV chunks is chosen to balance
+  the threads (the old choice left e.g. 56 chunks for 24 threads), with chunks kept small
+  enough to stay in L2 while each verified token re-reads them: flash attention is 7–22%
+  faster per call at 0.5k–14k context.
+- **Cheaper rollback after rejected MTP drafts:** the ~66 MB recurrent (delta-net) state is
+  restored by ggml's already running, pinned compute threads instead of one thread while all
+  others wait (5.1 → 2.2 ms per restore).
+- **Sampling fast path:** when the result provably depends only on the best token (greedy) or
+  on the top-k logits (default sampler chain), the server's sampler works on the logits
+  directly instead of building a 248k-entry candidate array per token (638 → 59 µs per call
+  greedy, 493 → 124 µs at temperature 0.7). It falls back to the full path whenever grammar,
+  biases, active penalties, probability output or equal logits could change the result, so
+  tokens are identical.
+- **Transparent huge pages** are requested for large CPU buffers (weights, KV cache), which
+  otherwise get 4 KB pages with the common THP "madvise" setting.
+
+Together, the rollback and sampling changes raise generation speed by +5.7% (greedy) and +4.2%
+(temperature 0.7) with byte-identical output (see [MTP rollback and sampling](#mtp-rollback-and-sampling)).
 
 ## What it does
 
@@ -76,30 +104,82 @@ has to fit that many times. Because of this, `--numa mirror` implies `--no-mmap`
   split of threads into one block per node. This cut barrier imbalance from 23.5% to
   16.7% of thread time in our tests.
 
+- **Recommended for Qwen3.5 / Qwen3.6 MoE with MTP:**
+  `--numa mirror -t <all cores> -cr <cpus> -rtr -mtprot iq4_xs --spec-type mtp:n_max=3,p_min=0.75`.
+
+**Switches for A/B tests** (environment variables; unset = the default behaviour):
+
+| Variable | Effect |
+|---|---|
+| `IQK_FA_NO_MT_SPLIT=1` | old attention path for 2–7 query tokens (no split-K) |
+| `IQK_FA_OLD_CHUNKS=1` | old split-K chunk count |
+| `LLAMA_SERIAL_STATE_RESTORE=1` | restore the recurrent state on one thread |
+| `LLAMA_RESTORE_OWN_THREADS=1` | restore with separate threads instead of ggml's compute threads |
+| `LLAMA_SAMPLER_FAST=0` | always use the full sampling path |
+| `LLAMA_NUMA_MIRROR_FALLBACK=1` | run without mirroring if the mirror does not fit in RAM |
+| `LLAMA_COMPUTE_BUF_NUMA=interleave\|node0\|node1` | NUMA placement of compute buffers (default: first touch; measured no effect) |
+
 See [`examples/main/README.md`](examples/main/README.md) for the full list of `--numa` modes.
+
+## Diagnostics
+
+Opt-in tools used to find and verify the changes above; all are off unless the variable is set.
+
+| Tool | Scope | What it reports |
+|---|---|---|
+| `GGML_NUMA_BARRIER_STATS=<N>` | NUMA mirror | every N graphs: how thread time splits into compute, imbalance and barrier handoff, per op and per thread |
+| `LLAMA_PHASE_STATS=<N>` | general | every N decodes: wall time per decode cycle split into graph build, compute, thread wake-up, sampling, state restore and MTP draft, with sub-phases for restore and sampling |
+| `GGML_OP_BYTES=<N>` | general | every N graphs: time per op category and logical weight throughput (GB/s), separately for main, MTP and prompt-processing graphs |
+| `GGML_GRAPH_STATS=1` | general | once per graph size: op counts and the most frequent consecutive op pairs (fusion candidates) |
+| `llama-kbench` | general | the model's matmul shapes and quant types with weights in DRAM or in cache, 1–4 tokens per op |
 
 ## Benchmarks
 
-**Setup:** Dell PowerEdge R650xs, 2× Xeon Gold 6326, VMware ESXi VM with 24 vCPU / 64 GB
-in 2 vNUMA nodes (12 vCPU each); Docker container pinned with `--cpuset-cpus 0-23
+**Setup (all sections):** Dell PowerEdge R650xs, 2× Xeon Gold 6326, VMware ESXi VM with 24 vCPU /
+64 GB in 2 vNUMA nodes (12 vCPU each); Docker container pinned with `--cpuset-cpus 0-23
 --cpuset-mems 0,1 --cap-add SYS_NICE`. Model: Qwen3.6-35B-A3B Q4_K_M (20.2 GiB) with MTP
-speculative decoding (`--spec-type mtp:n_max=N,p_min=0.75`), `llama-server -c 8192 -np 1 -rtr`.
+speculative decoding (`--spec-type mtp:n_max=N,p_min=0.75`), `llama-server -np 1 -rtr`.
 
-**Method:** generation tok/s, median of 9 samples (3 prompts × 3 runs, 256 tokens,
-temperature 0.7) per MTP draft length; draft acceptance 84–88% throughout.
+Each section uses its own method (prompts, temperature, length), so absolute tok/s should only be
+compared within a section.
+
+### Mirror
+
+**Responsible:** the NUMA mirror itself, plus this fork's coverage of newer code paths (mirrored
+`-mtprot` head), parallel KV/state replication, faster delta-net and shared small-batch
+activation quantization; `-cr` thread pinning. The last row adds the general split-K, rollback
+and sampling changes.
+
+**Method:** `bench-mtp.sh`: generation tok/s, median of 9 samples (3 prompts × 3 runs, 256
+tokens, temperature 0.7, `-c 8192`) per MTP draft length; draft acceptance 84–88% throughout.
+The first four rows were measured at commit c5e3bfe1 or earlier; the last two back to back on
+the same day, two alternating runs each, mean of the two medians.
 
 | Configuration | draft 1 | draft 2 | draft 3 |
 |---|---|---|---|
 | `--numa isolate`, 1 node, 12 threads | 33.07 | 34.34 | 34.93 |
 | `--numa distribute`, 24 threads | 32.10 | 32.51 | 36.19 |
 | mikechambers84 `numa-mirror` (July base), 24 threads | 46.00 | 46.10 | 48.14 |
-| this fork, `--numa mirror`, 24 threads | 52.22 | 52.26 | 52.55 |
-| this fork, `--numa mirror -mtprot iq4_xs -cr 0-23`, 24 threads | **53.16** | **56.02** | **57.20** |
+| this fork at c5e3bfe1, `--numa mirror`, 24 threads | 52.22 | 52.26 | 52.55 |
+| this fork at c5e3bfe1, `--numa mirror -mtprot iq4_xs -cr 0-23`, 24 threads | 52.99 | 55.32 | 55.70 |
+| this fork at faca8c38, `--numa mirror -mtprot iq4_xs -cr 0-23`, 24 threads | **54.68** | **57.58** | **59.02** |
 
-Mirror gives 1.52–1.64× over a single node; `distribute` without mirroring gives no gain.
+Mirror gives 1.52–1.69× over a single node; `distribute` without mirroring gives no gain. The
+current build is +3.2% / +4.1% / +6.0% faster than c5e3bfe1 at draft 1 / 2 / 3; the gain grows
+with the draft length because longer drafts mean more rollbacks and more sampled tokens per
+cycle.
 
-**Long context** (`--numa mirror -mtprot iq4_xs -cr 0-23`, MTP draft 2, `-c 65536`, 256 tokens
-generated, median of 3):
+### Long context
+
+**Responsible:** split-K attention for multi-token decode (first table) and its balanced chunk
+count (second table).
+
+These changes don't depend on `--numa mirror`: they apply to ik_llama.cpp in general for CPU
+flash attention with GQA and multi-token decode (MTP or other speculative decoding). The numbers
+below were measured in mirror mode.
+
+**Split-K attention vs the previous path.** Method: `--numa mirror -mtprot iq4_xs -cr 0-23`, MTP
+draft 2, `-c 65536`, 256 tokens generated, median of 3. Commit 6401d01a.
 
 | Prompt tokens | Gen tok/s, split-K attention | Gen tok/s, previous path | Prompt tok/s |
 |---|---|---|---|
@@ -107,6 +187,40 @@ generated, median of 3):
 | ~3,000 | 49.59 | 45.29 | 479 |
 | ~7,000 | 45.70 | 38.67 | 441 |
 | ~14,000 | 44.79 | 26.70 | 377 |
+
+**Balanced chunk count vs the previous one.** Method: same build (a38d4321), new and old
+chunking (`IQK_FA_OLD_CHUNKS=1`) alternated, 2 rounds × 2 runs, MTP draft 3, temperature 0,
+384 tokens generated, `-c 32768`; flash-attention time per call from `GGML_OP_BYTES`. The
+summation order changes the text slightly, and with it MTP acceptance, so tok/s also reflects
+acceptance (tokens per draft cycle shown); the attention time is the direct measure.
+
+| Prompt tokens | Attention µs/call, new | old | Gen tok/s, new | old | Tokens/cycle, new | old |
+|---|---|---|---|---|---|---|
+| ~500 | **80** | 102 | 55.65 | 57.37 | 2.30 | 2.54 |
+| ~3,000 | **204** | 247 | 54.15 | 53.53 | 2.35 | 2.48 |
+| ~7,000 | **320** | 406 | 51.38 | 50.52 | 2.37 | 2.44 |
+| ~14,000 | **679** | 729 | 47.56 | 45.98 | 2.38 | 2.41 |
+
+### MTP rollback and sampling
+
+**Responsible:** cheaper rollback after rejected MTP drafts and the sampling fast path.
+
+These changes don't depend on `--numa mirror` either: the rollback applies to recurrent models
+(Qwen3.5 / Qwen3.6, Qwen3-Next) with MTP or speculative decoding and the state in CPU memory, the
+sampling fast path to llama-server on any backend. The numbers below were measured in mirror mode.
+
+**Method:** same build (9f695023), new and old code paths (`LLAMA_RESTORE_OWN_THREADS=1
+LLAMA_SAMPLER_FAST=0`) alternated, 3 rounds × 2 runs, MTP draft 3, 1024 tokens generated,
+`-c 16384`, phase timers on in both (about 2% overhead); one essay prompt at temperature 0 and
+at temperature 0.7 / top_p 0.95 / seed 42. Outputs byte-identical between old and new.
+
+| Sampling | Gen tok/s, new | old | Gain | State restore per rollback, new / old | Sampling per token, new / old |
+|---|---|---|---|---|---|
+| temperature 0 | **55.87** | 52.87 | +5.7% | 2.2 / 5.1 ms | 59 / 638 µs |
+| temperature 0.7 | **53.58** | 51.42 | +4.2% | 2.2 / 5.2 ms | 124 / 493 µs |
+
+Every change is also checked by comparing `--numa mirror` with `--numa distribute` output at
+temperature 0 (3 prompts × 2048 tokens, with and without MTP): identical.
 
 ---
 
