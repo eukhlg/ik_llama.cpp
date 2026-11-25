@@ -156,10 +156,25 @@ bool iqk_fa_indexed_kv_heads_rows(int int_type_k, int int_type_v, int Dk, int Dv
 // buffer bound is costed with the actual round-robin assignment (rows + a fixed per-chunk overhead)
 // and the cheapest is taken (ties: fewer chunks). IQK_FA_OLD_CHUNKS=1 restores the old choice.
 // ---------------------------------------------------------------------------------------------
-static inline int iqk_fa_split_k_max_steps(int nek1, int nek2, int nth) {
+// Multi-token path only: every chunk is re-read once per query token, so a chunk's K+V bytes
+// must stay well inside L2 (1.25 MB per core on Ice Lake). The first version picked ~1200-row
+// chunks at 14k context (~1.2 MB) and flash attention got 7% slower there; capping the chunk at
+// kChunkL2Budget fixes that. The single-token path reads each chunk once and has no cap.
+static constexpr size_t kChunkL2Budget = 512*1024;
+
+// largest chunk (rows, multiple of 32) whose K+V bytes fit the budget; 0 = no cap
+static inline int iqk_fa_split_k_max_nk(size_t kv_row_bytes) {
+    if (kv_row_bytes == 0) return 0;
+    int m = int(kChunkL2Budget/kv_row_bytes)/32*32;
+    return std::max(32, m);
+}
+
+static inline int iqk_fa_split_k_max_steps(int nek1, int nek2, int nth, int max_nk = 0) {
     // upper bound of nek2*nkk for any nek1' <= nek1: the work buffer is sized with this
     int nstep_k = nek2*((nek1 + 31)/32);
-    if (nstep_k > 4*nth + nek2) nstep_k = 4*nth + nek2;
+    int bound = 4*nth + nek2;
+    if (max_nk > 0) bound = std::max(bound, nek2*((nek1 + max_nk - 1)/max_nk) + nek2);
+    if (nstep_k > bound) nstep_k = bound;
     return nstep_k;
 }
 
@@ -177,7 +192,8 @@ static int iqk_fa_split_k_chunk_old(int nek1, int nek2, int nth) {
     return 32*nm;
 }
 
-static int iqk_fa_split_k_chunk(int nek1, int nek2, int nth) {
+// max_nk > 0: chunks above it are only used if no candidate within the work-buffer bound fits
+static int iqk_fa_split_k_chunk(int nek1, int nek2, int nth, int max_nk = 0) {
     static const bool old = [] {
         const char * e = getenv("IQK_FA_OLD_CHUNKS");
         return e && atoi(e) != 0;
@@ -185,14 +201,14 @@ static int iqk_fa_split_k_chunk(int nek1, int nek2, int nth) {
     // nek2 == 1 keeps the old choice: its work buffer is sized differently (see iqk_fa_work_buffer_size)
     if (old || nek2 <= 1) return iqk_fa_split_k_chunk_old(nek1, nek2, nth);
     // all threads of a graph ask with the same arguments: remember the last answer per thread
-    thread_local int c_nek1 = -1, c_nek2 = -1, c_nth = -1, c_nk = 0;
-    if (nek1 == c_nek1 && nek2 == c_nek2 && nth == c_nth) return c_nk;
+    thread_local int c_nek1 = -1, c_nek2 = -1, c_nth = -1, c_max = -1, c_nk = 0;
+    if (nek1 == c_nek1 && nek2 == c_nek2 && nth == c_nth && max_nk == c_max) return c_nk;
     constexpr int kOverheadRows = 32;   // per-chunk cost (setup, q reload, one more partial to combine)
     const int nblk      = (nek1 + 31)/32;
-    const int max_steps = iqk_fa_split_k_max_steps(nek1, nek2, nth);
+    const int max_steps = iqk_fa_split_k_max_steps(nek1, nek2, nth, max_nk);
     const int max_nkk   = std::max(1, std::min(nblk, max_steps/std::max(1, nek2)));
     std::vector<int64_t> load(nth);
-    int best_nk = 32*nblk;
+    int best_nk = 0, smallest_nk = 32*nblk;
     int64_t best_cost = INT64_MAX;
     int best_steps = INT32_MAX;
     for (int want = 1; want <= max_nkk; ++want) {
@@ -200,6 +216,8 @@ static int iqk_fa_split_k_chunk(int nek1, int nek2, int nth) {
         const int nkk = (nek1 + nk - 1)/nk;
         const int nstep_k = nek2*nkk;
         if (nstep_k > max_steps) continue;
+        smallest_nk = std::min(smallest_nk, nk);
+        if (max_nk > 0 && nk > max_nk) continue;
         std::fill(load.begin(), load.end(), 0);
         for (int istep_k = 0; istep_k < nstep_k; ++istep_k) {
             const int ik01    = nk*(istep_k % nkk);
@@ -211,7 +229,8 @@ static int iqk_fa_split_k_chunk(int nek1, int nek2, int nth) {
             best_cost = cost; best_steps = nstep_k; best_nk = nk;
         }
     }
-    c_nek1 = nek1; c_nek2 = nek2; c_nth = nth; c_nk = best_nk;
+    if (best_nk == 0) best_nk = smallest_nk;   // nothing within the cap: smallest chunk the buffer allows
+    c_nek1 = nek1; c_nek2 = nek2; c_nth = nth; c_max = max_nk; c_nk = best_nk;
     return best_nk;
 }
 
@@ -262,7 +281,8 @@ size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
     // multi-token GQA split-K (2..7 query tokens): must match iqk_flash_attn_noalibi
     if (iqk_fa_mt_split_enabled() && Q->ne[1] >= 2 && Q->ne[1] <= 7 && Q->ne[3] == 1 && rk2 > 1 && Q->ne[2]/V->ne[2] == rk2 &&
         K->ne[2] > 1 && nth >= 1 && K->ne[1]/32 > 1) {
-        int nstep_k = iqk_fa_split_k_max_steps(K->ne[1], K->ne[2], nth);
+        const int max_nk = iqk_fa_split_k_max_nk(ggml_row_size(K->type, K->ne[0]) + ggml_row_size(V->type, V->ne[0]));
+        int nstep_k = iqk_fa_split_k_max_steps(K->ne[1], K->ne[2], nth, max_nk);
         size_t result_size = (V->ne[0] + 16)*rk2*sizeof(float)*Q->ne[1];
         return size + nstep_k*result_size;
     }
@@ -712,7 +732,8 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
     if (iqk_fa_mt_split_enabled() && neq3 == 1 && rk2 > 1 && rk2 == rv2 && neq1 >= 2 && neq1 <= 7 && nek2 > 1 && nek1/32 > 1 && nth >= 1) {
         const size_t result_size_tok = (Dv + 16)*rk2*sizeof(float);
         const size_t result_size     = result_size_tok*neq1;
-        const int nk  = iqk_fa_split_k_chunk(nek1, nek2, nth);
+        const int max_nk = iqk_fa_split_k_max_nk(ggml_row_size(ggml_type(int_type_k_in), Dk) + ggml_row_size(ggml_type(int_type_v), Dv));
+        const int nk  = iqk_fa_split_k_chunk(nek1, nek2, nth, max_nk);
         int nkk = (nek1 + nk - 1)/nk;
         int nstep_k = nek2*nkk;
         for (int istep_k = ith; istep_k < nstep_k; istep_k += nth) {
