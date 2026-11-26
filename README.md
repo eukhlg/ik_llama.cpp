@@ -51,13 +51,20 @@ With all changes, `--numa mirror` on two nodes generates 54.7 / 57.6 / 59.0 tok/
   on the top-k logits (default sampler chain), the server's sampler works on the logits
   directly instead of building a 248k-entry candidate array per token (638 → 59 µs per call
   greedy, 493 → 124 µs at temperature 0.7). It falls back to the full path whenever grammar,
-  biases, active penalties, probability output or equal logits could change the result, so
-  tokens are identical.
+  biases, probability output or equal logits could change the result, so tokens are identical.
+- **Repetition penalties on the recent tokens only:** with a repeat, frequency or presence
+  penalty set, the sampler looked up every one of the 248k vocabulary entries per token to
+  change at most `repeat_last_n` of them. Now only the recent tokens are penalized, both in the
+  full path (the approach of upstream
+  [PR #3001](https://github.com/ikawrakow/ik_llama.cpp/pull/3001)) and inside the sampling
+  fast path, which no longer falls back when penalties are on (2101 → 71 µs per token greedy,
+  1899 → 145 µs at temperature 0.7).
 - **Transparent huge pages** are requested for large CPU buffers (weights, KV cache), which
   otherwise get 4 KB pages with the common THP "madvise" setting.
 
 Together, the rollback and sampling changes raise generation speed by +5.7% (greedy) and +4.2%
-(temperature 0.7) with byte-identical output (see [MTP rollback and sampling](#mtp-rollback-and-sampling)).
+(temperature 0.7), and with repetition penalties on by another +10.8% / +10.7%, with
+byte-identical output (see [MTP rollback and sampling](#mtp-rollback-and-sampling)).
 
 ## What it does
 
@@ -207,7 +214,8 @@ acceptance (tokens per draft cycle shown); the attention time is the direct meas
 
 ### MTP rollback and sampling
 
-**Responsible:** cheaper rollback after rejected MTP drafts and the sampling fast path.
+**Responsible:** cheaper rollback after rejected MTP drafts, the sampling fast path (first
+table) and repetition penalties on the recent tokens only (second table).
 
 These changes don't depend on `--numa mirror` either: the rollback applies to recurrent models
 (Qwen3.5 / Qwen3.6, Qwen3-Next) with MTP or speculative decoding and the state in CPU memory, the
@@ -222,6 +230,17 @@ at temperature 0.7 / top_p 0.95 / seed 42. Outputs byte-identical between old an
 |---|---|---|---|---|---|
 | temperature 0 | **55.87** | 52.87 | +5.7% | 2.2 / 5.1 ms | 59 / 638 µs |
 | temperature 0.7 | **53.58** | 51.42 | +4.2% | 2.2 / 5.2 ms | 124 / 493 µs |
+
+**Repetition penalties.** Method: repeat 1.1, frequency 0.5, presence 1.5, `repeat_last_n` 64;
+otherwise as above (3 rounds × 2 runs, MTP draft 3, 1024 tokens). Three configurations
+alternated: the current build (e820ffd8), the same build with `LLAMA_SAMPLER_FAST=0` (full path,
+recent-token penalties only) and the previous build (a235abf2, penalties over the whole
+vocabulary). Outputs byte-identical across all three.
+
+| Sampling | Gen tok/s, current | full path | previous | Gain | Sampling per token, current / full path / previous |
+|---|---|---|---|---|---|
+| temperature 0 | **50.23** | 49.09 | 45.35 | +10.8% | 71 / 669 / 2101 µs |
+| temperature 0.7 | **53.84** | 52.47 | 48.65 | +10.7% | 145 / 484 / 1899 µs |
 
 Every change is also checked by comparing `--numa mirror` with `--numa distribute` output at
 temperature 0 (3 prompts × 2048 tokens, with and without MTP): identical.
