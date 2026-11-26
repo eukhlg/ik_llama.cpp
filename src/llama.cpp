@@ -9980,7 +9980,7 @@ static bool llama_mirror_model_weights(const llama_model & model) {
         mb.size = ggml_backend_buffer_get_size(buf);
         void * base = ggml_backend_buffer_get_base(buf);
         for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
-            mb.node_base[n] = NULL;
+            mb.node_base[n] = nullptr;
         }
         mb.node_base[0] = base;                       // node 0 aliases the original buffer ...
         llama_numa_bind_parallel(base, mb.size, 0);   // ... migrated onto node 0 (best effort)
@@ -10045,7 +10045,7 @@ static bool llama_mirror_model_weights(const llama_model & model) {
         mb.size = ggml_backend_buffer_get_size(extra_out->buffer);
         void * base = ggml_backend_buffer_get_base(extra_out->buffer);
         for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
-            mb.node_base[n] = NULL;
+            mb.node_base[n] = nullptr;
         }
         mb.node_base[0] = base;
         llama_numa_bind_parallel(base, mb.size, 0);
@@ -10127,7 +10127,7 @@ static bool llama_mirror_kv_cache(struct llama_kv_cache & cache, const llama_hpa
         mb.size = ggml_backend_buffer_get_size(buf);
         void * base = ggml_backend_buffer_get_base(buf);
         for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
-            mb.node_base[n] = NULL;
+            mb.node_base[n] = nullptr;
         }
         mb.node_base[0] = base;            // node 0 aliases the original (cleared) buffer
         llama_numa_bind_parallel(base, mb.size, 0);  // best-effort migrate it onto node 0

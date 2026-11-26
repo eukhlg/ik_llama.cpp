@@ -169,7 +169,7 @@ static void ggml_compute_buf_numa_apply(void * data, size_t size, const char * w
 #if defined(__linux__) && defined(SYS_mbind)
     const int policy = ggml_compute_buf_numa_policy();
     const int n_nodes = ggml_numa_node_count();
-    if (policy == -1 || n_nodes < 2 || data == NULL || size == 0) return;
+    if (policy == -1 || n_nodes < 2 || data == nullptr || size == 0) return;
     if (policy >= n_nodes) return;
     // whole pages inside the range only (heap allocations need not be page aligned)
     const uintptr_t pg = (uintptr_t) sysconf(_SC_PAGESIZE);
