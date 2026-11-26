@@ -609,6 +609,7 @@ void server_slot::reset() {
     allow_idx = 0;
 
     // Reset speculative decoding stats
+    n_gen_decodes = 0;
     n_draft_total = 0;
     n_draft_accepted = 0;
     n_draft_by_depth.clear();
@@ -708,6 +709,8 @@ int server_slot::get_n_draft_max() const {
 void server_slot::release() {
     // Also release slots with a pending prompt (IDLE + LOAD_PROMPT), e.g. after
     // a rejected request, so they cannot keep the slot busy until the KV is full.
+    // LLAMA_PHASE_STATS=req: drop this slot's window if it was not reported (cancel, errors)
+    ggml_phase_window_end(id);
     if (is_processing()) {
         if (state == SLOT_STATE_PROCESSING) {
             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
@@ -924,6 +927,13 @@ void server_slot::print_timings() const {
         t_prompt_processing, n_prompt_tokens_processed, t_prompt, n_prompt_second,
         t_token_generation, n_decoded, t_gen, n_gen_second,
         t_prompt_processing + t_token_generation, n_prompt_tokens_processed + n_decoded);
+
+    // LLAMA_PHASE_STATS=req: phase table for this generation, begin .. last mark. The tokens and
+    // main decodes passed here are counted by the server up to the same mark (the n_decoded - 1
+    // produced after the first token); n_gen_second is printed for reference.
+    if (n_decoded > 0) {
+        ggml_phase_window_report(id, n_decoded - 1, n_gen_decodes, n_draft_total, n_draft_accepted, n_gen_second);
+    }
 
     if (n_draft_total > 0) {
         const float draft_ratio = (float)n_draft_accepted / n_draft_total;
@@ -4257,8 +4267,8 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                             });
 
                         send_final_response(slot);
+                        slot.print_timings();   // before release: release drops an unreported phase window
                         slot.release();
-                        slot.print_timings();
                         continue;
                     }
 
@@ -4685,8 +4695,10 @@ void server_context::speculative_decoding_accept() {
         slot.drafted.clear();
         slot.draft_proposal_dists.clear();
         slot.n_past += ids.size();
+        slot.n_gen_decodes += 1;   // one main decode verified this draft
         const int64_t t_current = ggml_time_us();
         slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+        ggml_phase_window_mark(slot.id);   // LLAMA_PHASE_STATS=req: tokens produced up to here
 
         // update how many tokens out of those tested were accepted
         const size_t n_draft_accepted = ids.size() - 1;
@@ -5327,6 +5339,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 
             if (slot.n_decoded == 1) {
                 slot.t_start_generation = ggml_time_us();
+                ggml_phase_window_begin(slot.id);   // LLAMA_PHASE_STATS=req: one window = this generation
                 slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
                 metrics.on_prompt_eval(slot);
                 // create checkpoint after prompt processing ends
@@ -5340,6 +5353,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 
             // create checkpoint during generation
             if (slot.n_decoded > 1) {
+                slot.n_gen_decodes += 1;   // this token came from one main decode
                 create_checkpoint_at_interval(slot);
                 if (slot.n_buffer != 0 && params_base.can_ban_phrases) {
                     if (llama_model_has_recurrent(llama_get_model(slot.ctx))) {
@@ -5351,6 +5365,9 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             }
 
             slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+            if (slot.n_decoded > 1) {
+                ggml_phase_window_mark(slot.id);   // LLAMA_PHASE_STATS=req: tokens produced up to here
+            }
 
             result.tok = id;
             result.prob = 1.0f; // TODO: set it here instead of doing inside populate_token_probs

@@ -1011,6 +1011,26 @@ extern "C" {
     GGML_API void    ggml_phase_add(int phase, int64_t ns);
     GGML_API void    ggml_phase_add_bytes(int phase, int64_t bytes);  // reported as MB per call and GB/s
     GGML_API void    ggml_phase_cycle(void);   // call once per main-model decode
+    // LLAMA_PHASE_STATS=req: no periodic reports; the caller opens a window and reports it with its
+    // own counters for exactly the same interval (e.g. the server: one generation = one window).
+    // Op-bytes and barrier stats, when on, are then reported with the same window too.
+    // `owner` identifies the request (e.g. the slot id). A window is only clean if no other request
+    // was active at any time during it; otherwise its report is flagged as mixed.
+    //   begin:  open the window (or mark the open window of another owner as overlapped)
+    //   mark:   the caller produced output; phase, op-bytes and barrier stats are all cut here, and
+    //           the report covers begin .. last mark
+    //   report: print the window with the caller's counts for begin .. last mark: tokens and main
+    //           decodes (cross-checked against ggml's own count); caller_tok_s is the caller's own
+    //           reported rate, printed for reference
+    //   end:    the request is finished or cancelled; an unreported window of this owner is dropped
+    // begin and mark return their timestamp (us, monotonic clock as ggml_time_us; 0 if inactive), so
+    // a caller can use the same endpoints for its own figures.
+    GGML_API bool    ggml_phase_request_mode(void);
+    GGML_API int64_t ggml_phase_window_begin(int owner);
+    GGML_API int64_t ggml_phase_window_mark(int owner);
+    GGML_API void    ggml_phase_window_report(int owner, int64_t n_tokens, int64_t n_cycles, int64_t n_drafted,
+                                              int64_t n_accepted, double caller_tok_s);
+    GGML_API void    ggml_phase_window_end(int owner);
     GGML_API int64_t ggml_cycles(void);
     GGML_API int64_t ggml_cycles_per_ms(void);
 

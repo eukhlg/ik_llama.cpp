@@ -5179,6 +5179,9 @@ struct ggml_nbs_acc {
     uint64_t last_node[GGML_NUMA_MAX_NODES];
 };
 
+// one line naming every active instrumentation (they perturb each other: 5.7); defined below
+static void ggml_ins_print_modes(void);
+
 static int      g_nbs_every = -1;   // -1: env not read yet, 0: off
 static double   g_nbs_tick_per_us = 1.0;
 static int64_t  g_nbs_graphs = 0;
@@ -5243,18 +5246,78 @@ static void ggml_nbs_flush_thread(void) {
     tl_nbs_prev  = 0;
 }
 
+// thread counts of the graphs in the current accumulation (main and draft graphs may differ, -td):
+// the per-thread table covers the largest team; a mix is flagged in the report
+static int g_nbs_n_threads = 0;   // largest team size
+static int g_nbs_n_threads_min = 0;
+
+static void ggml_nbs_reset(void) {
+    memset(g_nbs, 0, sizeof(g_nbs));
+    memset(g_nbs_thr_last, 0, sizeof(g_nbs_thr_last));
+    memset(g_nbs_thr_wait, 0, sizeof(g_nbs_thr_wait));
+    memset(g_nbs_thr_work, 0, sizeof(g_nbs_thr_work));
+    g_nbs_graphs = 0;
+    g_nbs_n_threads = 0;
+    g_nbs_n_threads_min = 0;
+    g_nbs_t0_us = ggml_time_us();
+}
+
+static void ggml_nbs_print_reset(int n_threads);
+
+// snapshot for request windows (see ggml_phase_window_mark): accumulators are merged per graph,
+// so a snapshot taken between graphs is consistent. The thread-count metadata is part of it: a
+// graph after the mark with another team size must not change the restored report.
+static struct ggml_nbs_acc g_nbs_snap[GGML_OP_COUNT];
+static uint64_t g_nbs_snap_last[GGML_NBS_MAX_THREADS], g_nbs_snap_wait[GGML_NBS_MAX_THREADS], g_nbs_snap_work[GGML_NBS_MAX_THREADS];
+static int64_t  g_nbs_snap_graphs = 0;
+static int      g_nbs_snap_n_threads = 0, g_nbs_snap_n_threads_min = 0;
+
+static void ggml_nbs_snap_save(void) {
+    memcpy(g_nbs_snap, g_nbs, sizeof(g_nbs));
+    memcpy(g_nbs_snap_last, g_nbs_thr_last, sizeof(g_nbs_thr_last));
+    memcpy(g_nbs_snap_wait, g_nbs_thr_wait, sizeof(g_nbs_thr_wait));
+    memcpy(g_nbs_snap_work, g_nbs_thr_work, sizeof(g_nbs_thr_work));
+    g_nbs_snap_graphs = g_nbs_graphs;
+    g_nbs_snap_n_threads = g_nbs_n_threads;
+    g_nbs_snap_n_threads_min = g_nbs_n_threads_min;
+}
+
+static void ggml_nbs_snap_restore(void) {
+    memcpy(g_nbs, g_nbs_snap, sizeof(g_nbs));
+    memcpy(g_nbs_thr_last, g_nbs_snap_last, sizeof(g_nbs_thr_last));
+    memcpy(g_nbs_thr_wait, g_nbs_snap_wait, sizeof(g_nbs_thr_wait));
+    memcpy(g_nbs_thr_work, g_nbs_snap_work, sizeof(g_nbs_thr_work));
+    g_nbs_graphs = g_nbs_snap_graphs;
+    g_nbs_n_threads = g_nbs_snap_n_threads;
+    g_nbs_n_threads_min = g_nbs_snap_n_threads_min;
+}
+
 // called single-threaded at the end of ggml_graph_compute
 static void ggml_nbs_graph_done(int n_threads) {
     if (g_nbs_every <= 0 || !g_numa_barrier.active) return;
-    if (++g_nbs_graphs % g_nbs_every != 0) return;
+    if (n_threads > g_nbs_n_threads) g_nbs_n_threads = n_threads;
+    if (g_nbs_n_threads_min == 0 || n_threads < g_nbs_n_threads_min) g_nbs_n_threads_min = n_threads;
+    ++g_nbs_graphs;
+    if (ggml_phase_request_mode()) return;   // reported with the request window
+    if (g_nbs_graphs % g_nbs_every != 0) return;
+    ggml_nbs_print_reset(g_nbs_n_threads);
+}
+
+static void ggml_nbs_print_reset(int n_threads) {
+    if (g_nbs_graphs == 0) return;
     uint64_t tot_c = 0, tot_i = 0, tot_h = 0;
     for (int op = 0; op < GGML_OP_COUNT; ++op) { tot_c += g_nbs[op].compute; tot_i += g_nbs[op].imbalance; tot_h += g_nbs[op].handoff; }
     const double tot = (double)(tot_c + tot_i + tot_h);
-    if (tot <= 0) return;
+    if (tot <= 0) { ggml_nbs_reset(); return; }
     const double tpu = g_nbs_tick_per_us;
     const int    nn  = (int) g_state.numa.n_nodes;
     fprintf(stderr, "\n=== NUMA barrier stats: %lld graphs, %d threads, %.1f s ===\n",
             (long long) g_nbs_graphs, n_threads, (ggml_time_us() - g_nbs_t0_us) / 1e6);
+    ggml_ins_print_modes();
+    if (g_nbs_n_threads_min > 0 && g_nbs_n_threads_min != n_threads) {
+        fprintf(stderr, "graphs with %d..%d threads (e.g. -td): per-thread rows and node labels use the %d-thread split\n",
+                g_nbs_n_threads_min, n_threads, n_threads);
+    }
     fprintf(stderr, "thread time: compute %.1f%%  imbalance %.1f%%  handoff %.1f%%\n",
             100.0*tot_c/tot, 100.0*tot_i/tot, 100.0*tot_h/tot);
     fprintf(stderr, "%-24s %9s %10s %10s %10s %8s %8s", "op", "barriers", "compute_us", "imbal_us", "handoff_us", "imbal%", "hand%");
@@ -5290,9 +5353,7 @@ static void ggml_nbs_graph_done(int n_threads) {
         memset(g_nbs_thr_wait, 0, sizeof(g_nbs_thr_wait));
         memset(g_nbs_thr_work, 0, sizeof(g_nbs_thr_work));
     }
-    memset(g_nbs, 0, sizeof(g_nbs));
-    g_nbs_graphs = 0;
-    g_nbs_t0_us = ggml_time_us();
+    ggml_nbs_reset();
 }
 
 static GGML_THREAD_LOCAL int tl_numa_node = 0; // this thread's NUMA node (set in set_numa_thread_affinity)
@@ -31600,18 +31661,38 @@ static int64_t g_phase_cnt[GGML_PHASE_COUNT];
 static int64_t g_phase_bytes[GGML_PHASE_COUNT];
 static int64_t g_phase_window_t0 = 0;
 static int     g_phase_cycles = 0;
+static bool    g_phase_req = false;          // LLAMA_PHASE_STATS=req: windows set by the caller
+static int     g_phase_owner = -1;           // owner of the open request window, -1 = none
+static bool    g_phase_overlap = false;      // another request was active during the open window
+#define GGML_PHASE_MAX_OWNERS 256
+static bool    g_phase_active[GGML_PHASE_MAX_OWNERS];  // requests begun and not yet reported / ended
+static int     g_phase_n_active = 0;
+// snapshot at the last mark: the report covers begin .. last mark
+static int64_t g_phase_snap_ns[GGML_PHASE_COUNT], g_phase_snap_cnt[GGML_PHASE_COUNT], g_phase_snap_bytes[GGML_PHASE_COUNT];
+static int64_t g_phase_snap_t = 0;
+static int     g_phase_snap_cycles = 0;
+static bool    g_phase_snap_valid = false;
 static atomic_int_fast64_t g_phase_wake_max;  // latest worker start time in the current graph
 
 bool ggml_phase_enabled(void) {
     if (g_phase_every < 0) {
         const char * e = getenv("LLAMA_PHASE_STATS");
-        g_phase_every = e ? MAX(0, atoi(e)) : 0;
+        g_phase_req   = e && strcmp(e, "req") == 0;
+        g_phase_every = g_phase_req ? INT_MAX : e ? MAX(0, atoi(e)) : 0;
         if (g_phase_every > 0) {
             g_phase_window_t0 = ggml_ins_now_ns();
-            fprintf(stderr, "ggml: phase stats enabled, report every %d decodes\n", g_phase_every);
+            if (g_phase_req) {
+                fprintf(stderr, "ggml: phase stats enabled, one report per request\n");
+            } else {
+                fprintf(stderr, "ggml: phase stats enabled, report every %d decodes\n", g_phase_every);
+            }
         }
     }
     return g_phase_every > 0;
+}
+
+bool ggml_phase_request_mode(void) {
+    return ggml_phase_enabled() && g_phase_req;
 }
 
 int64_t ggml_phase_now_ns(void) {
@@ -31629,8 +31710,14 @@ void ggml_phase_add_bytes(int phase, int64_t bytes) {
     g_phase_bytes[phase] += bytes;
 }
 
-void ggml_phase_cycle(void) {
-    if (!ggml_phase_enabled() || ++g_phase_cycles < g_phase_every) return;
+static void ggml_phase_reset(int64_t now) {
+    for (int i = 0; i < GGML_PHASE_COUNT; ++i) { g_phase_ns[i] = 0; g_phase_cnt[i] = 0; g_phase_bytes[i] = 0; }
+    g_phase_cycles = 0;
+    g_phase_window_t0 = now;
+}
+
+// phase table of the current window (title printed by the caller)
+static void ggml_phase_print(int64_t now) {
     static const char * names[GGML_PHASE_COUNT] = {
         "decode main model (total)", "decode MTP draft (total)",
         "  graph prep (reset/build/alloc, both)", "  graph compute (both)", "    thread wake-up (in compute)",
@@ -31648,12 +31735,11 @@ void ggml_phase_cycle(void) {
         GGML_PHASE_RESTORE_PLE, GGML_PHASE_RESTORE_SSM, GGML_PHASE_RESTORE_SYNC, GGML_PHASE_RESTORE_SPAWN,
         GGML_PHASE_RESTORE_COPY,
     };
-    const int64_t now  = ggml_ins_now_ns();
     const double  wall = (double) (now - g_phase_window_t0);
     const double  top  = (double) (g_phase_ns[GGML_PHASE_DECODE_MAIN] + g_phase_ns[GGML_PHASE_DECODE_MTP] +
                                    g_phase_ns[GGML_PHASE_SAMPLE] + g_phase_ns[GGML_PHASE_RESTORE] +
                                    g_phase_ns[GGML_PHASE_DRAFT_PICK]);
-    fprintf(stderr, "\n=== phase stats: %d main decodes, %.1f ms wall ===\n", g_phase_cycles, wall * 1e-6);
+    ggml_ins_print_modes();
     fprintf(stderr, "%-40s %10s %7s %8s %9s\n", "phase", "ms", "%wall", "calls", "avg_us");
     for (int k = 0; k < GGML_PHASE_COUNT; ++k) {
         const int i = order[k];
@@ -31669,9 +31755,128 @@ void ggml_phase_cycle(void) {
     }
     fprintf(stderr, "%-40s %10.2f %6.1f%%\n", "unattributed (wall - decodes - sampling - restore - draft pick)",
             (wall - top) * 1e-6, wall > 0 ? 100.0 * (wall - top) / wall : 0.0);
-    for (int i = 0; i < GGML_PHASE_COUNT; ++i) { g_phase_ns[i] = 0; g_phase_cnt[i] = 0; g_phase_bytes[i] = 0; }
-    g_phase_cycles = 0;
-    g_phase_window_t0 = now;
+}
+
+void ggml_phase_cycle(void) {
+    if (!ggml_phase_enabled()) return;
+    ++g_phase_cycles;
+    if (g_phase_req || g_phase_cycles < g_phase_every) return;
+    const int64_t now = ggml_ins_now_ns();
+    fprintf(stderr, "\n=== phase stats: %d main decodes, %.1f ms wall ===\n", g_phase_cycles, (now - g_phase_window_t0) * 1e-6);
+    ggml_phase_print(now);
+    ggml_phase_reset(now);
+}
+
+static void ggml_obs_reset(void);
+static void ggml_obs_print_reset(void);
+static bool ggml_obs_on(void);
+static void ggml_obs_snap_save(void);
+static void ggml_obs_snap_restore(void);
+
+// The phase counters, op-bytes and barrier stats are process-global, so a window belongs to one
+// owner; overlapping requests (-np > 1) are flagged instead of mixed silently.
+static void ggml_phase_set_active(int owner, bool on) {
+    if (owner < 0 || owner >= GGML_PHASE_MAX_OWNERS || g_phase_active[owner] == on) return;
+    g_phase_active[owner] = on;
+    g_phase_n_active += on ? 1 : -1;
+}
+
+int64_t ggml_phase_window_begin(int owner) {
+    if (!ggml_phase_request_mode()) return 0;
+    ggml_phase_set_active(owner, true);
+    if (g_phase_owner >= 0 && g_phase_owner != owner) {
+        g_phase_overlap = true;   // the open window now has company
+        return 0;
+    }
+    const int64_t t0 = ggml_ins_now_ns();
+    ggml_phase_reset(t0);
+    if (ggml_obs_on()) ggml_obs_reset();
+    if (g_nbs_every > 0) ggml_nbs_reset();
+    g_phase_owner      = owner;
+    g_phase_overlap    = g_phase_n_active > 1;   // others still running from before
+    g_phase_snap_valid = false;
+    return t0 / 1000;
+}
+
+// One cut for everything: phase sums, decode count, op-bytes and barrier tables and the returned
+// timestamp all describe begin .. this mark, so work after the last output (e.g. an MTP state
+// commit graph) is left out of every table alike.
+int64_t ggml_phase_window_mark(int owner) {
+    if (!ggml_phase_request_mode() || owner != g_phase_owner) return 0;
+    memcpy(g_phase_snap_ns,    g_phase_ns,    sizeof(g_phase_ns));
+    memcpy(g_phase_snap_cnt,   g_phase_cnt,   sizeof(g_phase_cnt));
+    memcpy(g_phase_snap_bytes, g_phase_bytes, sizeof(g_phase_bytes));
+    g_phase_snap_cycles = g_phase_cycles;
+    if (ggml_obs_on()) ggml_obs_snap_save();
+    if (g_nbs_every > 0) ggml_nbs_snap_save();
+    g_phase_snap_t      = ggml_ins_now_ns();
+    g_phase_snap_valid  = true;
+    return g_phase_snap_t / 1000;
+}
+
+void ggml_phase_window_end(int owner) {
+    if (!ggml_phase_request_mode()) return;
+    ggml_phase_set_active(owner, false);
+    if (owner == g_phase_owner) {
+        fprintf(stderr, "\n=== phase stats: request (owner %d) ended without a report, window dropped ===\n", owner);
+        ggml_phase_reset(ggml_ins_now_ns());
+        if (ggml_obs_on()) ggml_obs_reset();
+        if (g_nbs_every > 0) ggml_nbs_reset();
+        g_phase_owner = -1;
+        g_phase_overlap = false;
+        g_phase_snap_valid = false;
+    }
+}
+
+// Phase, op-byte and barrier counters cover begin .. last mark. The caller supplies token and
+// main-decode counts for that interval; compare its decode count with llama_decode's count.
+// The caller's legacy throughput is printed for reference, not as an elapsed-time cross-check.
+void ggml_phase_window_report(int owner, int64_t n_tokens, int64_t n_cycles, int64_t n_drafted,
+                              int64_t n_accepted, double caller_tok_s) {
+    if (!ggml_phase_request_mode()) return;
+    if (owner != g_phase_owner) {
+        ggml_phase_set_active(owner, false);
+        fprintf(stderr, "\n=== phase stats: request of owner %d not reported (window belongs to %d) ===\n",
+                owner, g_phase_owner);
+        return;
+    }
+    ggml_phase_set_active(owner, false);
+    int64_t now = ggml_ins_now_ns();
+    if (g_phase_snap_valid) {   // cut every table at the last mark
+        memcpy(g_phase_ns,    g_phase_snap_ns,    sizeof(g_phase_ns));
+        memcpy(g_phase_cnt,   g_phase_snap_cnt,   sizeof(g_phase_cnt));
+        memcpy(g_phase_bytes, g_phase_snap_bytes, sizeof(g_phase_bytes));
+        g_phase_cycles = g_phase_snap_cycles;
+        if (ggml_obs_on()) ggml_obs_snap_restore();
+        if (g_nbs_every > 0) ggml_nbs_snap_restore();
+        now = g_phase_snap_t;
+    }
+    const double  wall_ms = (now - g_phase_window_t0) * 1e-6;
+    const int     cycles  = g_phase_cycles;
+    fprintf(stderr, "\n=== phase stats: request (owner %d), %d main decodes, %.1f ms wall (begin .. last mark) ===\n",
+            owner, cycles, wall_ms);
+    if (g_phase_overlap) {
+        fprintf(stderr, "WARNING: another request was active during this window; all counters below are mixed\n");
+    }
+    fprintf(stderr, "window: tokens %lld, %d main decodes = %.3f tokens/decode, %.2f decodes/s, %.2f tok/s",
+            (long long) n_tokens, cycles, cycles > 0 ? (double) n_tokens / cycles : 0.0,
+            wall_ms > 0 ? cycles * 1e3 / wall_ms : 0.0, wall_ms > 0 ? n_tokens * 1e3 / wall_ms : 0.0);
+    if (n_drafted > 0) {
+        fprintf(stderr, "; drafts %lld, accepted %lld (%.1f%%)", (long long) n_drafted, (long long) n_accepted,
+                100.0 * n_accepted / n_drafted);
+    }
+    fprintf(stderr, "\ncaller: %lld main decodes%s over the same interval; "
+            "legacy caller-reported %.2f tok/s (reference only)\n",
+            (long long) n_cycles, n_cycles == cycles ? " (match)" : " (MISMATCH)", caller_tok_s);
+    ggml_phase_print(now);
+    ggml_phase_reset(now);
+    if (ggml_obs_on()) ggml_obs_print_reset();
+    if (g_nbs_every > 0 && g_numa_barrier.active) ggml_nbs_print_reset(g_nbs_n_threads);
+    // other requests that are still active keep counting: the next window begun while any of
+    // them runs is flagged as overlapped (g_phase_n_active > 1 in begin)
+    g_phase_owner      = -1;
+    g_phase_overlap    = false;
+    g_phase_snap_valid = false;
 }
 
 static inline void ggml_phase_worker_started(void) {
@@ -31703,6 +31908,7 @@ static double  g_obs_small[OBS_KINDS][OBS_COUNT];   // bytes of weight tensors <
 static double  g_obs_moe_distinct[OBS_TOKB], g_obs_moe_slots[OBS_TOKB];
 static int64_t g_obs_moe_calls[OBS_TOKB];
 static int     g_obs_kind = 0;
+static int64_t g_obs_ins_ns = 0;     // thread 0 time spent in the expert-id scan inside the graph loop
 
 static bool ggml_obs_enabled(void) {
     if (g_obs_every < 0) {
@@ -31723,8 +31929,9 @@ static void ggml_obs_weight(int cat, const struct ggml_tensor * t, double bytes)
     if (ggml_nbytes(t) <= (size_t) 24 * 1024 * 1024) g_obs_small[g_obs_kind][cat] += bytes;
 }
 
-// distinct expert ids in an I32 ids tensor [n_used, n_tokens]; adds reuse statistics
-static int ggml_obs_distinct(const struct ggml_tensor * ids, int n_as) {
+// distinct expert ids in an I32 ids tensor [n_used, n_tokens]. Reads the ids, so it must run
+// while they are valid (right after the op; the buffer may be reused by later nodes).
+static int ggml_obs_count_distinct(const struct ggml_tensor * ids, int n_as) {
     if (!ids || ids->type != GGML_TYPE_I32 || n_as <= 0 || n_as > 4096) return 0;
     unsigned char seen[4096];
     memset(seen, 0, (size_t) n_as);
@@ -31735,6 +31942,20 @@ static int ggml_obs_distinct(const struct ggml_tensor * ids, int n_as) {
             if (e >= 0 && e < n_as && !seen[e]) { seen[e] = 1; ++distinct; }
         }
     }
+    return distinct;
+}
+
+// MoE ids of the op at node `first` and the expert count of its weights (-1: not a MoE op)
+static int ggml_obs_moe_distinct(const struct ggml_cgraph * cgraph, int first) {
+    const struct ggml_tensor * n0 = cgraph->nodes[first];
+    if (n0->op == GGML_OP_MOE_FUSED_UP_GATE) return ggml_obs_count_distinct(n0->src[3], n0->src[0] ? (int) n0->src[0]->ne[2] : 0);
+    if (n0->op == GGML_OP_MUL_MAT_ID)        return ggml_obs_count_distinct(n0->src[2], n0->src[0] ? (int) n0->src[0]->ne[2] : 0);
+    return -1;
+}
+
+// routing reuse statistics for one MoE op (ids shape only, no data access)
+static int ggml_obs_distinct(const struct ggml_tensor * ids, int distinct) {
+    if (!ids || ids->type != GGML_TYPE_I32 || distinct < 0) return 0;
     const int b = (int) MIN(ids->ne[1], OBS_TOKB) - 1;
     if (b >= 0 && g_obs_kind != 2) {           // routing reuse for decode graphs only
         g_obs_moe_distinct[b] += distinct;
@@ -31744,8 +31965,9 @@ static int ggml_obs_distinct(const struct ggml_tensor * ids, int n_as) {
     return distinct;
 }
 
-// account graph nodes [first, last] (a fused chain is computed as one step) taking `ns` wall time
-static void ggml_obs_record(const struct ggml_cgraph * cgraph, int first, int last, int64_t ns) {
+// account graph nodes [first, last] (a fused chain is computed as one step) taking `ns` wall time;
+// `distinct` = expert count from ggml_obs_moe_distinct, taken right after the op
+static void ggml_obs_record(const struct ggml_cgraph * cgraph, int first, int last, int64_t ns, int distinct) {
     const struct ggml_tensor * n0 = cgraph->nodes[first];
     int cat = OBS_OTHER;
     switch (n0->op) {
@@ -31767,14 +31989,14 @@ static void ggml_obs_record(const struct ggml_cgraph * cgraph, int first, int la
         case GGML_OP_MOE_FUSED_UP_GATE: {
             cat = OBS_MOE_UP_GATE;
             const struct ggml_tensor * w0 = n0->src[0], * w1 = n0->src[1];
-            const int d = ggml_obs_distinct(n0->src[3], w0 ? (int) w0->ne[2] : 0);
+            const int d = ggml_obs_distinct(n0->src[3], distinct);
             if (w0) ggml_obs_weight(cat, w0, (double) d * w0->nb[2]);
             if (w1) ggml_obs_weight(cat, w1, (double) d * w1->nb[2]);
         } break;
         case GGML_OP_MUL_MAT_ID: {
             cat = OBS_MOE_DOWN;
             const struct ggml_tensor * w0 = n0->src[0];
-            const int d = ggml_obs_distinct(n0->src[2], w0 ? (int) w0->ne[2] : 0);
+            const int d = ggml_obs_distinct(n0->src[2], distinct);
             if (w0) ggml_obs_weight(cat, w0, (double) d * w0->nb[2]);
         } break;
         case GGML_OP_FLASH_ATTN_EXT:
@@ -31792,8 +32014,22 @@ static void ggml_obs_record(const struct ggml_cgraph * cgraph, int first, int la
 
 static void ggml_obs_graph_done(int64_t graph_ns) {
     g_obs_graph_ns += graph_ns;
-    if (++g_obs_graphs < g_obs_every) return;
+    ++g_obs_graphs;
+    if (ggml_phase_request_mode()) return;   // reported with the request window
+    if (g_obs_graphs < g_obs_every) return;
+    ggml_obs_print_reset();
+}
+
+static bool ggml_obs_on(void) {
+    return g_obs_every > 0;
+}
+
+static void ggml_obs_print_reset(void) {
+    if (g_obs_graphs == 0) return;
     fprintf(stderr, "\n=== op bytes stats: %d graphs, %.1f ms in ggml_graph_compute ===\n", g_obs_graphs, g_obs_graph_ns * 1e-6);
+    ggml_ins_print_modes();
+    fprintf(stderr, "thread 0 expert-id scan inside the graph loop: %.1f us per graph (included in the MoE op times)\n",
+            g_obs_ins_ns * 1e-3 / g_obs_graphs);
     fprintf(stderr, "logical weight bytes (not DRAM traffic); time = op wall time on thread 0 (incl. imbalance + barrier)\n");
     for (int k = 0; k < OBS_KINDS; ++k) {
         int64_t tot = 0; for (int c = 0; c < OBS_COUNT; ++c) tot += g_obs_ns[k][c];
@@ -31816,11 +32052,42 @@ static void ggml_obs_graph_done(int64_t graph_ns) {
         fprintf(stderr, "  %s%d  %8lld  %7.2f  %7.2f  %5.1f%%\n", b == OBS_TOKB - 1 ? ">=" : "  ", b + 1,
                 (long long) g_obs_moe_calls[b], d, sl, 100.0 * (1.0 - d / sl));
     }
+    ggml_obs_reset();
+}
+
+static struct {
+    int64_t ns[OBS_KINDS][OBS_COUNT], calls[OBS_KINDS][OBS_COUNT];
+    double  bytes[OBS_KINDS][OBS_COUNT], small[OBS_KINDS][OBS_COUNT];
+    double  moe_distinct[OBS_TOKB], moe_slots[OBS_TOKB];
+    int64_t moe_calls[OBS_TOKB];
+    int     graphs;
+    int64_t graph_ns, ins_ns;
+} g_obs_snap;
+
+static void ggml_obs_snap_save(void) {
+    memcpy(g_obs_snap.ns, g_obs_ns, sizeof(g_obs_ns)); memcpy(g_obs_snap.calls, g_obs_calls, sizeof(g_obs_calls));
+    memcpy(g_obs_snap.bytes, g_obs_bytes, sizeof(g_obs_bytes)); memcpy(g_obs_snap.small, g_obs_small, sizeof(g_obs_small));
+    memcpy(g_obs_snap.moe_distinct, g_obs_moe_distinct, sizeof(g_obs_moe_distinct));
+    memcpy(g_obs_snap.moe_slots, g_obs_moe_slots, sizeof(g_obs_moe_slots));
+    memcpy(g_obs_snap.moe_calls, g_obs_moe_calls, sizeof(g_obs_moe_calls));
+    g_obs_snap.graphs = g_obs_graphs; g_obs_snap.graph_ns = g_obs_graph_ns; g_obs_snap.ins_ns = g_obs_ins_ns;
+}
+
+static void ggml_obs_snap_restore(void) {
+    memcpy(g_obs_ns, g_obs_snap.ns, sizeof(g_obs_ns)); memcpy(g_obs_calls, g_obs_snap.calls, sizeof(g_obs_calls));
+    memcpy(g_obs_bytes, g_obs_snap.bytes, sizeof(g_obs_bytes)); memcpy(g_obs_small, g_obs_snap.small, sizeof(g_obs_small));
+    memcpy(g_obs_moe_distinct, g_obs_snap.moe_distinct, sizeof(g_obs_moe_distinct));
+    memcpy(g_obs_moe_slots, g_obs_snap.moe_slots, sizeof(g_obs_moe_slots));
+    memcpy(g_obs_moe_calls, g_obs_snap.moe_calls, sizeof(g_obs_moe_calls));
+    g_obs_graphs = g_obs_snap.graphs; g_obs_graph_ns = g_obs_snap.graph_ns; g_obs_ins_ns = g_obs_snap.ins_ns;
+}
+
+static void ggml_obs_reset(void) {
     memset(g_obs_ns, 0, sizeof(g_obs_ns)); memset(g_obs_calls, 0, sizeof(g_obs_calls));
     memset(g_obs_bytes, 0, sizeof(g_obs_bytes)); memset(g_obs_small, 0, sizeof(g_obs_small));
     memset(g_obs_moe_distinct, 0, sizeof(g_obs_moe_distinct)); memset(g_obs_moe_slots, 0, sizeof(g_obs_moe_slots));
     memset(g_obs_moe_calls, 0, sizeof(g_obs_moe_calls));
-    g_obs_graphs = 0; g_obs_graph_ns = 0;
+    g_obs_graphs = 0; g_obs_graph_ns = 0; g_obs_ins_ns = 0;
 }
 
 static thread_ret_t ggml_graph_compute_thread(void * data) {
@@ -31833,7 +32100,19 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     set_cpu_thread_affinity(cplan, state->ith); // explicit affinity takes precedence over NUMA
     tl_nbs_ith = state->ith;
     ggml_phase_worker_started();
+    // op bytes (thread 0): only timestamps and the MoE expert count are taken inside the loop,
+    // the accounting runs after the graph. Doing it after each barrier delayed thread 0 at the
+    // start of the next op and charged that time to the next op. Records beyond obs_cap (failed
+    // realloc) are dropped.
     const bool obs = state->ith == 0 && g_obs_every > 0;
+    struct ggml_obs_rec { int first, last, distinct; int64_t ns; };
+    static struct ggml_obs_rec * obs_recs = NULL;
+    static int obs_cap = 0;
+    int obs_n = 0;
+    if (obs && obs_cap < cgraph->n_nodes) {
+        struct ggml_obs_rec * p = (struct ggml_obs_rec *) realloc(obs_recs, (size_t) cgraph->n_nodes * sizeof(*p));
+        if (p) { obs_recs = p; obs_cap = cgraph->n_nodes; }
+    }
     int64_t obs_prev = obs ? ggml_ins_now_ns() : 0;
 
     struct ggml_compute_params params = {
@@ -31859,6 +32138,15 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
         tl_nbs_op = node->op;
         const int obs_first = node_n;
+        // MoE expert ids are read before the op: they are complete (computed by earlier nodes) and
+        // cannot be overwritten before this op's barrier. After it, the next node may reuse their
+        // buffer. The scan's time is part of this op's time and is reported separately.
+        int obs_distinct = -1;
+        if (obs && (node->op == GGML_OP_MOE_FUSED_UP_GATE || node->op == GGML_OP_MUL_MAT_ID)) {
+            const int64_t s0 = ggml_ins_now_ns();
+            obs_distinct = ggml_obs_moe_distinct(cgraph, node_n);
+            g_obs_ins_ns += ggml_ins_now_ns() - s0;
+        }
         node_n = ggml_compute_forward(&params, node, cgraph, node_n);
 #if IK_PRINT_TIMING
         int64_t tim2 = ggml_time_us();
@@ -31871,9 +32159,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         ggml_barrier(state->shared);
 
-        if (obs) {
+        if (obs && obs_n < obs_cap) {
             const int64_t t = ggml_ins_now_ns();
-            ggml_obs_record(cgraph, obs_first, node_n, t - obs_prev);
+            obs_recs[obs_n].first    = obs_first;
+            obs_recs[obs_n].last     = node_n;
+            obs_recs[obs_n].ns       = t - obs_prev;
+            obs_recs[obs_n].distinct = obs_distinct;
+            ++obs_n;
             obs_prev = t;
         }
 
@@ -31886,9 +32178,22 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     if (state->ith == 0) printf("ggml_barrier(...): %d us\n", (int)(t_end - t_start - t_eval));
 #endif
 
+    for (int k = 0; k < obs_n; ++k) {
+        ggml_obs_record(cgraph, obs_recs[k].first, obs_recs[k].last, obs_recs[k].ns, obs_recs[k].distinct);
+    }
+
     ggml_nbs_flush_thread();
 
     return 0;
+}
+
+static void ggml_ins_print_modes(void) {
+    const char * p = getenv("LLAMA_PHASE_STATS");
+    const char * o = getenv("GGML_OP_BYTES");
+    const char * b = getenv("GGML_NUMA_BARRIER_STATS");
+    fprintf(stderr, "instrumentation: phase=%s op_bytes=%s barrier_stats=%s\n",
+            p && *p && strcmp(p, "0") ? p : "off", o && *o && strcmp(o, "0") ? o : "off",
+            b && *b && strcmp(b, "0") ? b : "off");
 }
 
 // Opt-in graph audit (GGML_GRAPH_STATS=1): once per distinct graph (by node count), print how

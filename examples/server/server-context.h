@@ -166,6 +166,7 @@ struct server_slot {
     bool spec_prompt_warmup_failed = false;
     // speculative decoding stats
     int32_t n_draft_total = 0;      // Total draft tokens generated
+    int32_t n_gen_decodes = 0;      // main decodes after the first token (LLAMA_PHASE_STATS=req cross-check)
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
     std::vector<int32_t> n_draft_by_depth;
     std::vector<int32_t> n_draft_accepted_by_depth;
