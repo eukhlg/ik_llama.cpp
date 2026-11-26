@@ -1873,6 +1873,115 @@ void iqk_fused_delta_net_neon_impl(int n_heads, int gqa_ratio, int repeat_type, 
     }
 }
 #endif
+#ifdef __AVX512F__
+template <int head_dim>
+bool iqk_fused_delta_net_rows_avx512(int n_heads, int gqa_ratio, int repeat_type, int n_tokens, int n_seqs,
+        size_t vnb1, size_t vnb2, size_t vnb3,
+        const float * q_data, const float * k_data, const float * v_data, const float * g_data, const float * beta_data,
+        const float * state_in, float * out_data, float * state_out, float * saved_steps, int state_step_stride, int ith, int nth) {
+    static_assert(head_dim % 16 == 0);
+    constexpr int nblk = head_dim/16;
+    const int total_heads = n_heads * n_seqs;
+    const int64_t n_units = (int64_t) total_heads * nblk;
+    const int64_t u_start = (n_units * ith) / nth;
+    const int64_t u_end   = (n_units * (ith + 1)) / nth;
+    const float scale = 1.0f / sqrtf((float) head_dim);
+    const bool copy_state = state_out != state_in;
+
+    __m512 v_prime[nblk], out_val[nblk];
+
+    for (int64_t u = u_start; u < u_end; ) {
+        const int h_idx = (int) (u / nblk);
+        const int j0    = (int) (u % nblk);
+        const int j1    = (int) std::min<int64_t>(nblk, j0 + (u_end - u));
+        u += j1 - j0;
+
+        const int batch_idx = h_idx / n_heads;
+        const int head_idx  = h_idx % n_heads;
+        const int head_idx_kq = repeat_type == 0 ? head_idx / gqa_ratio : head_idx % (n_heads/gqa_ratio);
+
+        const int qkv_head_offset_kq  = batch_idx * (head_dim * n_tokens * n_heads/gqa_ratio) + head_idx_kq * (head_dim * n_tokens);
+        const int qkv_token_stride = head_dim;
+        const int g_batch_offset   = batch_idx * n_tokens * n_heads;
+        const int state_head_offset = batch_idx * (head_dim * head_dim * n_heads) + head_idx * (head_dim * head_dim);
+        const int out_head_offset  = batch_idx * (head_dim * n_heads * n_tokens) + head_idx * head_dim;
+        const int out_token_stride = head_dim * n_heads;
+        const size_t blk_bytes = 16 * (size_t) (j1 - j0) * sizeof(float);
+
+        float * state = state_out + state_head_offset;
+        if (copy_state) {
+            for (int col = 0; col < head_dim; ++col) {
+                std::memcpy(state + col * head_dim + 16*j0, state_in + state_head_offset + col * head_dim + 16*j0, blk_bytes);
+            }
+        }
+
+        for (int t = 0; t < n_tokens; ++t) {
+            const float * q_t = q_data + qkv_head_offset_kq + t * qkv_token_stride;
+            const float * k_t = k_data + qkv_head_offset_kq + t * qkv_token_stride;
+            const float * v_t = v_data + batch_idx * vnb3 + head_idx * vnb2 + t * vnb1;
+
+            const float g_val    = g_data[g_batch_offset + t * n_heads + head_idx];
+            const float beta_raw = beta_data[g_batch_offset + t * n_heads + head_idx];
+
+            auto vqksum = _mm512_setzero_ps();
+            for (int i = 0; i < head_dim; i += 16) {
+                vqksum = _mm512_fmadd_ps(_mm512_loadu_ps(k_t + i), _mm512_loadu_ps(q_t + i), vqksum);
+            }
+            const float kq_sum = _mm512_reduce_add_ps(vqksum);
+
+            const float beta_val = 1.0f / (1.0f + expf(-beta_raw));
+            const float decay    = expf(fminf(g_val, 50.0f));
+            const float attn_score = kq_sum * scale;
+
+            float * out_t = out_data + out_head_offset + t * out_token_stride;
+
+            for (int j = j0; j < j1; ++j) {
+                v_prime[j] = out_val[j] = _mm512_setzero_ps();
+            }
+            for (int col = 0; col < head_dim; ++col) {
+                auto k_col = _mm512_set1_ps(k_t[col]);
+                auto q_col = _mm512_set1_ps(q_t[col]);
+                for (int j = j0; j < j1; ++j) {
+                    auto st = _mm512_loadu_ps(state + col * head_dim + 16*j);
+                    v_prime[j] = _mm512_fmadd_ps(st, k_col, v_prime[j]);
+                    out_val[j] = _mm512_fmadd_ps(st, q_col, out_val[j]);
+                }
+            }
+            auto c1 = _mm512_set1_ps(beta_val);
+            auto c2 = _mm512_set1_ps(beta_val*decay);
+            auto c3 = _mm512_set1_ps(decay*scale);
+            auto c4 = _mm512_set1_ps(attn_score);
+            for (int j = j0; j < j1; ++j) {
+                auto v = _mm512_loadu_ps(v_t + 16*j);
+                v_prime[j] = _mm512_sub_ps(_mm512_mul_ps(v, c1), _mm512_mul_ps(v_prime[j], c2));
+                auto oval = _mm512_fmadd_ps(v_prime[j], c4, _mm512_mul_ps(out_val[j], c3));
+                _mm512_storeu_ps(out_t + 16*j, oval);
+            }
+            auto vmin = _mm512_set1_ps(-1e6f);
+            auto vmax = _mm512_set1_ps( 1e6f);
+            auto vd   = _mm512_set1_ps(decay);
+            for (int col = 0; col < head_dim; ++col) {
+                auto vk = _mm512_set1_ps(k_t[col]);
+                for (int j = j0; j < j1; ++j) {
+                    auto vs = _mm512_loadu_ps(state + col * head_dim + 16*j);
+                    vs = _mm512_fmadd_ps(v_prime[j], vk, _mm512_mul_ps(vs, vd));
+                    vs = _mm512_max_ps(vmin, _mm512_min_ps(vmax, vs));
+                    _mm512_storeu_ps(state + col * head_dim + 16*j, vs);
+                }
+            }
+
+            if (saved_steps && t + 1 < n_tokens) {
+                float * this_state = saved_steps + state_head_offset + t * state_step_stride;
+                for (int col = 0; col < head_dim; ++col) {
+                    std::memcpy(this_state + col * head_dim + 16*j0, state + col * head_dim + 16*j0, blk_bytes);
+                }
+            }
+        }
+    }
+    return true;
+}
+#endif
+
 template <int head_dim>
 void iqk_fused_delta_net_impl(int n_heads, int gqa_ratio, int repeat_type, int n_tokens, int n_seqs,
         size_t vnb1, size_t vnb2, size_t vnb3,
@@ -1882,6 +1991,15 @@ void iqk_fused_delta_net_impl(int n_heads, int gqa_ratio, int repeat_type, int n
     iqk_fused_delta_net_neon_impl<head_dim>(n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, vnb1, vnb2, vnb3,
             q_data, k_data, v_data, g_data, beta_data, state_in, out_data, state_out, saved_steps, state_step_stride, ith, nth);
     return;
+#endif
+#ifdef __AVX512F__
+    // Split the work by (head, 16-row block) instead of whole heads: the recurrence is
+    // independent per value row, and e.g. 32 heads on 24 threads leave 8 threads idle.
+    // A 16-float block is one cache line per state column, so threads never share a line.
+    if (iqk_fused_delta_net_rows_avx512<head_dim>(n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, vnb1, vnb2, vnb3,
+            q_data, k_data, v_data, g_data, beta_data, state_in, out_data, state_out, saved_steps, state_step_stride, ith, nth)) {
+        return;
+    }
 #endif
     const int total_heads = n_heads * n_seqs;
     const int heads_per_thread = (total_heads + nth - 1) / nth;
