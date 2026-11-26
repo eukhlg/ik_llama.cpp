@@ -9,6 +9,15 @@
 // (it can itself be limited by cache bandwidth, dequantisation or SIMD throughput).
 // Each graph node gets its own activation tensor, so consecutive matmuls are not fused into chains.
 //
+// --only a,b,...: run only the cases whose name contains one of the comma-separated parts, in the
+// order of the parts (a case matching several runs once, at its first part).
+// --cpu-orders "0-23|1-11,0,13-23,12|...": repeat every case with each CPU order (worker i on the
+// i-th CPU of the order), reusing the same weight buffers and graph; a rotation within each node
+// keeps node membership and worker counts. Default: --cpus as the only order.
+// For log parsing, every graph run is announced on stderr before it starts, in the form
+//   # kbench graph case=<name> mode=<dram|l3> tok=<n> order=<k> cpus=<list> phase=<warmup|timed> rep=<r>/<reps>
+// so barrier reports (printed on stderr at the end of each graph) can be attributed exactly.
+//
 // Run pinned to one NUMA node, e.g.:
 //   numactl --cpunodebind=0 --membind=0 llama-kbench -t 12 --cpus 0-11
 // or as production does it (roadmap 5.10 kernel reference), across both nodes with the NUMA mirror:
@@ -115,7 +124,8 @@ static int count_distinct(const ggml_tensor * ids, int64_t n_exp) {
 struct result { double us_best, us_med, gbs_best, gbs_med, bytes_per_op; int n_ops, copies; };
 
 static bool run_case(const bench_case & bc, int ntok, bool l3, double gb, int reps, int nth,
-                     const std::vector<int32_t> & cpus, result & res) {
+                     const std::vector<std::vector<int32_t>> & orders, const std::vector<std::string> & order_names,
+                     std::vector<result> & out) {
     const bool moe = bc.kind != "dense";
     const int64_t n_exp = moe ? bc.n_exp : 1;
     const size_t w_bytes = ggml_row_size(bc.type, bc.K) * bc.N * n_exp;      // one weight copy (one matrix)
@@ -240,21 +250,35 @@ static bool run_case(const bench_case & bc, int ntok, bool l3, double gb, int re
     ggml_cplan plan = ggml_graph_plan(gf, nth);
     std::vector<uint8_t> work(plan.work_size + 64);
     plan.work_data = work.data();
-    if (!cpus.empty()) { plan.cpu_affinity = cpus.data(); plan.n_cpu_affinity = (int32_t) cpus.size(); }
 
-    ggml_graph_compute(gf, &plan);                 // warm-up (and page-in)
-    std::vector<double> t(reps);
-    for (int r = 0; r < reps; ++r) {
-        const double t0 = now_s();
-        ggml_graph_compute(gf, &plan);
-        t[r] = now_s() - t0;
+    out.clear();
+    for (size_t o = 0; o < orders.size(); ++o) {   // same weights, activations and graph for every order
+        const std::vector<int32_t> & cpus = orders[o];
+        plan.cpu_affinity = cpus.empty() ? nullptr : cpus.data();
+        plan.n_cpu_affinity = (int32_t) cpus.size();
+        auto announce = [&](const char * phase, int r) {
+            fprintf(stderr, "# kbench graph case=%s mode=%s tok=%d order=%zu cpus=%s phase=%s rep=%d/%d\n", bc.name.c_str(),
+                    l3 ? "l3" : "dram", ntok, o, order_names[o].empty() ? "unpinned" : order_names[o].c_str(), phase, r, reps);
+            fflush(stderr);
+        };
+        announce("warmup", 0);
+        ggml_graph_compute(gf, &plan);             // warm-up (and page-in) for this order
+        std::vector<double> t(reps);
+        for (int r = 0; r < reps; ++r) {
+            announce("timed", r + 1);
+            const double t0 = now_s();
+            ggml_graph_compute(gf, &plan);
+            t[r] = now_s() - t0;
+        }
+        std::sort(t.begin(), t.end());
+        const double best = t[0], med = t[reps / 2];
+        result res{};
+        res.n_ops = n_ops; res.copies = copies;
+        res.bytes_per_op = bytes_total / n_ops;
+        res.us_best = best / n_ops * 1e6; res.us_med = med / n_ops * 1e6;
+        res.gbs_best = bytes_total / best / 1e9; res.gbs_med = bytes_total / med / 1e9;
+        out.push_back(res);
     }
-    std::sort(t.begin(), t.end());
-    const double best = t[0], med = t[reps / 2];
-    res.n_ops = n_ops; res.copies = copies;
-    res.bytes_per_op = bytes_total / n_ops;
-    res.us_best = best / n_ops * 1e6; res.us_med = med / n_ops * 1e6;
-    res.gbs_best = bytes_total / best / 1e9; res.gbs_med = bytes_total / med / 1e9;
     for (auto & nc : node_copies) ggml_numa_free(nc.first, nc.second);
     ggml_free(ctx);
     return true;
@@ -263,7 +287,7 @@ static bool run_case(const bench_case & bc, int ntok, bool l3, double gb, int re
 int main(int argc, char ** argv) {
     int nth = 12, reps = 7;
     double gb = 1.0;
-    std::string cpus_s, tokens_s = "1,2,3,4", modes = "dram,l3", only, model;
+    std::string cpus_s, tokens_s = "1,2,3,4", modes = "dram,l3", only, model, orders_s;
     bool numa_mirror = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -277,10 +301,20 @@ int main(int argc, char ** argv) {
         else if (a == "--only") only = next();
         else if (a == "--numa-mirror") numa_mirror = true;
         else if (a == "--model") model = next();
+        else if (a == "--cpu-orders") orders_s = next();
         else { fprintf(stderr, "usage: %s [-t N] [--cpus 0-11] [--tokens 1,2,3,4] [--gb 1.0] [--reps 7] [--modes dram,l3] [--only name]"
-                               " [--numa-mirror] [--model gguf]\n", argv[0]); return 1; }
+                               " [--numa-mirror] [--model gguf] [--cpu-orders \"0-23|1-11,0,13-23,12\"]\n", argv[0]); return 1; }
     }
-    const std::vector<int32_t> cpus = parse_cpus(cpus_s);
+    std::vector<std::string> order_names;
+    if (orders_s.empty()) order_names.push_back(cpus_s);
+    else for (size_t p = 0;;) { const size_t c = orders_s.find('|', p); order_names.push_back(orders_s.substr(p, c == std::string::npos ? std::string::npos : c - p)); if (c == std::string::npos) break; p = c + 1; }
+    std::vector<std::vector<int32_t>> orders;
+    for (const auto & n : order_names) {
+        orders.push_back(parse_cpus(n));
+        if (!orders_s.empty() && (int) orders.back().size() < nth) {
+            fprintf(stderr, "--cpu-orders: order '%s' has %zu CPUs, need >= %d\n", n.c_str(), orders.back().size(), nth); return 1;
+        }
+    }
     const std::vector<int> tokens = parse_ints(tokens_s);
     const bool do_dram = modes.find("dram") != std::string::npos, do_l3 = modes.find("l3") != std::string::npos;
 
@@ -362,17 +396,35 @@ int main(int argc, char ** argv) {
     }
     printf("# llama-kbench: %d threads, cpus %s, DRAM working set >= %.2f GiB, %d reps (best / median)%s\n",
            nth, cpus_s.empty() ? "unpinned" : cpus_s.c_str(), gb, reps, numa_mirror ? ", NUMA mirror" : "");
-    printf("%-24s %-5s %4s %9s %7s %10s %10s %9s %9s\n", "case", "mode", "tok", "MB/op", "ops", "us_best", "us_med", "GBs_best", "GBs_med");
-    for (const auto & bc : cases) {
-        if (!only.empty() && bc.name.find(only) == std::string::npos) continue;
+    for (size_t o = 0; o < order_names.size(); ++o) printf("# cpu order %zu: %s\n", o, order_names[o].empty() ? "unpinned" : order_names[o].c_str());
+    // --only: comma-separated name parts; cases run in the order of the parts
+    std::vector<std::string> parts;
+    for (size_t p = 0; !only.empty();) { const size_t c = only.find(',', p); parts.push_back(only.substr(p, c == std::string::npos ? std::string::npos : c - p)); if (c == std::string::npos) break; p = c + 1; }
+    std::vector<const bench_case *> sel;
+    if (parts.empty()) for (const auto & bc : cases) sel.push_back(&bc);
+    for (const auto & part : parts) {
+        bool any = false;
+        for (const auto & bc : cases) {
+            if (bc.name.find(part) == std::string::npos) continue;
+            any = true;
+            if (std::find(sel.begin(), sel.end(), &bc) == sel.end()) sel.push_back(&bc);
+        }
+        if (!any) { fprintf(stderr, "--only: no case matches '%s'\n", part.c_str()); return 1; }
+    }
+    printf("%-24s %-5s %4s %5s %9s %7s %10s %10s %9s %9s\n", "case", "mode", "tok", "order", "MB/op", "ops", "us_best", "us_med", "GBs_best", "GBs_med");
+    for (const bench_case * pbc : sel) {
+        const bench_case & bc = *pbc;
         for (int ntok : tokens) {
             for (int m = 0; m < 2; ++m) {
                 const bool l3 = m == 1;
                 if ((l3 && (!do_l3 || !bc.l3_ok)) || (!l3 && !do_dram)) continue;
-                result r{};
-                if (!run_case(bc, ntok, l3, gb, reps, nth, cpus, r)) return 1;
-                printf("%-24s %-5s %4d %9.2f %7d %10.1f %10.1f %9.1f %9.1f\n", bc.name.c_str(), l3 ? "l3" : "dram", ntok,
-                       r.bytes_per_op / 1e6, r.n_ops, r.us_best, r.us_med, r.gbs_best, r.gbs_med);
+                std::vector<result> rs;
+                if (!run_case(bc, ntok, l3, gb, reps, nth, orders, order_names, rs)) return 1;
+                for (size_t o = 0; o < rs.size(); ++o) {
+                    const result & r = rs[o];
+                    printf("%-24s %-5s %4d %5zu %9.2f %7d %10.1f %10.1f %9.1f %9.1f\n", bc.name.c_str(), l3 ? "l3" : "dram", ntok, o,
+                           r.bytes_per_op / 1e6, r.n_ops, r.us_best, r.us_med, r.gbs_best, r.gbs_med);
+                }
                 fflush(stdout);
             }
         }

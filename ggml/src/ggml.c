@@ -5224,11 +5224,23 @@ static uint64_t g_nbs_thr_work[GGML_NBS_MAX_THREADS];
 struct ggml_nbt_rec {
     uint64_t exit_prev, arrive;
     int64_t  ne0, ne1, ne2;
+    int64_t  k;                // src[0]->ne[0] (reduction dimension of a matmul), 0 if none
     int32_t  op, bid, wtype;   // wtype: type of src[0] (the weights for matmuls), -1 if none
+    int32_t  node0;            // graph index of the compute call's first node. One call can compute
+                               // several nodes (matmuls sharing src1 are fused, no barrier between
+                               // them); the call's nodes are resolved after the graph (ggml_nbt_call)
+};
+// the nodes of one ggml_compute_forward call, from the graph, single-threaded after it
+struct ggml_nbt_call {
+    int32_t  chain;            // compute nodes in the call
+    int64_t  rows, bytes;      // sum of ne[0] / of src[0] bytes over them
+    uint64_t sig;              // hash of every node's ne[0], K and src[0] type, in order
 };
 struct ggml_nbt_entry {
-    int      used, op, bid, team, wtype;
-    int64_t  ne0, ne1, ne2;
+    int      used, op, bid, team, wtype, chain;
+    int64_t  ne0, ne1, ne2, k, chain_rows;
+    uint64_t chain_bytes, chain_sig;
+    char     members[160];     // chain members as ne0:K:type, from the first graph that hit this key
     uint64_t n, completion, rel_spread, arr_spread, work_mean, work_max, wait_sum, late_rel;
     int64_t  late_work;   // signed sum of (latest worker's work - mean work)
     uint32_t latest[GGML_NBT_TOPT];
@@ -5249,26 +5261,63 @@ static GGML_THREAD_LOCAL int      tl_nbt_bid  = 0;  // barrier number within the
 static GGML_THREAD_LOCAL uint64_t tl_nbt_exit = 0;  // exit time of this worker's previous barrier
 static GGML_THREAD_LOCAL int64_t  tl_nbt_ne[3];     // dst shape of the node being computed
 static GGML_THREAD_LOCAL int32_t  tl_nbt_wtype = -1; // type of its src[0] (weights of a matmul)
+static GGML_THREAD_LOCAL int64_t  tl_nbt_k     = 0;  // its src[0]->ne[0]
+static GGML_THREAD_LOCAL int32_t  tl_nbt_node0 = 0;  // graph index of the current call's first node
 
-static struct ggml_nbt_entry * ggml_nbt_find(int op, int bid, int team, int wtype, int64_t ne0, int64_t ne1, int64_t ne2) {
-    uint64_t h = (uint64_t) op * 0x9E3779B97F4A7C15ull ^ (uint64_t) ne0 * 0xC2B2AE3D27D4EB4Full ^
-                 (uint64_t) ne1 * 0x165667B19E3779F9ull ^ (uint64_t) ne2 * 0x27D4EB2F165667C5ull ^
-                 (uint64_t) bid * 0x94D049BB133111EBull ^ (uint64_t) team * 0xBF58476D1CE4E5B9ull ^
-                 (uint64_t) (wtype + 1) * 0xD6E8FEB86659FD93ull;
+static void ggml_nbt_members(char * buf, size_t len, const struct ggml_cgraph * g, int node0, int chain) {
+    size_t o = 0; buf[0] = 0;
+    for (int j = node0, c = 0; g && j < g->n_nodes && c < chain && o < len; ++j) {
+        const struct ggml_tensor * nj = g->nodes[j];
+        if (ggml_is_noop(nj)) continue;
+        const int w = snprintf(buf + o, len - o, "%s%lld:%lld:%s", c ? "+" : "", (long long) nj->ne[0],
+                               (long long) (nj->src[0] ? nj->src[0]->ne[0] : 0),
+                               nj->src[0] ? ggml_type_name(nj->src[0]->type) : "-");
+        if (w < 0) break;
+        o += (size_t) w; ++c;
+    }
+}
+
+// compute nodes of the call that starts at node0 and ends before node `end` (the next call's first node,
+// or the end of the graph): the graph loop resumes after the call's last node and skips no-op nodes
+static struct ggml_nbt_call ggml_nbt_resolve(const struct ggml_cgraph * g, int node0, int end) {
+    struct ggml_nbt_call c = { 0, 0, 0, 0xCBF29CE484222325ull };
+    for (int j = node0; g && j >= 0 && j < end && j < g->n_nodes; ++j) {
+        const struct ggml_tensor * nj = g->nodes[j];
+        if (ggml_is_noop(nj)) continue;
+        ++c.chain; c.rows += nj->ne[0];
+        if (nj->src[0]) c.bytes += (int64_t) ggml_nbytes(nj->src[0]);
+        const uint64_t v[3] = { (uint64_t) nj->ne[0], (uint64_t) (nj->src[0] ? nj->src[0]->ne[0] : 0),
+                                (uint64_t) (nj->src[0] ? nj->src[0]->type + 1 : 0) };
+        for (int i = 0; i < 3; ++i) { c.sig ^= v[i]; c.sig *= 0x100000001B3ull; }   // FNV-1a over the members
+    }
+    return c;
+}
+
+static struct ggml_nbt_entry * ggml_nbt_find(const struct ggml_nbt_rec * r, const struct ggml_nbt_call * c, int team,
+                                             const struct ggml_cgraph * g) {
+    uint64_t h = (uint64_t) r->op * 0x9E3779B97F4A7C15ull ^ (uint64_t) r->ne0 * 0xC2B2AE3D27D4EB4Full ^
+                 (uint64_t) r->ne1 * 0x165667B19E3779F9ull ^ (uint64_t) r->ne2 * 0x27D4EB2F165667C5ull ^
+                 (uint64_t) r->bid * 0x94D049BB133111EBull ^ (uint64_t) team * 0xBF58476D1CE4E5B9ull ^
+                 (uint64_t) (r->wtype + 1) * 0xD6E8FEB86659FD93ull ^ (uint64_t) r->k * 0x9FB21C651E98DF25ull ^
+                 c->sig * 0xC13FA9A902A6328Full;
     for (int probe = 0; probe < GGML_NBT_KEYS; ++probe) {
         struct ggml_nbt_entry * e = &g_nbt[(h + probe) % GGML_NBT_KEYS];
         if (!e->used) {
-            e->used = 1; e->op = op; e->bid = bid; e->team = team; e->wtype = wtype; e->ne0 = ne0; e->ne1 = ne1; e->ne2 = ne2;
+            e->used = 1; e->op = r->op; e->bid = r->bid; e->team = team; e->wtype = r->wtype; e->chain = c->chain;
+            e->ne0 = r->ne0; e->ne1 = r->ne1; e->ne2 = r->ne2; e->k = r->k; e->chain_rows = c->rows;
+            e->chain_bytes = (uint64_t) c->bytes; e->chain_sig = c->sig;
+            if (c->chain > 1) ggml_nbt_members(e->members, sizeof(e->members), g, r->node0, c->chain);
             return e;
         }
-        if (e->op == op && e->bid == bid && e->team == team && e->wtype == wtype &&
-            e->ne0 == ne0 && e->ne1 == ne1 && e->ne2 == ne2) return e;
+        if (e->op == r->op && e->bid == r->bid && e->team == team && e->wtype == r->wtype && e->chain_sig == c->sig &&
+            e->chain == c->chain && e->chain_rows == c->rows &&
+            e->ne0 == r->ne0 && e->ne1 == r->ne1 && e->ne2 == r->ne2 && e->k == r->k) return e;
     }
     return NULL;
 }
 
 // single-threaded, after the graph: align the workers' records by barrier index and aggregate
-static void ggml_nbt_aggregate(int nth) {
+static void ggml_nbt_aggregate(int nth, const struct ggml_cgraph * g) {
     if (nth <= 1 || nth > GGML_NBS_MAX_THREADS) return;
     const uint64_t t0 = ggml_nbs_now();
     for (int t = 0; t < nth; ++t) {
@@ -5282,13 +5331,22 @@ static void ggml_nbt_aggregate(int nth) {
     for (int t = 0; t < nth; ++t) {
         if (!g_nbt_buf[t] || g_nbt_cnt[t] != n) { g_nbt_mismatch++; n = -1; break; }
     }
+    struct ggml_nbt_call call = { 0, 0, 0, 0 };
+    int call_node0 = -2;
     for (int k = 0; k < n; ++k) {
         const struct ggml_nbt_rec * r0 = &g_nbt_buf[0][k];
+        if (r0->node0 != call_node0) {   // first record of a call: its nodes end where the next call starts
+            int end = g ? g->n_nodes : 0;
+            for (int k2 = k + 1; k2 < n; ++k2) if (g_nbt_buf[0][k2].node0 != r0->node0) { end = g_nbt_buf[0][k2].node0; break; }
+            call = ggml_nbt_resolve(g, r0->node0, end);
+            call_node0 = r0->node0;
+        }
         uint64_t rel_min = UINT64_MAX, rel_max = 0, arr_min = UINT64_MAX, arr_max = 0, work_sum = 0, work_max = 0;
         int latest = 0, ok = 1;
         for (int t = 0; t < nth && ok; ++t) {
             const struct ggml_nbt_rec * r = &g_nbt_buf[t][k];
-            if (r->op != r0->op || r->bid != r0->bid || r->wtype != r0->wtype) { g_nbt_mismatch++; ok = 0; break; }
+            if (r->op != r0->op || r->bid != r0->bid || r->wtype != r0->wtype || r->node0 != r0->node0 ||
+                r->k != r0->k) { g_nbt_mismatch++; ok = 0; break; }
             if (r->exit_prev == 0 || r->arrive < r->exit_prev) { ok = 0; break; }   // first barrier of a graph
             if (r->exit_prev < rel_min) rel_min = r->exit_prev;
             if (r->exit_prev > rel_max) rel_max = r->exit_prev;
@@ -5302,7 +5360,7 @@ static void ggml_nbt_aggregate(int nth) {
         for (int t = 0; t < nth; ++t) wait_sum += arr_max - g_nbt_buf[t][k].arrive;
         const uint64_t mean = work_sum / (uint64_t) nth;
         const struct ggml_nbt_rec * rl = &g_nbt_buf[latest][k];
-        struct ggml_nbt_entry * e = ggml_nbt_find(r0->op, r0->bid, nth, r0->wtype, r0->ne0, r0->ne1, r0->ne2);
+        struct ggml_nbt_entry * e = ggml_nbt_find(r0, &call, nth, g);
         if (!e) { g_nbt_dropped++; continue; }
         e->n++;
         e->completion += arr_max - rel_min;
@@ -5343,11 +5401,13 @@ static void ggml_nbt_print(void) {
         fprintf(stderr, "  no barrier records survived: nothing to rank\n");
         return;
     }
-    fprintf(stderr, "  key = op, dst shape, type of src[0] (weights), barrier # within the op, team size; completion = last arrival - first previous exit;\n"
+    fprintf(stderr, "  key = op, dst shape, K = src[0]->ne[0], type of src[0] (weights), chain = nodes fused into this compute call\n"
+                    "  (matmuls sharing src1; rows = their total ne[0], MB = their total weight bytes), barrier # within the call,\n"
+                    "  team size; completion = last arrival - first previous exit;\n"
                     "  rel = exit spread entering the barrier interval; work = arrival - own previous exit (mean / max over workers);\n"
                     "  arr = arrival spread; wait = sum over workers (worker time, not wall time); latest = worker with the latest\n"
                     "  arrival (exact); late_rel = its exit offset; late_work = its work minus the mean (signed)\n");
-    fprintf(stderr, "  %-18s %-16s %-9s %3s %4s %8s %9s %6s %8s %7s %8s %8s %7s %9s  %-20s %6s %8s %9s\n", "op", "shape", "src0", "b#", "team", "barriers",
+    fprintf(stderr, "  %-18s %-16s %6s %-9s %-16s %3s %4s %8s %9s %6s %8s %7s %8s %8s %7s %9s  %-20s %6s %8s %9s\n", "op", "shape", "K", "src0", "chain:rows/MB", "b#", "team", "barriers",
             "compl_ms", "%", "compl_us", "rel_us", "work_us", "wmax_us", "arr_us", "wait_ms", "latest (share)", "n0_lst", "late_rel", "late_work");
     for (int r = 0; r < m && r < 30; ++r) {
         const struct ggml_nbt_entry * e = &g_nbt[idx[r]];
@@ -5359,12 +5419,26 @@ static void ggml_nbt_print(void) {
         char lat[48]; snprintf(lat, sizeof(lat), "t%d %.0f%%, t%d %.0f%%", t1, 100.0 * e->latest[t1] / n, t2, 100.0 * e->latest[t2] / n);
         uint64_t n0 = 0;   // share of barriers whose latest worker is on node 0 (block split of this team)
         for (int t = 0; t < GGML_NBT_TOPT && t < e->team; ++t) if (ggml_numa_node_for_thread(t, e->team) == 0) n0 += e->latest[t];
-        fprintf(stderr, "  %-18s %-16s %-9s %3d %4d %8llu %9.2f %5.1f%% %8.2f %7.2f %8.2f %8.2f %7.2f %9.2f  %-20s %5.1f%% %8.2f %9.2f\n",
-                ggml_op_name((enum ggml_op) e->op), shape, e->wtype >= 0 ? ggml_type_name((enum ggml_type) e->wtype) : "-",
+        char chain[40];   // fused calls carry @<member signature>, which links them to their chain line below
+        if (e->chain > 1) snprintf(chain, sizeof(chain), "%d:%lld/%.1f@%08x", e->chain, (long long) e->chain_rows, e->chain_bytes / 1e6, (unsigned) (e->chain_sig >> 32));
+        else              snprintf(chain, sizeof(chain), "%d:%lld/%.1f", e->chain, (long long) e->chain_rows, e->chain_bytes / 1e6);
+        fprintf(stderr, "  %-18s %-16s %6lld %-9s %-16s %3d %4d %8llu %9.2f %5.1f%% %8.2f %7.2f %8.2f %8.2f %7.2f %9.2f  %-20s %5.1f%% %8.2f %9.2f\n",
+                ggml_op_name((enum ggml_op) e->op), shape, (long long) e->k,
+                e->wtype >= 0 ? ggml_type_name((enum ggml_type) e->wtype) : "-", chain,
                 e->bid, e->team, (unsigned long long) e->n,
                 e->completion / tpu / 1000.0, 100.0 * e->completion / (double) tot, e->completion / n / tpu,
                 e->rel_spread / n / tpu, e->work_mean / n / tpu, e->work_max / n / tpu,
                 e->arr_spread / n / tpu, e->wait_sum / tpu / 1000.0, lat, 100.0 * n0 / n, e->late_rel / n / tpu, e->late_work / n / tpu);
+    }
+    int hdr = 0;   // members of the fused calls above (ne0:K:src0 type of each node, in graph order)
+    for (int r = 0; r < m && r < 30; ++r) {
+        const struct ggml_nbt_entry * e = &g_nbt[idx[r]];
+        if (e->chain <= 1) continue;
+        if (!hdr++) fprintf(stderr, "  chains (ne0:K:src0 per fused node, from the first graph with that key):\n");
+        fprintf(stderr, "  chain %-18s %lldx%lldx%lld K=%lld %s %d:%lld@%08x b#%d team %d: %s\n", ggml_op_name((enum ggml_op) e->op),
+                (long long) e->ne0, (long long) e->ne1, (long long) e->ne2, (long long) e->k,
+                e->wtype >= 0 ? ggml_type_name((enum ggml_type) e->wtype) : "-", e->chain, (long long) e->chain_rows,
+                (unsigned) (e->chain_sig >> 32), e->bid, e->team, e->members);
     }
 }
 
@@ -5478,11 +5552,11 @@ static void ggml_nbs_snap_restore(void) {
 }
 
 // called single-threaded at the end of ggml_graph_compute
-static void ggml_nbs_graph_done(int n_threads) {
+static void ggml_nbs_graph_done(int n_threads, const struct ggml_cgraph * cgraph) {
     if (g_nbs_every <= 0 || !g_numa_barrier.active) return;
     if (n_threads > g_nbs_n_threads) g_nbs_n_threads = n_threads;
     if (g_nbs_n_threads_min == 0 || n_threads < g_nbs_n_threads_min) g_nbs_n_threads_min = n_threads;
-    if (g_nbt_rec_graph) ggml_nbt_aggregate(n_threads);
+    if (g_nbt_rec_graph) ggml_nbt_aggregate(n_threads, cgraph);
     ++g_nbs_graphs;
     // sampling cadence on its own counter: report resets and request-window restores reset
     // g_nbs_graphs, which would otherwise shift or repeat the sampled graphs
@@ -5570,7 +5644,7 @@ static void ggml_numa_hier_barrier(void) {
             struct ggml_nbt_rec * r = &g_nbt_buf[tl_nbs_ith][tl_nbt_cnt++];
             r->exit_prev = tl_nbt_exit; r->arrive = t_arrive;
             r->ne0 = tl_nbt_ne[0]; r->ne1 = tl_nbt_ne[1]; r->ne2 = tl_nbt_ne[2];
-            r->op = tl_nbs_op; r->bid = tl_nbt_bid; r->wtype = tl_nbt_wtype;
+            r->op = tl_nbs_op; r->bid = tl_nbt_bid; r->wtype = tl_nbt_wtype; r->k = tl_nbt_k; r->node0 = tl_nbt_node0;
         } else {
             tl_nbt_ovf = 1;
         }
@@ -32400,7 +32474,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         tl_nbs_op = node->op;
         tl_nbt_ne[0] = node->ne[0]; tl_nbt_ne[1] = node->ne[1]; tl_nbt_ne[2] = node->ne[2];
         tl_nbt_wtype = node->src[0] ? (int32_t) node->src[0]->type : -1;
-        tl_nbt_bid = 0;
+        tl_nbt_k     = node->src[0] ? node->src[0]->ne[0] : 0;
+        tl_nbt_bid   = 0;
+        tl_nbt_node0 = node_n;   // the call's nodes are resolved from the graph after it (ggml_nbt_aggregate)
         const int obs_first = node_n;
         // MoE expert ids are read before the op: they are complete (computed by earlier nodes) and
         // cannot be overwritten before this op's barrier. After it, the next node may reuse their
@@ -32656,7 +32732,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     }
 #endif
 
-    ggml_nbs_graph_done(n_threads);
+    ggml_nbs_graph_done(n_threads, cgraph);
     if (ins_phase) {
         ggml_phase_add(GGML_PHASE_WAKE, atomic_load_explicit(&g_phase_wake_max, memory_order_relaxed) - ins_t0);
     }
