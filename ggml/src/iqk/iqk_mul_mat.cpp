@@ -674,6 +674,27 @@ static void convert_f8_q80(ggml_type type, int typeA, int n, const void * vx, si
     }
 }
 
+// Row units [u0, u1) of thread ith out of n, for the row-split matmul paths. Proportional
+// (default): every thread gets floor or ceil of n/nth, so with the NUMA mirror (threads in
+// contiguous blocks per node) each node gets its exact share of the rows. The old ceiling split
+// gave threads 0..nth-2 ceil(n/nth) each and the last thread the remainder, so node 0 streamed more
+// rows than node 1 (e.g. 512 units on 24 threads: 264 vs 248). Each output row is still computed
+// whole by one thread, so results are unchanged. IQK_SPLIT_PROPORTIONAL=0: old split, for A/B tests.
+static inline void iqk_thread_units(int n, int ith, int nth, int & u0, int & u1) {
+    static const bool proportional = [] {
+        const char * e = getenv("IQK_SPLIT_PROPORTIONAL");
+        return !e || atoi(e) != 0;
+    }();
+    if (proportional) {
+        u0 = (int) ((int64_t) n * ith / nth);
+        u1 = (int) ((int64_t) n * (ith + 1) / nth);
+    } else {
+        const int per = (n + nth - 1) / nth;
+        u0 = std::min(n, ith * per);
+        u1 = std::min(n, u0 + per);
+    }
+}
+
 extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
         int typeA, const void * A, long strideA,
         int typeB, const void * B, long strideB,
@@ -728,12 +749,11 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
         }
         const bool is_float = !mm.func16 && (typeA == GGML_TYPE_F32 || typeA == GGML_TYPE_F16 || typeA == GGML_TYPE_BF16);
         if (int num_rows = is_float ? 1 : MulMat::num_rows(ggml_type(typeA)); Ny <= 16 && (is_float || (num_rows >= 4 && Nx%num_rows == 0))) {
-            int nunit = Nx/num_rows;
-            int nper  = (nunit + nth - 1)/nth;
-            int first = ith*nper;
-            if (first < nunit) {
-                int nrc_x = num_rows*std::min(nper, nunit - first);
-                first *= num_rows;
+            int u0, u1;
+            iqk_thread_units(Nx/num_rows, ith, nth, u0, u1);
+            if (u1 > u0) {
+                int nrc_x = num_rows*(u1 - u0);
+                int first = u0*num_rows;
                 DataInfo info{C + first, (const char *)B, (size_t)stride_C, row_size_qy, 0, 1, nullptr, 0};
                 mm.mul_mat_NxM(ne00, (const char *)A + first*row_size_qx, row_size_qx, info, nrc_x, Ny);
             }
@@ -837,13 +857,13 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
         return true;
     }
 
-    auto nrc_x = (Nx/num_rows + nth - 1)/nth;
-    auto first_x = ith*nrc_x;
-    if (first_x + nrc_x > Nx/num_rows) nrc_x = Nx/num_rows - first_x;
+    int u0, u1;
+    iqk_thread_units(Nx/num_rows, ith, nth, u0, u1);
+    if (u1 <= u0) return true;
 
-    DataInfo info{C + first_x*num_rows, (const char *)B, (size_t)stride_C, row_size_qy, 0, 1, nullptr, 0};
+    DataInfo info{C + u0*num_rows, (const char *)B, (size_t)stride_C, row_size_qy, 0, 1, nullptr, 0};
 
-    mm.mul_mat_NxM(ne00, (const char *)A + row_size_qx*first_x*num_rows, row_size_qx, info, nrc_x*num_rows, Ny);
+    mm.mul_mat_NxM(ne00, (const char *)A + row_size_qx*u0*num_rows, row_size_qx, info, (u1 - u0)*num_rows, Ny);
 
     return true;
 }
