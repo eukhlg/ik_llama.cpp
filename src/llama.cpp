@@ -2517,18 +2517,34 @@ bool  llama_kv_cache::llama_ckpt_mode_equal(llama_ckpt_data ckpt_type, int mode)
 // (the production case: AVX-512 row-block split, threads split evenly across nodes, head count
 // divisible by the node count), bind those pages of every step to node k. Otherwise (AVX2
 // whole-head split, uneven teams) leave the pages where they are: writer, restore and active-state
-// placement would disagree. Pages are already populated (cleared, or holding live checkpoints on
-// reuse); the bind migrates them with their contents. n_threads = batch threads, since per-step
-// saves run in batches of more than one token. LLAMA_CKPT_NUMA=0 disables it, for A/B tests.
-static void llama_per_step_numa_place(llama_kv_cache::gpu_checkpoint & ckpt, const llama_model & model,
+// placement would disagree. On allocation the bind comes before the clear, so pages fault directly
+// on their node (migrating populated pages proved incomplete: about a fifth stayed behind, likely
+// in transparent huge pages split by the bind). On reuse the pages hold live checkpoints, so the
+// bind migrates them with their contents (best effort; the endpoint sample shows what moved).
+// n_threads = batch threads, since per-step saves run in batches of more than one token.
+// LLAMA_CKPT_NUMA=0 disables it, for A/B tests.
+struct llama_ckpt_numa_plan {
+    struct range { uintptr_t a0, a1; int node; };
+    std::vector<range> ranges;
+    int n_layers = 0, n_failed = 0, n_nodes = 1, n_threads = 0, steps = 0;
+    uintptr_t pg = 4096;
+    const char * when = "";
+};
+
+static llama_ckpt_numa_plan llama_per_step_numa_bind(llama_kv_cache::gpu_checkpoint & ckpt, const llama_model & model,
         int max_tokens, int n_threads, const char * when) {
+    llama_ckpt_numa_plan plan;
+    plan.when = when;
+    plan.n_threads = n_threads;
+    plan.steps = max_tokens - 1;
     static const bool ckpt_numa = [] {
         const char * e = getenv("LLAMA_CKPT_NUMA");
         return !e || atoi(e) != 0;
     }();
     const int n_nodes = ggml_numa_mirror_active() ? ggml_numa_node_count() : 1;
+    plan.n_nodes = n_nodes;
     if (!ckpt_numa || n_nodes <= 1 || max_tokens <= 1) {
-        return;
+        return plan;
     }
     ckpt.per_step_numa_threads = n_threads;
     const int num_v_heads = model.hparams.ssm_dt_rank;
@@ -2556,17 +2572,15 @@ static void llama_per_step_numa_place(llama_kv_cache::gpu_checkpoint & ckpt, con
     if (skip) {
         LLAMA_LOG_INFO("%s: NUMA mirror (%s): per-step checkpoints not bound%s: %s (%d threads)\n", __func__, when,
                 ckpt.per_step_numa_bound ? ", earlier placement kept" : "", skip, n_threads);
-        return;
+        return plan;
     }
 
-    struct bind_range { uintptr_t a0, a1; int node; };
-    std::vector<bind_range> ranges;
     const uintptr_t pg = (uintptr_t) ggml_numa_page_size();
+    plan.pg = pg;
     auto rd = [pg](uintptr_t a) { return a & ~(pg - 1); };
     auto ru = [pg](uintptr_t a) { return (a + pg - 1) & ~(pg - 1); };
     const size_t head_bytes = (size_t) head_v_dim * head_v_dim * sizeof(float);
     const size_t step_bytes = (size_t) num_v_heads * head_bytes;
-    int n_layers = 0;
     for (const auto & per_layer : ckpt.per_step_ssm) {
         // unsplit host tensors only (split recurrent state lives on other backends)
         if (per_layer.size() != 1) continue;
@@ -2585,29 +2599,35 @@ static void llama_per_step_numa_place(llama_kv_cache::gpu_checkpoint & ckpt, con
                 // neighbouring step or tensor are never touched.
                 const uintptr_t a0 = ru(s0);
                 const uintptr_t a1 = n + 1 == n_nodes ? rd(s1) : ru(s1);
-                if (a1 > a0) ranges.push_back({ a0, a1, n });
+                if (a1 > a0) plan.ranges.push_back({ a0, a1, n });
             }
         }
-        ++n_layers;
+        ++plan.n_layers;
     }
-    if (ranges.empty()) {
-        return;
-    }
-    int n_failed = 0;
-    for (const auto & r : ranges) {
+    for (const auto & r : plan.ranges) {
         if (!ggml_numa_bind((void *) r.a0, (size_t) (r.a1 - r.a0), r.node)) {
-            if (n_failed++ == 0) {
+            if (plan.n_failed++ == 0) {
                 LLAMA_LOG_WARN("%s: NUMA mirror: binding checkpoint range %p + %zu to node %d failed: %s\n",
                         __func__, (void *) r.a0, (size_t) (r.a1 - r.a0), r.node, strerror(errno));
             }
         }
     }
-    ckpt.per_step_numa_bound = n_failed < (int) ranges.size();
-    // endpoint sample: node of the first and last page of every range (two pages per range, so this
-    // checks the binding took effect, it does not prove residency of every page in between)
+    if (!plan.ranges.empty()) {
+        ckpt.per_step_numa_bound = plan.n_failed < (int) plan.ranges.size();
+    }
+    return plan;
+}
+
+// endpoint sample of a bound plan (pages must be populated): node of the first and last page of
+// every range. Two pages per range show whether the binding took effect; they do not prove the
+// residency of every page in between.
+static void llama_per_step_numa_report(const llama_ckpt_numa_plan & plan) {
+    if (plan.ranges.empty()) {
+        return;
+    }
     int n_wrong = 0, n_unknown = 0, first_errno = 0;
-    for (const auto & r : ranges) {
-        for (const uintptr_t a : { r.a0, r.a1 - pg }) {
+    for (const auto & r : plan.ranges) {
+        for (const uintptr_t a : { r.a0, r.a1 - plan.pg }) {
             errno = 0;
             const int node = ggml_numa_page_node((const void *) a);
             if (node < 0) {
@@ -2619,8 +2639,8 @@ static void llama_per_step_numa_place(llama_kv_cache::gpu_checkpoint & ckpt, con
     }
     LLAMA_LOG_INFO("%s: NUMA mirror (%s): per-step checkpoints of %d layers x %d steps bound by head range across %d nodes "
                    "(%d threads): %zu ranges, %d binds failed; endpoint sample of %zu pages: %d on another node, %d unknown%s%s\n",
-            __func__, when, n_layers, max_tokens - 1, n_nodes, n_threads, ranges.size(), n_failed, 2 * ranges.size(),
-            n_wrong, n_unknown, n_unknown ? ", first query error: " : "", n_unknown ? strerror(first_errno) : "");
+            __func__, plan.when, plan.n_layers, plan.steps, plan.n_nodes, plan.n_threads, plan.ranges.size(), plan.n_failed,
+            2 * plan.ranges.size(), n_wrong, n_unknown, n_unknown ? ", first query error: " : "", n_unknown ? strerror(first_errno) : "");
 }
 
 bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens, int n_threads) {
@@ -2628,7 +2648,7 @@ bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens, i
         // reused allocation: decide the NUMA placement again if the batch thread count changed
         // (the writer partition depends on it); binding migrates pages with their contents
         if (n_threads > 0 && n_threads != ckpt.per_step_numa_threads) {
-            llama_per_step_numa_place(ckpt, model, ckpt.per_step_max_allocated, n_threads, "reuse");
+            llama_per_step_numa_report(llama_per_step_numa_bind(ckpt, model, ckpt.per_step_max_allocated, n_threads, "reuse"));
         }
         return true;
     }
@@ -2789,7 +2809,6 @@ bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens, i
             ckpt.release_per_step();
             return false;
         }
-        ggml_backend_buffer_clear(buf, 0);
         LLAMA_LOG_INFO("%s: %10s per-step buffer = %8.2f MiB (max_tokens=%d)\n", __func__,
                        ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0, max_tokens);
         ckpt.per_step_ctxs.push_back(ctx);
@@ -2797,7 +2816,12 @@ bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens, i
     }
 
     ckpt.per_step_max_allocated = max_tokens;
-    llama_per_step_numa_place(ckpt, model, max_tokens, n_threads, "alloc");
+    // bind before the first touch, then clear (the clear populates the pages on their node)
+    const llama_ckpt_numa_plan numa_plan = llama_per_step_numa_bind(ckpt, model, max_tokens, n_threads, "alloc");
+    for (ggml_backend_buffer_t b : ckpt.per_step_bufs) {
+        ggml_backend_buffer_clear(b, 0);
+    }
+    llama_per_step_numa_report(numa_plan);
     return true;
 }
 
