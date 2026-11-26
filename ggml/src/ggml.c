@@ -5203,6 +5203,165 @@ static uint64_t g_nbs_thr_last[GGML_NBS_MAX_THREADS];
 static uint64_t g_nbs_thr_wait[GGML_NBS_MAX_THREADS];
 static uint64_t g_nbs_thr_work[GGML_NBS_MAX_THREADS];
 
+// GGML_NUMA_BARRIER_TRACE=<N> (with GGML_NUMA_BARRIER_STATS): per-barrier timing by op, dst shape,
+// barrier number within the op and team size, for every N-th graph (N=1: all; a larger N checks
+// that conclusions survive a lower sampling rate). Nothing shared is touched inside the barrier:
+// each worker appends {previous exit, arrival, key} to its own buffer (allocated by the worker
+// itself, so node-local), and the exit time is taken at the barrier's common final exit point
+// (after the statistics bookkeeping and, for leaders, after releasing their node). After the graph,
+// the single-threaded graph-done hook aligns the workers' records by barrier index and aggregates:
+//   completion = last arrival - first previous exit     (one barrier interval, wall time)
+//   rel_spread = last previous exit - first             (exit skew entering the op)
+//   work       = arrival - own previous exit            (per worker: mean and max)
+//   arr_spread = last arrival - first arrival
+//   wait       = sum over workers of (last arrival - own arrival)  (worker time, not wall time)
+//   latest     = worker with the maximum arrival time (exact); for it, its exit offset and its
+//                work minus the mean (signed: negative = it started late and worked less)
+// The aggregation time is reported separately; it falls between graphs, not inside barriers.
+#define GGML_NBT_KEYS    1024
+#define GGML_NBT_TOPT    64
+#define GGML_NBT_MAX_REC 8192
+struct ggml_nbt_rec {
+    uint64_t exit_prev, arrive;
+    int64_t  ne0, ne1, ne2;
+    int32_t  op, bid;
+};
+struct ggml_nbt_entry {
+    int      used, op, bid, team;
+    int64_t  ne0, ne1, ne2;
+    uint64_t n, completion, rel_spread, arr_spread, work_mean, work_max, wait_sum, late_rel;
+    int64_t  late_work;   // signed sum of (latest worker's work - mean work)
+    uint32_t latest[GGML_NBT_TOPT];
+};
+static int      g_nbt_every = 0;            // 0: off
+static uint64_t g_nbt_dropped = 0, g_nbt_mismatch = 0, g_nbt_graphs = 0, g_nbt_agg_ticks = 0, g_nbt_overflow = 0;
+static uint64_t g_nbt_snap_dropped = 0, g_nbt_snap_mismatch = 0, g_nbt_snap_graphs = 0, g_nbt_snap_agg_ticks = 0, g_nbt_snap_overflow = 0;
+static struct ggml_nbt_entry g_nbt[GGML_NBT_KEYS], g_nbt_snap[GGML_NBT_KEYS];
+static struct ggml_nbt_rec * g_nbt_buf[GGML_NBS_MAX_THREADS];
+static int      g_nbt_cnt[GGML_NBS_MAX_THREADS];
+static int      g_nbt_rec_graph = 0;        // set before a graph runs: record this graph
+static uint64_t g_nbt_seq = 0;              // graphs seen by the trace, never reset (sampling cadence)
+static int      g_nbt_ovf[GGML_NBS_MAX_THREADS];   // worker's buffer overflowed in this graph
+static GGML_THREAD_LOCAL int      tl_nbt_rec  = 0;
+static GGML_THREAD_LOCAL int      tl_nbt_cnt  = 0;  // records this graph (published to g_nbt_cnt at thread end)
+static GGML_THREAD_LOCAL int      tl_nbt_ovf  = 0;  // more barriers than buffer records in this graph
+static GGML_THREAD_LOCAL int      tl_nbt_bid  = 0;  // barrier number within the current op
+static GGML_THREAD_LOCAL uint64_t tl_nbt_exit = 0;  // exit time of this worker's previous barrier
+static GGML_THREAD_LOCAL int64_t  tl_nbt_ne[3];     // dst shape of the node being computed
+
+static struct ggml_nbt_entry * ggml_nbt_find(int op, int bid, int team, int64_t ne0, int64_t ne1, int64_t ne2) {
+    uint64_t h = (uint64_t) op * 0x9E3779B97F4A7C15ull ^ (uint64_t) ne0 * 0xC2B2AE3D27D4EB4Full ^
+                 (uint64_t) ne1 * 0x165667B19E3779F9ull ^ (uint64_t) ne2 * 0x27D4EB2F165667C5ull ^
+                 (uint64_t) bid * 0x94D049BB133111EBull ^ (uint64_t) team * 0xBF58476D1CE4E5B9ull;
+    for (int probe = 0; probe < GGML_NBT_KEYS; ++probe) {
+        struct ggml_nbt_entry * e = &g_nbt[(h + probe) % GGML_NBT_KEYS];
+        if (!e->used) {
+            e->used = 1; e->op = op; e->bid = bid; e->team = team; e->ne0 = ne0; e->ne1 = ne1; e->ne2 = ne2;
+            return e;
+        }
+        if (e->op == op && e->bid == bid && e->team == team && e->ne0 == ne0 && e->ne1 == ne1 && e->ne2 == ne2) return e;
+    }
+    return NULL;
+}
+
+// single-threaded, after the graph: align the workers' records by barrier index and aggregate
+static void ggml_nbt_aggregate(int nth) {
+    if (nth <= 1 || nth > GGML_NBS_MAX_THREADS) return;
+    const uint64_t t0 = ggml_nbs_now();
+    for (int t = 0; t < nth; ++t) {
+        if (g_nbt_ovf[t]) {   // the graph's tail barriers are missing: skip it, count it
+            g_nbt_overflow++;
+            g_nbt_agg_ticks += ggml_nbs_now() - t0;
+            return;
+        }
+    }
+    int n = g_nbt_cnt[0];
+    for (int t = 0; t < nth; ++t) {
+        if (!g_nbt_buf[t] || g_nbt_cnt[t] != n) { g_nbt_mismatch++; n = -1; break; }
+    }
+    for (int k = 0; k < n; ++k) {
+        const struct ggml_nbt_rec * r0 = &g_nbt_buf[0][k];
+        uint64_t rel_min = UINT64_MAX, rel_max = 0, arr_min = UINT64_MAX, arr_max = 0, work_sum = 0, work_max = 0;
+        int latest = 0, ok = 1;
+        for (int t = 0; t < nth && ok; ++t) {
+            const struct ggml_nbt_rec * r = &g_nbt_buf[t][k];
+            if (r->op != r0->op || r->bid != r0->bid) { g_nbt_mismatch++; ok = 0; break; }
+            if (r->exit_prev == 0 || r->arrive < r->exit_prev) { ok = 0; break; }   // first barrier of a graph
+            if (r->exit_prev < rel_min) rel_min = r->exit_prev;
+            if (r->exit_prev > rel_max) rel_max = r->exit_prev;
+            if (r->arrive < arr_min) arr_min = r->arrive;
+            if (r->arrive > arr_max) { arr_max = r->arrive; latest = t; }
+            work_sum += r->arrive - r->exit_prev;
+            if (r->arrive - r->exit_prev > work_max) work_max = r->arrive - r->exit_prev;
+        }
+        if (!ok) continue;
+        uint64_t wait_sum = 0;
+        for (int t = 0; t < nth; ++t) wait_sum += arr_max - g_nbt_buf[t][k].arrive;
+        const uint64_t mean = work_sum / (uint64_t) nth;
+        const struct ggml_nbt_rec * rl = &g_nbt_buf[latest][k];
+        struct ggml_nbt_entry * e = ggml_nbt_find(r0->op, r0->bid, nth, r0->ne0, r0->ne1, r0->ne2);
+        if (!e) { g_nbt_dropped++; continue; }
+        e->n++;
+        e->completion += arr_max - rel_min;
+        e->rel_spread += rel_max - rel_min;
+        e->arr_spread += arr_max - arr_min;
+        e->work_mean  += mean;
+        e->work_max   += work_max;
+        e->wait_sum   += wait_sum;
+        e->late_rel   += rl->exit_prev - rel_min;
+        e->late_work  += (int64_t) (rl->arrive - rl->exit_prev) - (int64_t) mean;
+        if (latest < GGML_NBT_TOPT) e->latest[latest]++;
+    }
+    g_nbt_graphs++;
+    g_nbt_agg_ticks += ggml_nbs_now() - t0;
+}
+
+static void ggml_nbt_print(void) {
+    int idx[GGML_NBT_KEYS], m = 0;
+    uint64_t tot = 0;
+    for (int i = 0; i < GGML_NBT_KEYS; ++i) if (g_nbt[i].used && g_nbt[i].n) { idx[m++] = i; tot += g_nbt[i].completion; }
+    if (!m && !g_nbt_graphs && !g_nbt_overflow && !g_nbt_mismatch && !g_nbt_dropped) return;   // nothing recorded or rejected
+    for (int i = 1; i < m; ++i) {   // insertion sort by accumulated completion time, descending
+        int k = idx[i], j = i - 1;
+        while (j >= 0 && g_nbt[idx[j]].completion < g_nbt[k].completion) { idx[j + 1] = idx[j]; --j; }
+        idx[j + 1] = k;
+    }
+    const double tpu = g_nbs_tick_per_us;
+    fprintf(stderr, "barrier trace (every %d graphs: %llu graphs recorded, aggregation %.1f us per graph between graphs), "
+                    "%d keys, %.1f ms completion total\n",
+            g_nbt_every, (unsigned long long) g_nbt_graphs, g_nbt_graphs ? g_nbt_agg_ticks / tpu / g_nbt_graphs : 0.0,
+            m, tot / tpu / 1000.0);
+    if (g_nbt_overflow || g_nbt_mismatch || g_nbt_dropped) {
+        fprintf(stderr, "  WARNING: %llu graphs skipped (record buffer of %d barriers overflowed), %llu mismatched record sets skipped, "
+                        "%llu barriers dropped (key table full)\n",
+                (unsigned long long) g_nbt_overflow, GGML_NBT_MAX_REC, (unsigned long long) g_nbt_mismatch, (unsigned long long) g_nbt_dropped);
+    }
+    if (!m) {
+        fprintf(stderr, "  no barrier records survived: nothing to rank\n");
+        return;
+    }
+    fprintf(stderr, "  key = op, dst shape, barrier # within the op, team size; completion = last arrival - first previous exit;\n"
+                    "  rel = exit spread entering the barrier interval; work = arrival - own previous exit (mean / max over workers);\n"
+                    "  arr = arrival spread; wait = sum over workers (worker time, not wall time); latest = worker with the latest\n"
+                    "  arrival (exact); late_rel = its exit offset; late_work = its work minus the mean (signed)\n");
+    fprintf(stderr, "  %-18s %-16s %3s %4s %8s %9s %6s %8s %7s %8s %8s %7s %9s  %-20s %8s %9s\n", "op", "shape", "b#", "team", "barriers",
+            "compl_ms", "%", "compl_us", "rel_us", "work_us", "wmax_us", "arr_us", "wait_ms", "latest (share)", "late_rel", "late_work");
+    for (int r = 0; r < m && r < 30; ++r) {
+        const struct ggml_nbt_entry * e = &g_nbt[idx[r]];
+        const double n = (double) e->n;
+        char shape[40]; snprintf(shape, sizeof(shape), "%lldx%lldx%lld", (long long) e->ne0, (long long) e->ne1, (long long) e->ne2);
+        int t1 = 0, t2 = -1;
+        for (int t = 1; t < GGML_NBT_TOPT; ++t) if (e->latest[t] > e->latest[t1]) t1 = t;
+        for (int t = 0; t < GGML_NBT_TOPT; ++t) if (t != t1 && (t2 < 0 || e->latest[t] > e->latest[t2])) t2 = t;
+        char lat[48]; snprintf(lat, sizeof(lat), "t%d %.0f%%, t%d %.0f%%", t1, 100.0 * e->latest[t1] / n, t2, 100.0 * e->latest[t2] / n);
+        fprintf(stderr, "  %-18s %-16s %3d %4d %8llu %9.2f %5.1f%% %8.2f %7.2f %8.2f %8.2f %7.2f %9.2f  %-20s %8.2f %9.2f\n",
+                ggml_op_name((enum ggml_op) e->op), shape, e->bid, e->team, (unsigned long long) e->n,
+                e->completion / tpu / 1000.0, 100.0 * e->completion / (double) tot, e->completion / n / tpu,
+                e->rel_spread / n / tpu, e->work_mean / n / tpu, e->work_max / n / tpu,
+                e->arr_spread / n / tpu, e->wait_sum / tpu / 1000.0, lat, e->late_rel / n / tpu, e->late_work / n / tpu);
+    }
+}
+
 static void ggml_nbs_init(void) {
     if (g_nbs_every >= 0) return;
     const char * e = getenv("GGML_NUMA_BARRIER_STATS");
@@ -5221,10 +5380,18 @@ static void ggml_nbs_init(void) {
                 every, g_nbs_tick_per_us);
     }
     g_nbs_every = every;
+    const char * tr = getenv("GGML_NUMA_BARRIER_TRACE");
+    g_nbt_every = every > 0 && tr ? MAX(0, atoi(tr)) : 0;
+    if (g_nbt_every > 0) fprintf(stderr, "ggml: NUMA barrier trace by op and shape enabled, every %d graphs\n", g_nbt_every);
 }
 
 // called by every worker thread at the end of ggml_graph_compute_thread
 static void ggml_nbs_flush_thread(void) {
+    if (tl_nbt_rec) {   // trace: publish this worker's record count once, after its last barrier
+        g_nbt_cnt[tl_nbs_ith] = tl_nbt_cnt;
+        g_nbt_ovf[tl_nbs_ith] = tl_nbt_ovf;
+        tl_nbt_rec = 0;
+    }
     if (g_nbs_every <= 0 || !tl_nbs_dirty) return;
     while (atomic_flag_test_and_set(&g_nbs_lock)) { sched_yield(); }
     for (int op = 0; op < GGML_OP_COUNT; ++op) {
@@ -5253,6 +5420,8 @@ static int g_nbs_n_threads_min = 0;
 
 static void ggml_nbs_reset(void) {
     memset(g_nbs, 0, sizeof(g_nbs));
+    memset(g_nbt, 0, sizeof(g_nbt));
+    g_nbt_dropped = g_nbt_mismatch = g_nbt_graphs = g_nbt_agg_ticks = g_nbt_overflow = 0;
     memset(g_nbs_thr_last, 0, sizeof(g_nbs_thr_last));
     memset(g_nbs_thr_wait, 0, sizeof(g_nbs_thr_wait));
     memset(g_nbs_thr_work, 0, sizeof(g_nbs_thr_work));
@@ -5274,6 +5443,11 @@ static int      g_nbs_snap_n_threads = 0, g_nbs_snap_n_threads_min = 0;
 
 static void ggml_nbs_snap_save(void) {
     memcpy(g_nbs_snap, g_nbs, sizeof(g_nbs));
+    if (g_nbt_every > 0) {
+        memcpy(g_nbt_snap, g_nbt, sizeof(g_nbt));
+        g_nbt_snap_dropped = g_nbt_dropped; g_nbt_snap_mismatch = g_nbt_mismatch;
+        g_nbt_snap_graphs = g_nbt_graphs; g_nbt_snap_agg_ticks = g_nbt_agg_ticks; g_nbt_snap_overflow = g_nbt_overflow;
+    }
     memcpy(g_nbs_snap_last, g_nbs_thr_last, sizeof(g_nbs_thr_last));
     memcpy(g_nbs_snap_wait, g_nbs_thr_wait, sizeof(g_nbs_thr_wait));
     memcpy(g_nbs_snap_work, g_nbs_thr_work, sizeof(g_nbs_thr_work));
@@ -5284,6 +5458,11 @@ static void ggml_nbs_snap_save(void) {
 
 static void ggml_nbs_snap_restore(void) {
     memcpy(g_nbs, g_nbs_snap, sizeof(g_nbs));
+    if (g_nbt_every > 0) {
+        memcpy(g_nbt, g_nbt_snap, sizeof(g_nbt));
+        g_nbt_dropped = g_nbt_snap_dropped; g_nbt_mismatch = g_nbt_snap_mismatch;
+        g_nbt_graphs = g_nbt_snap_graphs; g_nbt_agg_ticks = g_nbt_snap_agg_ticks; g_nbt_overflow = g_nbt_snap_overflow;
+    }
     memcpy(g_nbs_thr_last, g_nbs_snap_last, sizeof(g_nbs_thr_last));
     memcpy(g_nbs_thr_wait, g_nbs_snap_wait, sizeof(g_nbs_thr_wait));
     memcpy(g_nbs_thr_work, g_nbs_snap_work, sizeof(g_nbs_thr_work));
@@ -5297,7 +5476,12 @@ static void ggml_nbs_graph_done(int n_threads) {
     if (g_nbs_every <= 0 || !g_numa_barrier.active) return;
     if (n_threads > g_nbs_n_threads) g_nbs_n_threads = n_threads;
     if (g_nbs_n_threads_min == 0 || n_threads < g_nbs_n_threads_min) g_nbs_n_threads_min = n_threads;
+    if (g_nbt_rec_graph) ggml_nbt_aggregate(n_threads);
     ++g_nbs_graphs;
+    // sampling cadence on its own counter: report resets and request-window restores reset
+    // g_nbs_graphs, which would otherwise shift or repeat the sampled graphs
+    ++g_nbt_seq;
+    g_nbt_rec_graph = g_nbt_every > 0 && g_nbt_seq % (uint64_t) g_nbt_every == 0;   // the next graph
     if (ggml_phase_request_mode()) return;   // reported with the request window
     if (g_nbs_graphs % g_nbs_every != 0) return;
     ggml_nbs_print_reset(g_nbs_n_threads);
@@ -5340,7 +5524,8 @@ static void ggml_nbs_print_reset(int n_threads) {
     {
         uint64_t tot_last = 0;
         for (int t = 0; t < n_threads && t < GGML_NBS_MAX_THREADS; ++t) tot_last += g_nbs_thr_last[t];
-        fprintf(stderr, "per thread: last = share of barriers where it arrived last; work/wait = avg us per barrier\n");
+        fprintf(stderr, "per thread: last = share of barriers whose cross-node arrival it completed (leader of the last node:\n"
+                        "an indicator, not the exact latest timestamp); work/wait = avg us per barrier\n");
         for (int t = 0; t < n_threads && t < GGML_NBS_MAX_THREADS; ++t) {
             const double nbar = tot_last ? (double) tot_last : 1.0;
             fprintf(stderr, "  t%-3d node %d  last %5.1f%%  work %7.2f  wait %7.2f%s",
@@ -5353,6 +5538,7 @@ static void ggml_nbs_print_reset(int n_threads) {
         memset(g_nbs_thr_wait, 0, sizeof(g_nbs_thr_wait));
         memset(g_nbs_thr_work, 0, sizeof(g_nbs_thr_work));
     }
+    if (g_nbt_every > 0) ggml_nbt_print();
     ggml_nbs_reset();
 }
 
@@ -5372,6 +5558,18 @@ static void ggml_numa_hier_barrier(void) {
     const int stats   = g_nbs_every > 0;
     const uint64_t t_arrive = stats ? ggml_nbs_now() : 0;
     int last_global = 0;
+    if (tl_nbt_rec) {
+        // own buffer only: nothing shared is written inside the barrier
+        if (tl_nbt_cnt < GGML_NBT_MAX_REC) {
+            struct ggml_nbt_rec * r = &g_nbt_buf[tl_nbs_ith][tl_nbt_cnt++];
+            r->exit_prev = tl_nbt_exit; r->arrive = t_arrive;
+            r->ne0 = tl_nbt_ne[0]; r->ne1 = tl_nbt_ne[1]; r->ne2 = tl_nbt_ne[2];
+            r->op = tl_nbs_op; r->bid = tl_nbt_bid;
+        } else {
+            tl_nbt_ovf = 1;
+        }
+        tl_nbt_bid++;
+    }
 
     // ---- intra-node level (node-local cache line) ----
     if (node_nth > 1) {
@@ -5395,6 +5593,7 @@ static void ggml_numa_hier_barrier(void) {
                 tl_nbs_prev  = t_leave;
                 tl_nbs_dirty = 1;
             }
+            if (tl_nbt_rec) tl_nbt_exit = ggml_nbs_now();   // common final exit point (follower)
             return;
         }
         // last arriver on this node becomes the leader
@@ -5444,6 +5643,7 @@ static void ggml_numa_hier_barrier(void) {
     if (node_nth > 1) {
         atomic_fetch_add(&g_numa_barrier.node[node]->release, 1);
     }
+    if (tl_nbt_rec) tl_nbt_exit = ggml_nbs_now();   // common final exit point (leader, after releasing)
 }
 
 static inline void ggml_barrier_impl(struct ggml_compute_state_shared * shared) {
@@ -32142,6 +32342,18 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     set_numa_thread_affinity(state->ith, state->shared->n_threads);
     set_cpu_thread_affinity(cplan, state->ith); // explicit affinity takes precedence over NUMA
     tl_nbs_ith = state->ith;
+    tl_nbt_rec = 0;
+    if (g_nbt_rec_graph && state->ith < GGML_NBS_MAX_THREADS) {
+        if (!g_nbt_buf[state->ith]) {   // allocated by the worker itself: first touch on its node
+            g_nbt_buf[state->ith] = (struct ggml_nbt_rec *) calloc(GGML_NBT_MAX_REC, sizeof(struct ggml_nbt_rec));
+        }
+        if (g_nbt_buf[state->ith]) {
+            tl_nbt_cnt  = 0;
+            tl_nbt_ovf  = 0;
+            tl_nbt_exit = 0;
+            tl_nbt_rec  = 1;
+        }
+    }
     ggml_phase_worker_started();
     // op bytes (thread 0): only timestamps and the MoE expert count are taken inside the loop,
     // the accounting runs after the graph. Doing it after each barrier delayed thread 0 at the
@@ -32180,6 +32392,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         int64_t tim1 = ggml_time_us();
 #endif
         tl_nbs_op = node->op;
+        tl_nbt_ne[0] = node->ne[0]; tl_nbt_ne[1] = node->ne[1]; tl_nbt_ne[2] = node->ne[2];
+        tl_nbt_bid = 0;
         const int obs_first = node_n;
         // MoE expert ids are read before the op: they are complete (computed by earlier nodes) and
         // cannot be overwritten before this op's barrier. After it, the next node may reuse their
@@ -32234,9 +32448,9 @@ static void ggml_ins_print_modes(void) {
     const char * p = getenv("LLAMA_PHASE_STATS");
     const char * o = getenv("GGML_OP_BYTES");
     const char * b = getenv("GGML_NUMA_BARRIER_STATS");
-    fprintf(stderr, "instrumentation: phase=%s op_bytes=%s barrier_stats=%s\n",
+    fprintf(stderr, "instrumentation: phase=%s op_bytes=%s barrier_stats=%s barrier_trace=%s\n",
             p && *p && strcmp(p, "0") ? p : "off", o && *o && strcmp(o, "0") ? o : "off",
-            b && *b && strcmp(b, "0") ? b : "off");
+            b && *b && strcmp(b, "0") ? b : "off", g_nbt_every > 0 ? "on" : "off");
 }
 
 // Opt-in graph audit (GGML_GRAPH_STATS=1): once per distinct graph (by node count), print how
