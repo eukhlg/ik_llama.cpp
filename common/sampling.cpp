@@ -644,11 +644,7 @@ static int sampler_fast_mode(const common_sampler * cs, const llama_context * ct
     if (!cs->allow_fast_path || !sampler_fast_globally_enabled()) return 0;
     if (ctx_cfg || cs->grammar || cs->rbudget || cs->adapt_p_ctx || cs->server_biases) return 0;
     if (p.n_probs > 0 || p.mirostat != 0 || p.adaptive_target >= 0.0f) return 0;
-    if (!(p.penalty_repeat == 1.0f && p.penalty_freq == 0.0f && p.penalty_present == 0.0f)) {
-        const auto & pt = p.use_penalty_prompt_tokens ? p.penalty_prompt_tokens : cs->prev;
-        const int32_t last_n = p.penalty_last_n < 0 ? p.n_prev : p.penalty_last_n;
-        if (std::min((int) pt.size(), last_n) > 0) return 0;
-    }
+    // active repetition penalties are applied by the fast path itself (window tokens only, 5.8)
     if (p.temp == 0.0f) return 1;
     if (p.temp < 0.0f) return 0;
     const bool dry_off = p.dry_multiplier == 0.0f || p.dry_base < 1.0f || p.dry_penalty_last_n == 0;
@@ -663,6 +659,33 @@ static int sampler_fast_mode(const common_sampler * cs, const llama_context * ct
         return 0;   // something else touches the full array before TOP_K
     }
     return 0;
+}
+
+// Repetition penalties change at most the window tokens: run the unchanged
+// llama_sample_repetition_penalties over copies of their entries only (taken from cand[id], which
+// must hold token id at index id), instead of a hash lookup for every vocabulary entry (5.8, after
+// upstream PR #3001). A repeated token gets one copy per occurrence; all copies compute the same value.
+// The logit of token id is read at (const char *) logit0 + id*stride. Returns the penalized copies in
+// `pen` (empty if penalties are inactive).
+static void sampler_penalize_window(struct common_sampler * cs, struct llama_context * ctx, int n_vocab,
+        const float * logit0, size_t stride, std::vector<llama_token_data> & pen) {
+    const common_params_sampling & p = cs->params;
+    pen.clear();
+    if (p.penalty_repeat == 1.0f && p.penalty_freq == 0.0f && p.penalty_present == 0.0f) return;
+    const auto & tokens = p.use_penalty_prompt_tokens ? p.penalty_prompt_tokens : cs->prev;
+    const int32_t last_n = p.penalty_last_n < 0 ? p.n_prev : p.penalty_last_n;
+    const int n_used = std::min((int) tokens.size(), last_n);
+    if (n_used <= 0) return;
+    const llama_token * last = tokens.data() + tokens.size() - n_used;
+    pen.reserve(n_used);
+    for (int i = 0; i < n_used; ++i) {
+        if (last[i] >= 0 && last[i] < n_vocab) {
+            const float logit = *(const float *) ((const char *) logit0 + (size_t) last[i]*stride);
+            pen.push_back(llama_token_data{ last[i], logit, 0.0f });
+        }
+    }
+    llama_token_data_array pen_p = { pen.data(), pen.size(), false };
+    llama_sample_repetition_penalties(ctx, &pen_p, last, n_used, p.penalty_repeat, p.penalty_freq, p.penalty_present);
 }
 
 static llama_token llama_sampling_sample_full(struct common_sampler * ctx_sampling, struct llama_context * ctx_main,
@@ -693,12 +716,33 @@ static llama_token llama_sampling_sample_impl(
             if (ctx_sampling->elb_states.size() > ctx_sampling->elb_idx) {
                 common_expiring_logit_bias_apply(ctx_sampling, lg);
             }
+            // repetition penalties: as in prepare, but written into the logits in place for the
+            // selection below and restored afterwards (prepare leaves the logits unpenalized);
+            // the newline token keeps its logit when penalize_nl is off, as in prepare
+            auto & pen   = ctx_sampling->pen_entries;
+            auto & saved = ctx_sampling->pen_saved;
+            saved.clear();
+            sampler_penalize_window(ctx_sampling, ctx_main, n_vocab, lg, sizeof(float), pen);
+            if (!pen.empty()) {
+                const llama_token nl_token = params.penalize_nl ? LLAMA_TOKEN_NULL : llama_token_nl(llama_get_model(ctx_main));
+                for (const auto & td : pen) {
+                    if (td.id != nl_token) saved.push_back({ td.id, lg[td.id] });
+                }
+                for (const auto & td : pen) {
+                    if (td.id != nl_token) lg[td.id] = td.logit;
+                }
+            }
+            auto restore_penalized = [&]() {
+                for (size_t j = saved.size(); j-- > 0; ) lg[saved[j].first] = saved[j].second;
+                saved.clear();
+            };
             auto & cur = ctx_sampling->cur;
             if (mode == 1) {
                 const int best = sampler_fast_argmax(lg, n_vocab);
                 if (best >= 0) {
                     cur.resize(1);
                     cur[0] = llama_token_data{ best, lg[best], 0.0f };
+                    restore_penalized();
                     ctx_sampling->cur_p = { cur.data(), cur.size(), false };
                     if (ph_t) ggml_phase_add(GGML_PHASE_SAMPLE_CAND, ggml_phase_now_ns() - ph_t);
                     return best;
@@ -708,6 +752,7 @@ static llama_token llama_sampling_sample_impl(
                 if (sampler_fast_top_k(lg, n_vocab, fk, top)) {
                     cur.resize(top.size());
                     for (size_t j = 0; j < top.size(); ++j) cur[j] = llama_token_data{ top[j].second, top[j].first, 0.0f };
+                    restore_penalized();
                     ctx_sampling->cur_p = { cur.data(), cur.size(), false };
                     if (ph_t) ggml_phase_add(GGML_PHASE_SAMPLE_CAND, ggml_phase_now_ns() - ph_t);
                     const int64_t q_t0 = ggml_phase_enabled() ? ggml_phase_now_ns() : 0;
@@ -720,7 +765,8 @@ static llama_token llama_sampling_sample_impl(
                 }
             }
             // not unique (or NaN): the bias edits are already in the logits, so run the full path
-            // without applying them a second time
+            // without applying them a second time (it applies the penalties itself)
+            restore_penalized();
             return llama_sampling_sample_full(ctx_sampling, ctx_main, ctx_cfg, idx, grammar_first, /*biases_applied=*/ true);
         }
     }
@@ -845,10 +891,6 @@ static llama_token_data_array llama_sampling_prepare_impl(
     const int n_vocab = llama_n_vocab(llama_get_model(ctx_main));
 
     const int32_t penalty_last_n  = params.penalty_last_n < 0 ? params.n_prev : params.penalty_last_n;
-    const float   penalty_repeat  = params.penalty_repeat;
-    const float   penalty_freq    = params.penalty_freq;
-    const float   penalty_present = params.penalty_present;
-
     const bool    penalize_nl     = params.penalize_nl;
 
     auto & prev = ctx_sampling->prev;
@@ -914,9 +956,12 @@ static llama_token_data_array llama_sampling_prepare_impl(
         const llama_token nl_token = llama_token_nl(llama_get_model(ctx_main));
         const float nl_logit = nl_token != LLAMA_TOKEN_NULL ? logits[nl_token] : 0.0f;
 
-        llama_sample_repetition_penalties(ctx_main, &cur_p,
-                penalty_tokens.data() + penalty_tokens.size() - penalty_tokens_used_size,
-                penalty_tokens_used_size, penalty_repeat, penalty_freq, penalty_present);
+        // window tokens only: cur_p holds token i at index i (5.8, after upstream PR #3001)
+        auto & pen = ctx_sampling->pen_entries;
+        sampler_penalize_window(ctx_sampling, ctx_main, n_vocab, &cur_p.data[0].logit, sizeof(llama_token_data), pen);
+        for (const auto & td : pen) {
+            cur_p.data[td.id] = td;
+        }
 
         if (!penalize_nl && nl_token != LLAMA_TOKEN_NULL) {
             for (size_t idx = 0; idx < cur_p.size; idx++) {

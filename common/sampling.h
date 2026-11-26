@@ -279,6 +279,8 @@ struct common_sampler {
     // for its slot samplers. LLAMA_SAMPLER_FAST=0 disables it globally (A/B tests).
     bool allow_fast_path = false;
     std::vector<std::pair<float, int>> fast_top;   // scratch for the fast path
+    std::vector<llama_token_data> pen_entries;      // scratch: window-only repetition penalties (5.8)
+    std::vector<std::pair<int, float>> pen_saved;   // scratch: logits to restore after the fast path
 
     // expiring logit bias
     struct elb_state {
