@@ -5344,8 +5344,8 @@ static void ggml_nbt_print(void) {
                     "  rel = exit spread entering the barrier interval; work = arrival - own previous exit (mean / max over workers);\n"
                     "  arr = arrival spread; wait = sum over workers (worker time, not wall time); latest = worker with the latest\n"
                     "  arrival (exact); late_rel = its exit offset; late_work = its work minus the mean (signed)\n");
-    fprintf(stderr, "  %-18s %-16s %3s %4s %8s %9s %6s %8s %7s %8s %8s %7s %9s  %-20s %8s %9s\n", "op", "shape", "b#", "team", "barriers",
-            "compl_ms", "%", "compl_us", "rel_us", "work_us", "wmax_us", "arr_us", "wait_ms", "latest (share)", "late_rel", "late_work");
+    fprintf(stderr, "  %-18s %-16s %3s %4s %8s %9s %6s %8s %7s %8s %8s %7s %9s  %-20s %6s %8s %9s\n", "op", "shape", "b#", "team", "barriers",
+            "compl_ms", "%", "compl_us", "rel_us", "work_us", "wmax_us", "arr_us", "wait_ms", "latest (share)", "n0_lst", "late_rel", "late_work");
     for (int r = 0; r < m && r < 30; ++r) {
         const struct ggml_nbt_entry * e = &g_nbt[idx[r]];
         const double n = (double) e->n;
@@ -5354,11 +5354,13 @@ static void ggml_nbt_print(void) {
         for (int t = 1; t < GGML_NBT_TOPT; ++t) if (e->latest[t] > e->latest[t1]) t1 = t;
         for (int t = 0; t < GGML_NBT_TOPT; ++t) if (t != t1 && (t2 < 0 || e->latest[t] > e->latest[t2])) t2 = t;
         char lat[48]; snprintf(lat, sizeof(lat), "t%d %.0f%%, t%d %.0f%%", t1, 100.0 * e->latest[t1] / n, t2, 100.0 * e->latest[t2] / n);
-        fprintf(stderr, "  %-18s %-16s %3d %4d %8llu %9.2f %5.1f%% %8.2f %7.2f %8.2f %8.2f %7.2f %9.2f  %-20s %8.2f %9.2f\n",
+        uint64_t n0 = 0;   // share of barriers whose latest worker is on node 0 (block split of this team)
+        for (int t = 0; t < GGML_NBT_TOPT && t < e->team; ++t) if (ggml_numa_node_for_thread(t, e->team) == 0) n0 += e->latest[t];
+        fprintf(stderr, "  %-18s %-16s %3d %4d %8llu %9.2f %5.1f%% %8.2f %7.2f %8.2f %8.2f %7.2f %9.2f  %-20s %5.1f%% %8.2f %9.2f\n",
                 ggml_op_name((enum ggml_op) e->op), shape, e->bid, e->team, (unsigned long long) e->n,
                 e->completion / tpu / 1000.0, 100.0 * e->completion / (double) tot, e->completion / n / tpu,
                 e->rel_spread / n / tpu, e->work_mean / n / tpu, e->work_max / n / tpu,
-                e->arr_spread / n / tpu, e->wait_sum / tpu / 1000.0, lat, e->late_rel / n / tpu, e->late_work / n / tpu);
+                e->arr_spread / n / tpu, e->wait_sum / tpu / 1000.0, lat, 100.0 * n0 / n, e->late_rel / n / tpu, e->late_work / n / tpu);
     }
 }
 

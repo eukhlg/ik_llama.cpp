@@ -11,7 +11,19 @@
 //
 // Run pinned to one NUMA node, e.g.:
 //   numactl --cpunodebind=0 --membind=0 llama-kbench -t 12 --cpus 0-11
+// or as production does it (roadmap 5.10 kernel reference), across both nodes with the NUMA mirror:
+//   llama-kbench -t 24 --cpus 0-23 --numa-mirror --model <gguf> --only model_2048x8192 --tokens 2 --modes dram
+// --numa-mirror: weights get one copy per node (node 0: the original, bound to node 0; node k: a
+// node-bound copy), threads are split per node and the hierarchical barrier is active, as in the
+// server with --numa mirror. GGML_NUMA_BARRIER_STATS / GGML_NUMA_BARRIER_TRACE work as in the server.
+// --model: adds one case per dense shape, model_<K>x<N>_<type>, with the weight type of the model's
+// tensors of that shape as -rtr repacks them (the most frequent; the breakdown is printed). The
+// explicitly typed cases are kept unchanged.
 #include "ggml.h"
+
+#include <map>
+
+extern "C" int iqk_repacked_type(const struct ggml_tensor * tensor);   // ggml/src/iqk/iqk_quantize.h
 
 #include <algorithm>
 #include <chrono>
@@ -139,6 +151,55 @@ static bool run_case(const bench_case & bc, int ntok, bool l3, double gb, int re
         }
     }
 
+    // NUMA mirror: every node reads its own node-bound copy (ggml_numa_alloc). The server binds the
+    // original buffer to node 0 instead; a fresh node-0 allocation gives the same placement without
+    // relying on page migration, and the check below verifies it.
+    std::vector<std::pair<void *, size_t>> node_copies;
+    if (ggml_numa_mirror_active()) {
+        const int n_nodes = ggml_numa_node_count();
+        auto mirror = [&](ggml_tensor * t) {
+            if (!t) return;
+            const size_t sz = ggml_nbytes(t);
+            void * nd[GGML_NUMA_MAX_NODES] = { nullptr };
+            for (int n = 0; n < n_nodes; ++n) {
+                void * p = ggml_numa_alloc(sz, n);
+                if (!p) { fprintf(stderr, "ggml_numa_alloc failed on node %d\n", n); exit(1); }
+                memcpy(p, t->data, sz);
+                nd[n] = p;
+                node_copies.push_back({ p, sz });
+            }
+            ggml_numa_tensor_set_mirror(t, nd);
+        };
+        for (int c = 0; c < copies; ++c) { mirror(w0[c]); mirror(w1[c]); }
+        // verify: sample 16 pages of every node's copy of every weight; refuse to measure otherwise
+        long checked = 0, wrong = 0, unknown = 0;
+        const size_t pg = ggml_numa_page_size();
+        auto check = [&](const void * base, size_t sz, int node) {
+            for (int k = 0; k < 16; ++k) {
+                const size_t off = (sz / pg > 0 ? (sz / pg - 1) * k / 15 : 0) * pg;
+                const int got = ggml_numa_page_node((const char *) base + off);
+                ++checked;
+                if (got < 0) ++unknown; else if (got != node) ++wrong;
+            }
+        };
+        size_t ci = 0;
+        for (int c = 0; c < copies; ++c) {
+            for (ggml_tensor * t : { w0[c], w1[c] }) {
+                if (!t) continue;
+                const size_t sz = ggml_nbytes(t);
+                for (int n = 0; n < n_nodes; ++n) check(node_copies[ci++].first, sz, n);
+            }
+        }
+        printf("# placement check %s: %ld pages sampled, %ld on another node, %ld unknown\n", bc.name.c_str(), checked, wrong, unknown);
+        if (wrong || unknown) {
+            fprintf(stderr, "placement check failed for %s: %ld of %ld sampled weight pages not on their node (%ld unknown); not measuring\n",
+                    bc.name.c_str(), wrong + unknown, checked, unknown);
+            for (auto & nc : node_copies) ggml_numa_free(nc.first, nc.second);
+            ggml_free(ctx);
+            return false;
+        }
+    }
+
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 4 * n_ops + 16, false);
     double bytes_total = 0;
     ggml_tensor * fixed_ids = nullptr;
@@ -194,6 +255,7 @@ static bool run_case(const bench_case & bc, int ntok, bool l3, double gb, int re
     res.bytes_per_op = bytes_total / n_ops;
     res.us_best = best / n_ops * 1e6; res.us_med = med / n_ops * 1e6;
     res.gbs_best = bytes_total / best / 1e9; res.gbs_med = bytes_total / med / 1e9;
+    for (auto & nc : node_copies) ggml_numa_free(nc.first, nc.second);
     ggml_free(ctx);
     return true;
 }
@@ -201,7 +263,8 @@ static bool run_case(const bench_case & bc, int ntok, bool l3, double gb, int re
 int main(int argc, char ** argv) {
     int nth = 12, reps = 7;
     double gb = 1.0;
-    std::string cpus_s, tokens_s = "1,2,3,4", modes = "dram,l3", only;
+    std::string cpus_s, tokens_s = "1,2,3,4", modes = "dram,l3", only, model;
+    bool numa_mirror = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() { if (i + 1 >= argc) { fprintf(stderr, "missing value for %s\n", a.c_str()); exit(1); } return std::string(argv[++i]); };
@@ -212,18 +275,29 @@ int main(int argc, char ** argv) {
         else if (a == "--reps") reps = std::max(3, std::stoi(next()));
         else if (a == "--modes") modes = next();
         else if (a == "--only") only = next();
-        else { fprintf(stderr, "usage: %s [-t N] [--cpus 0-11] [--tokens 1,2,3,4] [--gb 1.0] [--reps 7] [--modes dram,l3] [--only name]\n", argv[0]); return 1; }
+        else if (a == "--numa-mirror") numa_mirror = true;
+        else if (a == "--model") model = next();
+        else { fprintf(stderr, "usage: %s [-t N] [--cpus 0-11] [--tokens 1,2,3,4] [--gb 1.0] [--reps 7] [--modes dram,l3] [--only name]"
+                               " [--numa-mirror] [--model gguf]\n", argv[0]); return 1; }
     }
     const std::vector<int32_t> cpus = parse_cpus(cpus_s);
     const std::vector<int> tokens = parse_ints(tokens_s);
     const bool do_dram = modes.find("dram") != std::string::npos, do_l3 = modes.find("l3") != std::string::npos;
 
+    // ggml_init's first call initialises the global state (including the NUMA state), so it must
+    // come before ggml_numa_init, as in llama_backend_init + llama_numa_init
     ggml_init_params ip0 = { 16u << 20, nullptr, false };   // initialise ggml tables once
     ggml_free(ggml_init(ip0));
+    if (numa_mirror) {
+        ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
+        ggml_numa_set_mirror(GGML_NUMA_MIRROR_WEIGHTS);
+        if (!ggml_numa_mirror_active()) { fprintf(stderr, "--numa-mirror: NUMA mirror not active (one node?)\n"); return 1; }
+        printf("# NUMA mirror active: %d nodes\n", ggml_numa_node_count());
+    }
 
     // shapes of Qwen3.6-35B-A3B (n_embd 2048, delta-net inner 4096, 256 experts of 512, 8 used, vocab 248320)
     // types as after -rtr (K-quants repacked to _R4) and -mtprot iq4_xs for the MTP output head
-    const std::vector<bench_case> cases = {
+    std::vector<bench_case> cases = {
         { "dense_2048x8192_q4kr4",  "dense",       GGML_TYPE_Q4_K_R4, 2048,   8192,   0, 0, true  },
         { "dense_2048x4096_q4kr4",  "dense",       GGML_TYPE_Q4_K_R4, 2048,   4096,   0, 0, true  },
         { "dense_4096x2048_q4kr4",  "dense",       GGML_TYPE_Q4_K_R4, 4096,   2048,   0, 0, true  },
@@ -234,8 +308,60 @@ int main(int argc, char ** argv) {
         { "moe_down_q4kr4",         "moe_down",    GGML_TYPE_Q4_K_R4,  512,   2048, 256, 8, true  },
     };
 
-    printf("# llama-kbench: %d threads, cpus %s, DRAM working set >= %.2f GiB, %d reps (best / median)\n",
-           nth, cpus_s.empty() ? "unpinned" : cpus_s.c_str(), gb, reps);
+    if (!model.empty()) {
+        ggml_context * meta = nullptr;
+        gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &meta };
+        gguf_context * g = gguf_init_from_file(model.c_str(), gp);
+        if (!g || !meta) { fprintf(stderr, "cannot read %s\n", model.c_str()); return 1; }
+        // one derived case per distinct dense shape, named model_<K>x<N>_<type>; explicitly typed
+        // cases stay as they are
+        std::vector<bench_case> derived;
+        std::vector<std::pair<int64_t, int64_t>> seen;
+        for (const auto & bc : cases) {
+            if (bc.kind != "dense") continue;
+            if (std::find(seen.begin(), seen.end(), std::make_pair(bc.K, bc.N)) != seen.end()) continue;
+            seen.push_back({ bc.K, bc.N });
+            std::map<std::pair<int, int>, int> cnt;   // (file type, repacked type) -> tensors
+            std::string example;
+            // the vocabulary-sized shape matches both the output head and the token embedding; the
+            // embedding is a lookup table (never repacked, not a matmul), so it must not decide the
+            // type: use output.weight if present; with tied weights (no output.weight) the server
+            // multiplies by token_embd.weight itself, so that is then the right tensor
+            std::vector<ggml_tensor *> match;
+            bool has_output = false;
+            for (ggml_tensor * t = ggml_get_first_tensor(meta); t; t = ggml_get_next_tensor(meta, t)) {
+                if (ggml_n_dims(t) != 2 || t->ne[0] != bc.K || t->ne[1] != bc.N) continue;
+                match.push_back(t);
+                if (strcmp(t->name, "output.weight") == 0) has_output = true;
+            }
+            const bool only_embd = !match.empty() && std::all_of(match.begin(), match.end(),
+                    [](const ggml_tensor * t) { return strcmp(t->name, "token_embd.weight") == 0; });
+            for (ggml_tensor * t : match) {
+                if (has_output && strcmp(t->name, "output.weight") != 0) continue;
+                if (!has_output && !only_embd && strcmp(t->name, "token_embd.weight") == 0) continue;
+                const int rt = iqk_repacked_type(t);
+                cnt[{ (int) t->type, rt }]++;
+                if (example.empty()) example = t->name;
+            }
+            if (only_embd) printf("# model: %lldx%lld matches only token_embd.weight (tied output head): using its type\n",
+                                  (long long) bc.K, (long long) bc.N);
+            if (cnt.empty()) { printf("# model: no %lldx%lld tensors\n", (long long) bc.K, (long long) bc.N); continue; }
+            auto best = cnt.begin();
+            for (auto it = cnt.begin(); it != cnt.end(); ++it) if (it->second > best->second) best = it;
+            bench_case mc = bc;
+            mc.type = (ggml_type) best->first.second;
+            mc.name = "model_" + std::to_string(bc.K) + "x" + std::to_string(bc.N) + "_" + ggml_type_name(mc.type);
+            printf("# model: %s (e.g. %s):", mc.name.c_str(), example.c_str());
+            for (auto & kv : cnt) printf(" %d x %s->%s", kv.second, ggml_type_name((ggml_type) kv.first.first), ggml_type_name((ggml_type) kv.first.second));
+            printf("; using the most frequent\n");
+            derived.push_back(mc);
+        }
+        cases.insert(cases.end(), derived.begin(), derived.end());
+        gguf_free(g);
+        ggml_free(meta);
+    }
+    printf("# llama-kbench: %d threads, cpus %s, DRAM working set >= %.2f GiB, %d reps (best / median)%s\n",
+           nth, cpus_s.empty() ? "unpinned" : cpus_s.c_str(), gb, reps, numa_mirror ? ", NUMA mirror" : "");
     printf("%-24s %-5s %4s %9s %7s %10s %10s %9s %9s\n", "case", "mode", "tok", "MB/op", "ops", "us_best", "us_med", "GBs_best", "GBs_med");
     for (const auto & bc : cases) {
         if (!only.empty() && bc.name.find(only) == std::string::npos) continue;
