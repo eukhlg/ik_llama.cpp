@@ -5697,6 +5697,7 @@ static long ggml_sys_mbind(void * addr, unsigned long len, int mode,
     return syscall(SYS_mbind, addr, len, mode, nodemask, maxnode, flags);
 #else
     UNUSED(addr); UNUSED(len); UNUSED(mode); UNUSED(nodemask); UNUSED(maxnode); UNUSED(flags);
+    errno = ENOSYS;
     return -1;
 #endif
 }
@@ -5743,23 +5744,65 @@ void ggml_numa_free(void * ptr, size_t size) {
 
 // best-effort migration of an already-populated range (e.g. the original weight buffer) onto a
 // given node. Used to make node 0's "copy" (which aliases the original buffer) node-0-local.
-void ggml_numa_bind(void * ptr, size_t size, int node) {
+bool ggml_numa_bind(void * ptr, size_t size, int node) {
 #if defined(__gnu_linux__)
     if (!ptr || node < 0 || node >= (int) g_state.numa.n_nodes) {
-        return;
+        errno = EINVAL;
+        return false;
     }
-    long pg = sysconf(_SC_PAGESIZE);
-    if (pg <= 0) pg = 4096;
+    const uintptr_t pg = (uintptr_t) ggml_numa_page_size();
     uintptr_t start = (uintptr_t) ptr;
-    uintptr_t aligned_start = start & ~((uintptr_t) pg - 1);
+    uintptr_t aligned_start = start & ~(pg - 1);
     size_t len = size + (size_t) (start - aligned_start);
     const size_t bits = 8 * sizeof(unsigned long);
     unsigned long nodemask[(GGML_NUMA_MAX_NODES + 8 * sizeof(unsigned long) - 1) / (8 * sizeof(unsigned long))];
     memset(nodemask, 0, sizeof(nodemask));
     nodemask[node / bits] |= 1UL << (node % bits);
-    ggml_sys_mbind((void *) aligned_start, len, MPOL_BIND, nodemask, GGML_NUMA_MAX_NODES + 1, MPOL_MF_MOVE);
+    return ggml_sys_mbind((void *) aligned_start, len, MPOL_BIND, nodemask, GGML_NUMA_MAX_NODES + 1, MPOL_MF_MOVE) == 0;
 #else
     UNUSED(ptr); UNUSED(size); UNUSED(node);
+    errno = ENOSYS;
+    return false;
+#endif
+}
+
+size_t ggml_numa_page_size(void) {
+#if defined(__gnu_linux__)
+    const long pg = sysconf(_SC_PAGESIZE);
+    return pg > 0 ? (size_t) pg : 4096;
+#else
+    return 4096;
+#endif
+}
+
+int ggml_numa_page_node(const void * addr) {
+#if defined(__gnu_linux__) && defined(SYS_get_mempolicy)
+    int node = -1;
+    // MPOL_F_NODE | MPOL_F_ADDR: node of the page that backs addr (must be populated)
+    if (syscall(SYS_get_mempolicy, &node, NULL, 0, (void *) addr, 1 | 2) == 0) {
+        return node;
+    }
+    return -1;
+#else
+    UNUSED(addr);
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+bool ggml_delta_net_thread_heads(int head_dim, int n_heads, int ith0, int ith1, int nth, int * h0, int * h1) {
+#if GGML_USE_IQK_MULMAT
+    return iqk_fused_delta_net_thread_heads(head_dim, n_heads, ith0, ith1, nth, h0, h1);
+#else
+    // ggml_compute_forward_delta_net_f32 fallback: whole-head split
+    UNUSED(head_dim);
+    if (nth <= 0 || ith0 < 0 || ith1 < ith0 || ith1 > nth || n_heads <= 0 || !h0 || !h1) {
+        return false;
+    }
+    const int hpt = (n_heads + nth - 1) / nth;
+    *h0 = MIN(ith0 * hpt, n_heads);
+    *h1 = MIN(ith1 * hpt, n_heads);
+    return true;
 #endif
 }
 
@@ -32420,6 +32463,16 @@ bool ggml_parallel_host_copy(const struct ggml_host_copy_range * items, int n_it
     }
     const bool mirror  = ggml_numa_mirror_active();
     const int  n_nodes = mirror ? ggml_numa_node_count() : 1;
+    // GGML_RESTORE_COPY_THREADS=k: only the first k threads per node copy (the rest skip), for
+    // the worker-count sweep; unset or 0 = all
+    // The full OpenMP team still enters, sets affinity and joins the final barrier; this limits
+    // copy participation, not team size. Waiting workers may still compete with the copiers.
+    // TODO: If overhead remains material, compare a smaller pinned team as a separate experiment.
+    static int lim = -1;
+    if (lim < 0) {
+        const char * e = getenv("GGML_RESTORE_COPY_THREADS");
+        lim = e ? MAX(0, atoi(e)) : 0;
+    }
 #if defined(__gnu_linux__)
     cpu_set_t saved_affinity;
     const bool restore_affinity = pthread_getaffinity_np(pthread_self(), sizeof(saved_affinity), &saved_affinity) == 0;
@@ -32448,8 +32501,12 @@ bool ggml_parallel_host_copy(const struct ggml_host_copy_range * items, int n_it
             const int tn = mirror ? ggml_numa_node_for_thread(t, nth) : 0;
             if (tn == node) { if (cnt == 0) first = t; ++cnt; }
         }
-        const int r = ith - first;
-        for (int k = 0; k < n_items; ++k) {
+        int r = ith - first;
+        if (lim > 0 && cnt > lim) {
+            if (r >= lim) r = -1;
+            cnt = lim;
+        }
+        for (int k = 0; k < n_items && r >= 0; ++k) {
             const size_t bytes = items[k].bytes;
             const size_t a  = bytes * node / n_nodes;
             const size_t b  = bytes * (node + 1) / n_nodes;

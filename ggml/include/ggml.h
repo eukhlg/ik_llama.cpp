@@ -1056,8 +1056,14 @@ extern "C" {
     // allocate/free memory bound to a specific NUMA node (mmap + mbind + THP)
     GGML_API void *   ggml_numa_alloc(size_t size, int node);
     GGML_API void     ggml_numa_free(void * ptr, size_t size);
-    // best-effort migrate an already-populated range onto a node (mbind + MPOL_MF_MOVE)
-    GGML_API void     ggml_numa_bind(void * ptr, size_t size, int node);
+    // best-effort migrate an already-populated range onto a node (mbind + MPOL_MF_MOVE);
+    // returns false (errno set) when mbind fails or is unavailable
+    GGML_API bool     ggml_numa_bind(void * ptr, size_t size, int node);
+    GGML_API size_t   ggml_numa_page_size(void);                   // base page size (4096 if unknown)
+    GGML_API int      ggml_numa_page_node(const void * addr);      // node of the page at addr, -1 (errno set) if unknown
+    // heads whose state the fused delta-net op writes from threads [ith0, ith1) of nth (one sequence);
+    // false when that range does not start and end on head boundaries or the split is not known
+    GGML_API bool     ggml_delta_net_thread_heads(int head_dim, int n_heads, int ith0, int ith1, int nth, int * h0, int * h1);
     // attach/detach per-node copies to a tensor. node_data must have ggml_numa_node_count() entries.
     GGML_API void     ggml_numa_tensor_set_mirror(struct ggml_tensor * tensor, void * const * node_data);
     GGML_API void     ggml_numa_tensor_clear_mirror(struct ggml_tensor * tensor);

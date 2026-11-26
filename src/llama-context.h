@@ -215,6 +215,8 @@ struct llama_kv_cache {
         int32_t conv_offset = -1;
         int32_t per_step_n_tokens = 0;
         int32_t per_step_max_allocated = 0;
+        int32_t per_step_numa_threads = -1;   // batch threads the NUMA placement was decided for (-1: never)
+        bool    per_step_numa_bound = false;  // checkpoints currently bound by head range
         int64_t per_step_ssm_state_size = 0;
         int64_t per_step_conv_state_dim = 0;
         int64_t per_step_conv_dim = 0;
@@ -285,6 +287,8 @@ struct llama_kv_cache {
             conv_restore_graphs.clear();
             per_step_n_tokens = 0;
             per_step_max_allocated = 0;
+            per_step_numa_threads = -1;
+            per_step_numa_bound = false;
             per_step_ssm_state_size = 0;
             per_step_conv_state_dim = 0;
             per_step_conv_dim = 0;
@@ -332,7 +336,7 @@ struct llama_kv_cache {
     bool llama_ckpt_mode_equal(llama_ckpt_data ckpt_type, int mode) const;
 
     // Per-step checkpoint: allocate, restore step k's full state (SSM + conv) to cache
-    bool per_step_alloc(const llama_model & model, int max_tokens);
+    bool per_step_alloc(const llama_model & model, int max_tokens, int n_threads = 0);
     bool per_step_restore(ggml_backend_sched_t sched, llama_ckpt_data ckpt_type, int step, uint32_t slot);
 
     ~llama_kv_cache() {

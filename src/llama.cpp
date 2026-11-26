@@ -2510,8 +2510,126 @@ bool  llama_kv_cache::llama_ckpt_mode_equal(llama_ckpt_data ckpt_type, int mode)
     return ckpt.selected_spec_mode == mode;
 }
 
-bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens) {
+// NUMA placement of the per-step delta-net checkpoints (roadmap 5.9). The fused delta-net op writes
+// each step's state from the threads that own each head range; the restore copies node k's
+// 1/n_nodes byte share of the state with node k's threads, and the active state is placed by equal
+// head ranges. When the writer partition of node k's threads is exactly the k-th equal head range
+// (the production case: AVX-512 row-block split, threads split evenly across nodes, head count
+// divisible by the node count), bind those pages of every step to node k. Otherwise (AVX2
+// whole-head split, uneven teams) leave the pages where they are: writer, restore and active-state
+// placement would disagree. Pages are already populated (cleared, or holding live checkpoints on
+// reuse); the bind migrates them with their contents. n_threads = batch threads, since per-step
+// saves run in batches of more than one token. LLAMA_CKPT_NUMA=0 disables it, for A/B tests.
+static void llama_per_step_numa_place(llama_kv_cache::gpu_checkpoint & ckpt, const llama_model & model,
+        int max_tokens, int n_threads, const char * when) {
+    static const bool ckpt_numa = [] {
+        const char * e = getenv("LLAMA_CKPT_NUMA");
+        return !e || atoi(e) != 0;
+    }();
+    const int n_nodes = ggml_numa_mirror_active() ? ggml_numa_node_count() : 1;
+    if (!ckpt_numa || n_nodes <= 1 || max_tokens <= 1) {
+        return;
+    }
+    ckpt.per_step_numa_threads = n_threads;
+    const int num_v_heads = model.hparams.ssm_dt_rank;
+    const int head_v_dim  = num_v_heads > 0 ? (int) (model.hparams.ssm_d_inner / num_v_heads) : 0;
+    const char * skip = nullptr;
+    if (num_v_heads <= 0 || head_v_dim <= 0) {
+        skip = "no delta-net heads";
+    } else if (n_threads <= 0) {
+        skip = "thread count unknown";
+    } else if (num_v_heads % n_nodes != 0) {
+        skip = "head count not divisible by the node count";
+    }
+    for (int n = 0; n < n_nodes && !skip; ++n) {
+        int first = -1, cnt = 0;
+        for (int t = 0; t < n_threads; ++t) {
+            if (ggml_numa_node_for_thread(t, n_threads) == n) { if (first < 0) first = t; ++cnt; }
+        }
+        int h0 = 0, h1 = 0;
+        if (cnt == 0 || !ggml_delta_net_thread_heads(head_v_dim, num_v_heads, first, first + cnt, n_threads, &h0, &h1)) {
+            skip = "writer partition splits a head or is not known";
+        } else if (h0 != num_v_heads * n / n_nodes || h1 != num_v_heads * (n + 1) / n_nodes) {
+            skip = "writer head ranges differ from the equal split used by restore";
+        }
+    }
+    if (skip) {
+        LLAMA_LOG_INFO("%s: NUMA mirror (%s): per-step checkpoints not bound%s: %s (%d threads)\n", __func__, when,
+                ckpt.per_step_numa_bound ? ", earlier placement kept" : "", skip, n_threads);
+        return;
+    }
+
+    struct bind_range { uintptr_t a0, a1; int node; };
+    std::vector<bind_range> ranges;
+    const uintptr_t pg = (uintptr_t) ggml_numa_page_size();
+    auto rd = [pg](uintptr_t a) { return a & ~(pg - 1); };
+    auto ru = [pg](uintptr_t a) { return (a + pg - 1) & ~(pg - 1); };
+    const size_t head_bytes = (size_t) head_v_dim * head_v_dim * sizeof(float);
+    const size_t step_bytes = (size_t) num_v_heads * head_bytes;
+    int n_layers = 0;
+    for (const auto & per_layer : ckpt.per_step_ssm) {
+        // unsplit host tensors only (split recurrent state lives on other backends)
+        if (per_layer.size() != 1) continue;
+        const ggml_tensor * t = per_layer.front();
+        if (!t || !t->data || !t->buffer || !ggml_backend_buffer_is_host(t->buffer) ||
+                ggml_nbytes(t) != (size_t) (max_tokens - 1) * step_bytes) {
+            continue;
+        }
+        for (int st = 0; st < max_tokens - 1; ++st) {
+            const uintptr_t base = (uintptr_t) t->data + (size_t) st * step_bytes;
+            for (int n = 0; n < n_nodes; ++n) {
+                const uintptr_t s0 = base + (size_t) (num_v_heads * n / n_nodes) * head_bytes;
+                const uintptr_t s1 = base + (size_t) (num_v_heads * (n + 1) / n_nodes) * head_bytes;
+                // A page crossing an internal boundary goes to the earlier node: its end and the
+                // next range's start both round up (same rule as the state). Pages shared with the
+                // neighbouring step or tensor are never touched.
+                const uintptr_t a0 = ru(s0);
+                const uintptr_t a1 = n + 1 == n_nodes ? rd(s1) : ru(s1);
+                if (a1 > a0) ranges.push_back({ a0, a1, n });
+            }
+        }
+        ++n_layers;
+    }
+    if (ranges.empty()) {
+        return;
+    }
+    int n_failed = 0;
+    for (const auto & r : ranges) {
+        if (!ggml_numa_bind((void *) r.a0, (size_t) (r.a1 - r.a0), r.node)) {
+            if (n_failed++ == 0) {
+                LLAMA_LOG_WARN("%s: NUMA mirror: binding checkpoint range %p + %zu to node %d failed: %s\n",
+                        __func__, (void *) r.a0, (size_t) (r.a1 - r.a0), r.node, strerror(errno));
+            }
+        }
+    }
+    ckpt.per_step_numa_bound = n_failed < (int) ranges.size();
+    // endpoint sample: node of the first and last page of every range (two pages per range, so this
+    // checks the binding took effect, it does not prove residency of every page in between)
+    int n_wrong = 0, n_unknown = 0, first_errno = 0;
+    for (const auto & r : ranges) {
+        for (const uintptr_t a : { r.a0, r.a1 - pg }) {
+            errno = 0;
+            const int node = ggml_numa_page_node((const void *) a);
+            if (node < 0) {
+                if (n_unknown++ == 0) first_errno = errno;
+            } else if (node != r.node) {
+                ++n_wrong;
+            }
+        }
+    }
+    LLAMA_LOG_INFO("%s: NUMA mirror (%s): per-step checkpoints of %d layers x %d steps bound by head range across %d nodes "
+                   "(%d threads): %zu ranges, %d binds failed; endpoint sample of %zu pages: %d on another node, %d unknown%s%s\n",
+            __func__, when, n_layers, max_tokens - 1, n_nodes, n_threads, ranges.size(), n_failed, 2 * ranges.size(),
+            n_wrong, n_unknown, n_unknown ? ", first query error: " : "", n_unknown ? strerror(first_errno) : "");
+}
+
+bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens, int n_threads) {
     if (ckpt.per_step_max_allocated >= max_tokens) {
+        // reused allocation: decide the NUMA placement again if the batch thread count changed
+        // (the writer partition depends on it); binding migrates pages with their contents
+        if (n_threads > 0 && n_threads != ckpt.per_step_numa_threads) {
+            llama_per_step_numa_place(ckpt, model, ckpt.per_step_max_allocated, n_threads, "reuse");
+        }
         return true;
     }
 
@@ -2679,6 +2797,7 @@ bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens) {
     }
 
     ckpt.per_step_max_allocated = max_tokens;
+    llama_per_step_numa_place(ckpt, model, max_tokens, n_threads, "alloc");
     return true;
 }
 
@@ -10204,7 +10323,7 @@ static bool llama_mirror_kv_cache(struct llama_kv_cache & cache, const llama_hpa
         const size_t n_heads        = hparams.ssm_dt_rank;
         const size_t head_v_dim     = hparams.ssm_d_inner / hparams.ssm_dt_rank;
         const size_t head_bytes     = head_v_dim*head_v_dim*sizeof(float);
-        const uintptr_t pg = 4096;
+        const uintptr_t pg = (uintptr_t) ggml_numa_page_size();
         auto rd = [pg](uintptr_t a) { return a & ~(pg - 1); };
         auto ru = [pg](uintptr_t a) { return (a + pg - 1) & ~(pg - 1); };
         for (auto * t : cache.s_l) {
@@ -10219,7 +10338,7 @@ static bool llama_mirror_kv_cache(struct llama_kv_cache & cache, const llama_hpa
                 for (int n = 0; n < n_nodes; ++n) {
                     const uintptr_t s0 = ssm + (n_heads*n/n_nodes)*head_bytes;
                     const uintptr_t s1 = ssm + (n_heads*(n + 1)/n_nodes)*head_bytes;
-                    // a page shared by two nodes' ranges goes to the later node; never touch
+                    // a page shared by two nodes' ranges goes to the earlier node; never touch
                     // pages before the delta-net state or past its end
                     const uintptr_t a0 = ru(s0);
                     const uintptr_t a1 = n + 1 == n_nodes ? rd(s1) : ru(s1);
@@ -12009,7 +12128,7 @@ static bool alloc_conv_windows(llama_kv_cache & kv, int history, int max_tokens)
     return true;
 }
 
-static bool spec_ckpt_try_per_step(llama_kv_cache & kv, const llama_model & model, llama_ckpt_data ckpt_type, int max_tokens) {
+static bool spec_ckpt_try_per_step(llama_kv_cache & kv, const llama_model & model, llama_ckpt_data ckpt_type, int max_tokens, int n_threads) {
     if (model.arch == LLM_ARCH_INKLING2_LOOP || model.arch == LLM_ARCH_LFM2) {
         return ckpt_type.type == LLAMA_CHECKPOINT_SPEC && kv.checkpoint_alloc_shadows(ckpt_type) &&
             alloc_conv_windows(kv, model.hparams.n_shortconv_l_cache - 1, max_tokens);
@@ -12055,7 +12174,7 @@ static bool spec_ckpt_try_per_step(llama_kv_cache & kv, const llama_model & mode
     }
 
 
-    if (!kv.per_step_alloc(model, max_tokens)) {
+    if (!kv.per_step_alloc(model, max_tokens, n_threads)) {
         kv.save_per_step_ssm = false;
         return false;
     }
@@ -12179,7 +12298,7 @@ int llama_spec_ckpt_init(struct llama_context * ctx, llama_ckpt_data ckpt_type, 
     const auto prepare_per_step = [&]() {
         return is_dsv4
             ? llama_dsv4_spec_ckpt_prepare(ctx, ckpt_type, LLAMA_SPEC_CKPT_PER_STEP, max_tokens)
-            : spec_ckpt_try_per_step(kv, ctx->model, ckpt_type, max_tokens);
+            : spec_ckpt_try_per_step(kv, ctx->model, ckpt_type, max_tokens, (int) ctx->cparams.n_threads_batch);
     };
     const auto prepare_gpu_fallback = [&]() {
         // the standard Mamba-2 layout keeps the conv window in k_l; checkpoint_alloc_shadows

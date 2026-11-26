@@ -2184,6 +2184,34 @@ bool iqk_fused_delta_net(int head_dim, int n_heads, int gqa_ratio, int repeat_ty
     return true;
 }
 
+bool iqk_fused_delta_net_thread_heads(int head_dim, int n_heads, int ith0, int ith1, int nth, int * h0, int * h1) {
+    if (nth <= 0 || ith0 < 0 || ith1 < ith0 || ith1 > nth || n_heads <= 0 || !h0 || !h1) {
+        return false;
+    }
+    const bool fused = head_dim == 64 || head_dim == 128;
+#ifdef __ARM_NEON
+    if (fused) return false;   // the NEON split is not modelled here
+#endif
+#ifdef __AVX512F__
+    if (fused) {
+        // iqk_fused_delta_net_rows_avx512: (head, 16-row block) units in contiguous ranges
+        const int nblk = head_dim / 16;
+        const int64_t n_units = (int64_t) n_heads * nblk;
+        const int64_t u0 = n_units * ith0 / nth;
+        const int64_t u1 = n_units * ith1 / nth;
+        if (u0 % nblk != 0 || u1 % nblk != 0) return false;
+        *h0 = (int) (u0 / nblk);
+        *h1 = (int) (u1 / nblk);
+        return true;
+    }
+#endif
+    // whole-head split (AVX2 path of iqk_fused_delta_net_impl and the ggml fallback)
+    const int hpt = (n_heads + nth - 1) / nth;
+    *h0 = std::min(ith0 * hpt, n_heads);
+    *h1 = std::min(ith1 * hpt, n_heads);
+    return true;
+}
+
 namespace {
 constexpr int k_indexer_chunks = 64;
 constexpr int k_n_bucket = 64;
@@ -2921,6 +2949,17 @@ bool iqk_fused_delta_net(int, int, int, int, int, int,
         const float *, const float *, const float *, const float *, const float *,
         const float *, float *, float *, float *, int, int, int) {
     return false;
+}
+
+bool iqk_fused_delta_net_thread_heads(int, int n_heads, int ith0, int ith1, int nth, int * h0, int * h1) {
+    // ggml fallback: whole-head split
+    if (nth <= 0 || ith0 < 0 || ith1 < ith0 || ith1 > nth || n_heads <= 0 || !h0 || !h1) {
+        return false;
+    }
+    const int hpt = (n_heads + nth - 1) / nth;
+    *h0 = ith0 * hpt < n_heads ? ith0 * hpt : n_heads;
+    *h1 = ith1 * hpt < n_heads ? ith1 * hpt : n_heads;
+    return true;
 }
 
 bool iqk_indexer_topk(struct ggml_tensor *, void *, barrier_t, void *, int, int) {

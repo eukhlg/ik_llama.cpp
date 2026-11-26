@@ -85,6 +85,11 @@ IQK_API bool iqk_fused_delta_net(int head_dim, int n_heads, int gqa_ratio, int r
         const float * q_data, const float * k_data, const float * v_data, const float * g_data, const float * beta_data,
         const float * state_in, float * out_data, float * state_out, float * saved_steps, int state_step_stride, int ith, int nth);
 
+// Heads whose state the fused delta-net op writes from threads [ith0, ith1) of nth (one sequence),
+// using the same partition as iqk_fused_delta_net or the ggml fallback. False when that range does
+// not start and end on head boundaries, or when the partition is not modelled here.
+IQK_API bool iqk_fused_delta_net_thread_heads(int head_dim, int n_heads, int ith0, int ith1, int nth, int * h0, int * h1);
+
 IQK_API bool iqk_indexer_topk(struct ggml_tensor * dst, void * work_buffer, barrier_t barrier, void * barrier_data, int ith, int nth);
 IQK_API size_t iqk_idx_topk_work_buffer_size(const struct ggml_tensor * dst, int nthread);
 
